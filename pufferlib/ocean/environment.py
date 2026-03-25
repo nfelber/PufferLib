@@ -152,6 +152,7 @@ MAKE_FUNCTIONS = {
     'impulse_wars': 'ImpulseWars',
     'drive': 'Drive',
     'pacman': 'Pacman',
+    'quad_meshing': 'QuadMeshing',
     'tmaze': 'TMaze',
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',
