@@ -128,19 +128,36 @@ void compute_observations(QuadMeshing* env) {
     }
 
     // Make SDF observations
-    Frame2D frame = compute_active_local_frame(env);
-    int N = env->observation_density;
+    // Frame2D frame = compute_active_local_frame(env);
+    // int N = env->observation_density;
+    //
+    // int obs_idx = 0;
+    // for (int y = 0; y < N; ++y) {
+    //     for (int x = 0; x < N; ++x) {
+    //         Vec2 query_local = {
+    //             env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
+    //             env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
+    //         };
+    //         Vec2 query_world = local_to_world(frame, query_local);
+    //         env->observations[obs_idx++] = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
+    //     }
+    // }
 
     int obs_idx = 0;
-    for (int y = 0; y < N; ++y) {
-        for (int x = 0; x < N; ++x) {
-            Vec2 query_local = {
-                env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
-                env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
-            };
-            Vec2 query_world = local_to_world(frame, query_local);
-            env->observations[obs_idx++] = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
-        }
+    env->observations[obs_idx++] = polygon2D_area(env->boundary) / polygon2D_area(env->starting_boundary);
+
+    Frame2D frame = compute_active_local_frame(env);
+    for (int i=0; i<3; ++i) {
+        Vec2 ln = world_to_local(frame, Polygon2D_neighbor(env->boundary, env->active_vertex, -i-1));
+        Vec2 rn = world_to_local(frame, Polygon2D_neighbor(env->boundary, env->active_vertex,  i+1));
+        float langle = atan2f(ln.y, ln.x);
+        float rangle = atan2f(rn.y, rn.x);
+        float lr = norm2(ln);
+        float rr = norm2(rn);
+        env->observations[obs_idx++] = langle;
+        env->observations[obs_idx++] = lr;
+        env->observations[obs_idx++] = rangle;
+        env->observations[obs_idx++] = rr;
     }
 }
 
@@ -171,6 +188,10 @@ float compute_reward(QuadMeshing* env, Polygon2D quad) {
     const float Ad = A - env->target_quad_area;
     float dq = 1.0 / (1.0 + alpha * Ad*Ad);
 
+    // return A * eq * dq;
+    // return A * (eq + dq - 1.0);
+    // return (1.25 * eq * eq - 1.0);
+    // return eq;
     return eq * dq;
 }
 
@@ -196,12 +217,12 @@ void c_step(QuadMeshing* env) {
     env->rewards[0] = 0;
     env->terminals[0] = 0;
 
-    const float action_kind = env->actions[0];
+    const int action_kind = roundf(env->actions[0]);
     const float action_angle = env->actions[1];
     const float action_radius = env->actions[2];
 
     bool action_valid = false;
-    if (action_kind < -0.5) {
+    if (action_kind == 0) {
         // Close left
         env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -2);
         env->quad.vertices.data[1] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
@@ -218,7 +239,7 @@ void c_step(QuadMeshing* env) {
                 Vec2Array_remove_range(&env->boundary.vertices, env->active_vertex-1, env->active_vertex);
             }
         }
-    } else if (action_kind > 0.5) {
+    } else if (action_kind == 1) {
         // Close right
         env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
         env->quad.vertices.data[1] = env->boundary.vertices.data[env->active_vertex];
@@ -338,26 +359,26 @@ void c_render(QuadMeshing* env) {
     DrawCircleV(world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx), 8.0, RED);
 
     // SDF grid
-    Frame2D frame = compute_active_local_frame(env);
-    int N = env->observation_density;
-    int obs_idx = 0;
-    for (int y = 0; y < N; ++y) {
-        for (int x = 0; x < N; ++x) {
-            Vec2 query_local = {
-                env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
-                env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
-            };
-            Vec2 query_world = local_to_world(frame, query_local);
-            float d = env->observations[obs_idx++];
-            Color c = {
-                (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.1)),
-                (unsigned char)(255 * clamp01(0.5 + 5.0*d * 0.4)),
-                (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.7)),
-                255
-            };
-            DrawCircleV(world_to_screen(query_world, &ctx), 3.0, c);
-        }
-    }
+    // Frame2D frame = compute_active_local_frame(env);
+    // int N = env->observation_density;
+    // int obs_idx = 0;
+    // for (int y = 0; y < N; ++y) {
+    //     for (int x = 0; x < N; ++x) {
+    //         Vec2 query_local = {
+    //             env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
+    //             env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
+    //         };
+    //         Vec2 query_world = local_to_world(frame, query_local);
+    //         float d = env->observations[obs_idx++];
+    //         Color c = {
+    //             (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.1)),
+    //             (unsigned char)(255 * clamp01(0.5 + 5.0*d * 0.4)),
+    //             (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.7)),
+    //             255
+    //         };
+    //         DrawCircleV(world_to_screen(query_world, &ctx), 3.0, c);
+    //     }
+    // }
 
     DrawText(TextFormat("S: SDF | ESC: Quit | Episode return: %f", env->episode_return), 10, 10, 20, DARKGRAY);
 

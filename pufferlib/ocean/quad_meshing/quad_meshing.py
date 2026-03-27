@@ -29,22 +29,32 @@ class QuadMeshing(pufferlib.PufferEnv):
         self.tick = 0
         
         # Observation space: observation_density x observation_density float32 SDF values
-        num_obs = observation_density * observation_density
+        # num_obs = observation_density * observation_density
+        num_obs = 13
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0, high=1.0,
             shape=(num_obs,),
             dtype=np.float32
         )
         
-        # Action space: 3D continuous
-        # action[0]: kind in [-1, 1] (-1=close_left, 0=place_vertex, 1=close_right)
-        # action[1]: angle in [-1, 1] for vertex placement
-        # action[2]: radius multiplier in [0, 1]
+        # Action space: Hybrid (1 discrete + 2 continuous)
+        # Stored as 3D continuous Box for buffer compatibility
+        # action[0]: discrete action choice (0-2, stored as float 0.0, 1.0, or 2.0)
+        #   - 0 = close_left
+        #   - 1 = close_right
+        #   - 2 = place_vertex
+        # action[1]: angle in [-1, 1] for vertex placement (continuous)
+        # action[2]: radius multiplier in [0, 1] (continuous)
         self.single_action_space = gymnasium.spaces.Box(
-            low=np.array([-1.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([1.0,  1.0, 1.0], dtype=np.float32),
+            low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
+            high=np.array([2.0,  1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
+        # self.single_action_space = gymnasium.spaces.Box(
+        #     low=np.array([-1.0, -1.0, 0.0], dtype=np.float32),
+        #     high=np.array([1.0,  1.0, 1.0], dtype=np.float32),
+        #     dtype=np.float32
+        # )
         
         super().__init__(buf)
         

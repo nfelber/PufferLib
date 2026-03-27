@@ -186,7 +186,116 @@ def entropy_probs(logits, probs):
     p_log_p = logits * probs
     return -p_log_p.sum(-1)
 
+
+class HybridDistribution:
+    def __init__(self, discrete_logits=None, continuous_mean=None, continuous_logstd=None):
+        self.discrete_logits = discrete_logits or []
+        self.has_discrete = len(self.discrete_logits) > 0
+
+        self.has_continuous = continuous_mean is not None and continuous_logstd is not None
+
+        # --- DISCRETE ---
+        if self.has_discrete:
+            # each l: [B, K_i]
+            self.discrete_logits = torch.nn.utils.rnn.pad_sequence(
+                [l.transpose(0, 1) for l in self.discrete_logits],  # [K_i, B]
+                batch_first=False,
+                padding_value=-torch.inf
+            ).permute(1, 2, 0)  # [Nd, B, K]
+
+            self.normalized_logits = self.discrete_logits - self.discrete_logits.logsumexp(
+                dim=-1, keepdim=True
+            )
+
+            self.probs = logits_to_probs(self.discrete_logits)
+            self.probs = torch.nan_to_num(self.probs, 1e-8, 1e-8, 1e-8)
+
+        # --- CONTINUOUS ---
+        if self.has_continuous:
+            mean = torch.nan_to_num(continuous_mean, 0.0, 0.0, 0.0)
+            logstd = torch.nan_to_num(continuous_logstd, 0.0, 0.0, 0.0)
+            std = torch.exp(logstd)
+            self.cont_dist = torch.distributions.Normal(mean, std)
+
+    def sample(self):
+        parts = []
+
+        if self.has_discrete:
+            action = torch.multinomial(
+                self.probs.reshape(-1, self.probs.shape[-1]),
+                1,
+                replacement=True
+            ).int()
+
+            action = action.reshape(self.probs.shape[:-1])  # [Nd, B]
+            action = action.T  # [B, Nd]
+
+            parts.append(action)
+
+        if self.has_continuous:
+            cont = self.cont_dist.sample()
+            cont = cont.view(cont.shape[0], -1)
+            parts.append(cont)
+
+        if len(parts) == 1:
+            return parts[0]
+
+        return torch.cat(parts, dim=-1)
+
+    def log_prob(self, action):
+        logprob = 0.0
+
+        if self.has_discrete:
+            batch = self.discrete_logits.shape[1]
+        else:
+            batch = self.cont_dist.loc.shape[0]
+
+        action = action.view(batch, -1)
+
+        idx = 0
+
+        # --- DISCRETE ---
+        if self.has_discrete:
+            nd = self.discrete_logits.shape[0]
+
+            # [B, Nd] -> [Nd, B]
+            discrete_action = action[:, :nd].T.contiguous()
+
+            logprob += log_prob(
+                self.normalized_logits,
+                discrete_action
+            ).sum(0)
+
+            idx += nd
+
+        # --- CONTINUOUS ---
+        if self.has_continuous:
+            cont_action = action[:, idx:]
+            logprob = logprob + self.cont_dist.log_prob(cont_action).sum(-1)
+
+        return logprob
+
+    def entropy(self):
+        ent = 0.0
+
+        if self.has_discrete:
+            ent += entropy(self.normalized_logits).sum(0)
+
+        if self.has_continuous:
+            ent += self.cont_dist.entropy().view(self.cont_dist.loc.shape[0], -1).sum(-1)
+
+        return ent
+
+
 def sample_logits(logits, action=None):
+    if isinstance(logits, HybridDistribution):
+        if action is None:
+            action = logits.sample()
+
+        logprob = logits.log_prob(action)
+        entropy = logits.entropy()
+
+        return action, logprob, entropy
     is_discrete = isinstance(logits, torch.Tensor)
     if isinstance(logits, torch.distributions.Normal):
         batch = logits.loc.shape[0]

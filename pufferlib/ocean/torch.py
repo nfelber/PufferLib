@@ -963,3 +963,81 @@ class G2048(nn.Module):
         logits = self.decoder(hidden)
         values = self.value(hidden)
         return logits, values
+
+
+class QuadMeshingPolicy(nn.Module):
+    """
+    Policy for QuadMeshing with hybrid action space.
+    
+    Actions:
+    - 1 discrete dimension: action_choice (0=close_left, 1=place_vertex, 2=close_right)
+    - 2 continuous dimensions: angle (interpolant) and radius (ratio)
+    """
+    
+    def __init__(self, env, hidden_size=128, **kwargs):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        
+        # Encoder
+        num_obs = np.prod(env.single_observation_space.shape)
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+        
+        # Action heads - Discrete (3 choices)
+        self.discrete_decoder = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 3), std=0.01)
+        
+        # Action heads - Continuous (angle and radius)
+        self.continuous_decoder_mean = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 2), std=0.01)
+        self.continuous_decoder_logstd = nn.Parameter(torch.zeros(1, 2))
+        
+        # Value head
+        self.value = pufferlib.pytorch.layer_init(
+            nn.Linear(hidden_size, 1), std=1)
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        logits, values = self.decode_actions(hidden)
+        return logits, values
+    
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        """Encode observations to hidden state."""
+        batch_size = observations.shape[0]
+        return self.encoder(observations.view(batch_size, -1).float())
+    
+    def decode_actions(self, hidden):
+        """
+        Decode hidden state to HybridDistribution.
+        
+        Returns:
+            HybridDistribution with:
+            - 1 discrete action (3 choices)
+            - 2 continuous actions (angle, radius)
+        """
+        # Discrete: action choice (3 possibilities)
+        discrete_logits = [self.discrete_decoder(hidden)]
+        
+        # Continuous: angle and radius
+        continuous_mean = self.continuous_decoder_mean(hidden)
+        continuous_logstd = self.continuous_decoder_logstd.expand_as(continuous_mean)
+
+        dist = pufferlib.pytorch.HybridDistribution(
+            discrete_logits=discrete_logits,
+            continuous_mean=continuous_mean,
+            continuous_logstd=continuous_logstd
+        )
+
+        values = self.value(hidden)
+        
+        # Return HybridDistribution
+        return dist, values
+

@@ -305,7 +305,7 @@ class PuffeRL:
                     self.full_rows += num_full
 
                 action = action.cpu().numpy()
-                if isinstance(logits, torch.distributions.Normal):
+                if isinstance(logits, torch.distributions.Normal) or isinstance(logits, pufferlib.pytorch.HybridDistribution):
                     action = np.clip(action, self.vecenv.action_space.low, self.vecenv.action_space.high)
 
             profile('eval_misc', epoch)
@@ -1037,7 +1037,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
             action = action.cpu().numpy().reshape(vecenv.action_space.shape)
 
-        if isinstance(logits, torch.distributions.Normal):
+        if isinstance(logits, torch.distributions.Normal) or isinstance(logits, pufferlib.pytorch.HybridDistribution):
             action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
         ob = vecenv.step(action)[0]
