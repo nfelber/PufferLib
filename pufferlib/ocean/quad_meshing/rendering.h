@@ -16,14 +16,14 @@ typedef struct {
 static inline Vector2 world_to_screen(Vec2 p, const RenderContext* ctx) {
     return (Vector2){
         ctx->offsetX + (p.x - ctx->min.x) * ctx->scale,
-        ctx->offsetY + (p.y - ctx->min.y) * ctx->scale
+        ctx->screenH - (ctx->offsetY + (p.y - ctx->min.y) * ctx->scale)
     };
 }
 
 static inline Vec2 screen_to_world(int x, int y, const RenderContext* ctx) {
     return (Vec2){
         ctx->min.x + (x - ctx->offsetX) / ctx->scale,
-        ctx->min.y + (y - ctx->offsetY) / ctx->scale
+        ctx->min.y + (y + ctx->screenH - ctx->offsetY) / ctx->scale
     };
 }
 

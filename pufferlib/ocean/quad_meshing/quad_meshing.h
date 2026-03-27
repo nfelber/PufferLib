@@ -54,8 +54,8 @@ void init(QuadMeshing* env) {
             pos = add2(pos, dir);
         }
         const float x = dir.x;
-        dir.x = dir.y;
-        dir.y = -x;
+        dir.x = -dir.y;
+        dir.y = x;
     }
     env->starting_boundary.isCCW = is_polygon_ccw(env->starting_boundary);    
 
@@ -103,8 +103,8 @@ static Frame2D compute_active_local_frame(QuadMeshing* env) {
     // Build orthonormal frame
     Frame2D f;
     f.origin = v;
-    f.y = bis;
-    f.x = (Vec2){ bis.y, -bis.x };
+    f.x = bis;
+    f.y = (Vec2){ -bis.y, bis.x };
 
     if (!env->boundary.isCCW) {
         f.x = scalmul2(f.x, -1.0);
@@ -242,8 +242,8 @@ void c_step(QuadMeshing* env) {
         const float t = 0.5 * (1.0 + action_angle);
         const float r = env->action_radius * action_radius;
         const Vec2 dir = slerp2(
-            sub2(env->quad.vertices.data[2], env->quad.vertices.data[1]),
             sub2(env->quad.vertices.data[0], env->quad.vertices.data[1]),
+            sub2(env->quad.vertices.data[2], env->quad.vertices.data[1]),
             t, false
         );
         env->quad.vertices.data[3] = add2(env->quad.vertices.data[1], scalmul2(dir, r));
@@ -261,7 +261,7 @@ void c_step(QuadMeshing* env) {
     }
 
     env->rewards[0] = action_valid ? compute_reward(env, env->quad) : -0.1;
-    env->log.score += env->rewards[0];
+    env->episode_return += env->rewards[0];
 
     // Add latest quad to mesh
     // TODO: Only when rendering
@@ -359,7 +359,7 @@ void c_render(QuadMeshing* env) {
         }
     }
 
-    DrawText(TextFormat("S: SDF | ESC: Quit | Score: %f", env->log.score), 10, 10, 20, DARKGRAY);
+    DrawText(TextFormat("S: SDF | ESC: Quit | Episode return: %f", env->episode_return), 10, 10, 20, DARKGRAY);
 
     EndDrawing();
 }

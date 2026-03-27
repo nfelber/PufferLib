@@ -29,6 +29,7 @@ BUID_CUDA_EXT = bool(CUDA_HOME or ROCM_HOME)
 # Build with DEBUG=1 to enable debug symbols
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
+ONLY_QUAD = os.getenv("ONLY_QUAD", "0") == "1"
 NO_TRAIN = os.getenv("NO_TRAIN", "0") == "1"
 
 # Build raylib for your platform
@@ -189,7 +190,10 @@ extension_kwargs = dict(
 # Find C extensions
 c_extensions = []
 if not NO_OCEAN:
-    c_extension_paths = glob.glob('pufferlib/ocean/**/binding.c', recursive=True)
+    if ONLY_QUAD:
+        c_extension_paths = glob.glob('pufferlib/ocean/quad_meshing/binding.c', recursive=True)
+    else:
+        c_extension_paths = glob.glob('pufferlib/ocean/**/binding.c', recursive=True)
     c_extensions = [
         Extension(
             path.rstrip('.c').replace('/', '.'),
