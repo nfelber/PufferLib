@@ -166,12 +166,12 @@ float compute_reward(QuadMeshing* env, Polygon2D quad) {
     const float eq = sqrtf(sqrtf(2) * Emin * angleMin / (Dmax * angleMax));
 
     // Density quality
-    const float alpha = 10.0;
+    const float alpha = 4096.0 * 10.0;
     const float A = polygon2D_area(quad);
     const float Ad = A - env->target_quad_area;
     float dq = 1.0 / (1.0 + alpha * Ad*Ad);
 
-    return A * eq * dq;
+    return eq * dq;
 }
 
 void c_reset(QuadMeshing* env) {
