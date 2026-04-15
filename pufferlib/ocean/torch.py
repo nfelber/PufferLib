@@ -986,6 +986,8 @@ class QuadMeshingPolicy(nn.Module):
             nn.GELU(),
             pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
         )
         
         # Action heads - Discrete (3 choices)

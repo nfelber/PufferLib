@@ -180,15 +180,20 @@ float point_segment2D_distance(Vec2 p, Segment2D s) {
 }
 
 DEFINE_VECTOR(Vec2, Vec2Array)
+DEFINE_VECTOR(size_t, SizeArray)
 
 typedef struct {
     Vec2Array vertices;
     bool isCCW;
 } Polygon2D;
 
-Vec2 Polygon2D_neighbor(Polygon2D poly, int i, int offset) {
+static inline int polygon2D_neighbor_index(Polygon2D poly, int i, int offset) {
     const int n = poly.vertices.size;
-    return poly.vertices.data[((i + offset) % n + n) % n];
+    return ((i + offset) % n + n) % n;
+}
+
+Vec2 Polygon2D_neighbor(Polygon2D poly, int i, int offset) {
+    return poly.vertices.data[polygon2D_neighbor_index(poly, i, offset)];
 }
 
 // Shoelace formula, positive if vertices are ccw and negative if cw
@@ -226,7 +231,7 @@ float polygonInteriorAngle(Polygon2D poly, int i) {
     Vec2 u1 = scalmul2(v1, 1.0 / len1);
     Vec2 u2 = scalmul2(v2, 1.0 / len2);
 
-    float angle = acosf(dot2(u1, u2));
+    float angle = acosf(clampf(dot2(u1, u2), -1.0, 1.0));
 
     float s = poly.isCCW ? 1.0 : -1.0;
     if (cross2(u1, u2) * s > 0.0) {
@@ -306,4 +311,3 @@ void mesh2D_add_edge(Mesh2D *m, size_t v1, size_t v2) {
     Edge e = { v1, v2 };
     EdgeArray_push(&m->edges, e);
 }
-

@@ -88,6 +88,11 @@ dm_lab = [
     'dm_env==1.6',
 ]
 
+quad_meshing_ee = [
+    'shapely',
+    'pygame',
+]
+
 griddly = [
     'gym==0.23',
     'gymnasium==0.29.1',

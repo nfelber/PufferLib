@@ -281,6 +281,8 @@ install_requires = [
     'gym==0.23',
     'gymnasium>=0.29.1',
     'pettingzoo>=1.24.1',
+    'shapely',
+    'pygame',
 ]
 
 if not NO_TRAIN:

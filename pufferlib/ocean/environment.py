@@ -153,6 +153,7 @@ MAKE_FUNCTIONS = {
     'drive': 'Drive',
     'pacman': 'Pacman',
     'quad_meshing': 'QuadMeshing',
+    'quad_meshing_ee': 'make_quad_meshing_ee',
     'tmaze': 'TMaze',
     'checkers': 'Checkers',
     'asteroids': 'Asteroids',

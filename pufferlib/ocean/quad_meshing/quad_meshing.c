@@ -3,11 +3,12 @@
 
 int main() {
     QuadMeshing env;
-    env.action_radius = 1.0;
+    env.action_radius = 0.3;
     env.observation_radius = 1.0;
     env.observation_density = 32;
+    env.sdf_accel_resolution = 64;
 
-    init(&env);
+    init(&env, NULL, 0);
 
     env.observations = (float*)calloc(
         env.observation_density*env.observation_density, sizeof(float));
@@ -20,13 +21,13 @@ int main() {
     while (!WindowShouldClose()) {
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             if (IsKeyDown(KEY_A)) {
-                env.actions[0] = -1.0;
+                env.actions[0] = 0.0;
             } else if (IsKeyDown(KEY_D)) {
                 env.actions[0] = 1.0;
             } else if (IsKeyDown(KEY_W)) {
-                env.actions[0] = 0.0;
+                env.actions[0] = 2.0;
                 env.actions[1] = 0.0;
-                env.actions[2] = 0.2;
+                env.actions[2] = 0.58;
             }
         } else {
             env.actions[0] = ((float)rand() / (float)RAND_MAX) * 2.0 - 1.0;
@@ -42,4 +43,3 @@ int main() {
     free(env.terminals);
     c_close(&env);
 }
-

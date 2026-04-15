@@ -2,35 +2,75 @@
 
 import gymnasium
 import numpy as np
+import json
+import os
 
 import pufferlib
 from pufferlib.ocean.quad_meshing import binding
 
 
 class QuadMeshing(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, observation_density=8, observation_radius=0.3,
-                 action_radius=0.3, render_mode=None, log_interval=128, buf=None, seed=0):
+    def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
+                 observation_density=8, observation_radius=0.3, action_radius=0.3,
+                 boundary_file=None, random_active_vertex=False, delayed_rewards=False,
+                 render_enabled=False, render_target_fps=60):
         '''
         Initialize the QuadMeshing environment.
         
         Args:
             num_envs: Number of parallel environments to run
-            observation_density: NxN grid size for SDF observations (default 32 = 1024 floats)
-            observation_radius: Spatial extent of observation region around active vertex
-            action_radius: Maximum radius multiplier for placing new vertices
             render_mode: Rendering mode (not fully supported yet)
             log_interval: Number of steps between log reports
             buf: Optional pre-allocated observation buffer
             seed: Random seed
+            observation_density: NxN grid size for SDF observations (default 32 = 1024 floats)
+            observation_radius: Spatial extent of observation region around active vertex
+            action_radius: Maximum radius multiplier for placing new vertices
+            boundary_file: Path to JSON file containing boundary vertices. If not provided,
+                           defaults to a hard-coded square boundary. JSON format:
+                           {"vertices": [[x1, y1], [x2, y2], ...]}
+            random_active_vertex: If True, the active vertex is chosen randomly at each step.
+            delayed_rewards: If True, only emit reward when the mesh is completed.
+            render_enabled: If True, render-related work is enabled in the C env.
+            render_target_fps: Target FPS used for rendering.
         '''
         self.num_agents = num_envs
         self.render_mode = render_mode
         self.log_interval = log_interval
         self.tick = 0
         
+        # Load boundary from file if provided
+        boundary_vertices = None
+        if boundary_file:
+            boundary_file_path = boundary_file
+            if not os.path.isabs(boundary_file_path):
+                # Try to find relative to current working directory
+                if not os.path.exists(boundary_file_path):
+                    # Try relative to this file's directory
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    boundary_file_path = os.path.join(script_dir, boundary_file)
+            
+            if not os.path.exists(boundary_file_path):
+                raise FileNotFoundError(f"Boundary file not found: {boundary_file}")
+            
+            try:
+                with open(boundary_file_path, 'r') as f:
+                    data = json.load(f)
+                    if 'vertices' not in data:
+                        raise ValueError("JSON must contain 'vertices' key with list of [x, y] coordinates")
+                    boundary_vertices = data['vertices']
+                    if not isinstance(boundary_vertices, list) or len(boundary_vertices) < 3:
+                        raise ValueError("Boundary must have at least 3 vertices")
+                    for vertex in boundary_vertices:
+                        if not isinstance(vertex, list) or len(vertex) != 2:
+                            raise ValueError("Each vertex must be a [x, y] list")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in boundary file: {e}")
+        
         # Observation space: observation_density x observation_density float32 SDF values
         # num_obs = observation_density * observation_density
         num_obs = 13
+        # num_obs = 12
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0, high=1.0,
             shape=(num_obs,),
@@ -70,6 +110,11 @@ class QuadMeshing(pufferlib.PufferEnv):
             observation_density=observation_density,
             observation_radius=observation_radius,
             action_radius=action_radius,
+            boundary_vertices=boundary_vertices,
+            random_active_vertex=random_active_vertex,
+            delayed_rewards=delayed_rewards,
+            render_enabled=render_enabled,
+            render_target_fps=render_target_fps,
         )
     
     def reset(self, seed=None):
