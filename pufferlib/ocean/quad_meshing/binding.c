@@ -12,6 +12,23 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
 
     env->render_enabled = unpack(kwargs, "render_enabled");
     env->render_target_fps = unpack(kwargs, "render_target_fps");
+    env->export_meshes = unpack(kwargs, "export_meshes");
+
+    const char* default_export_path = "mesh.obj";
+    const char* export_path = default_export_path;
+    PyObject* export_path_obj = PyDict_GetItemString(kwargs, "export_mesh_path");
+    if (export_path_obj) {
+        if (!PyUnicode_Check(export_path_obj)) {
+            PyErr_SetString(PyExc_ValueError, "export_mesh_path must be a string");
+            return -1;
+        }
+        export_path = PyUnicode_AsUTF8(export_path_obj);
+    }
+    if (!export_path || export_path[0] == '\0') {
+        export_path = default_export_path;
+    }
+    strncpy(env->export_mesh_path, export_path, sizeof(env->export_mesh_path) - 1);
+    env->export_mesh_path[sizeof(env->export_mesh_path) - 1] = '\0';
     
     // Extract boundary vertices if provided
     float* boundary_vertices = NULL;

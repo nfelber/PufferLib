@@ -31,6 +31,7 @@
               pkgs.cudatoolkit
               pkgs.binutils
               pkgs.libllvm
+              pkgs.zenity
             ];
 
             multiPkgs = pkgs: [
@@ -50,7 +51,15 @@
               export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib:$TRITON_LIBCUDA_PATH
 
               # manylinux compatibility
-              export LD_LIBRARY_PATH=${lib.makeLibraryPath pkgs.pythonManylinuxPackages.manylinux1}:$LD_LIBRARY_PATH
+              export LD_LIBRARY_PATH=${
+                with pkgs; lib.makeLibraryPath (
+                  pythonManylinuxPackages.manylinux1 ++ [
+                    libXxf86vm
+                    libXrandr
+                    libXinerama
+                    libXcursor
+                ])}:$LD_LIBRARY_PATH
+
 
               unset PYTHONPATH
 

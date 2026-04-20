@@ -13,7 +13,8 @@ class QuadMeshing(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
                  observation_density=8, observation_radius=0.3, action_radius=0.3,
                  boundary_file=None, random_active_vertex=False, delayed_rewards=False,
-                 render_enabled=False, render_target_fps=60):
+                 render_enabled=False, render_target_fps=60,
+                 export_meshes=False, export_mesh_path="mesh.obj"):
         '''
         Initialize the QuadMeshing environment.
         
@@ -33,7 +34,10 @@ class QuadMeshing(pufferlib.PufferEnv):
             delayed_rewards: If True, only emit reward when the mesh is completed.
             render_enabled: If True, render-related work is enabled in the C env.
             render_target_fps: Target FPS used for rendering.
-        '''
+            export_meshes: If True, export OBJ mesh files when episodes end.
+            export_mesh_path: Output path template for OBJ files. Use "{episode}"
+                              to include the episode index in the filename.
+         '''
         self.num_agents = num_envs
         self.render_mode = render_mode
         self.log_interval = log_interval
@@ -115,6 +119,8 @@ class QuadMeshing(pufferlib.PufferEnv):
             delayed_rewards=delayed_rewards,
             render_enabled=render_enabled,
             render_target_fps=render_target_fps,
+            export_meshes=export_meshes,
+            export_mesh_path=export_mesh_path,
         )
     
     def reset(self, seed=None):

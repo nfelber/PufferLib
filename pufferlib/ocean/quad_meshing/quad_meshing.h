@@ -48,6 +48,10 @@ typedef struct {
     // Rendering
     bool render_enabled;
     int render_target_fps;
+    bool export_meshes;
+    bool mesh_enabled;
+    char export_mesh_path[512];
+    int export_mesh_counter;
 
     // Env state
     Polygon2D boundary;
@@ -61,6 +65,72 @@ typedef struct {
     // Cache
     QuadMeshingCache cache;
 } QuadMeshing;
+
+static void build_export_mesh_path(QuadMeshing* env, char* out, size_t out_size) {
+    const char* template = env->export_mesh_path;
+    if (!template || template[0] == '\0') {
+        template = "mesh.obj";
+    }
+
+    const char* token = strstr(template, "{episode}");
+    if (token) {
+        size_t prefix_len = (size_t)(token - template);
+        const char* suffix = token + strlen("{episode}");
+        if (prefix_len + strlen(suffix) + 32 >= out_size) {
+            out[0] = '\0';
+            return;
+        }
+        memcpy(out, template, prefix_len);
+        snprintf(out + prefix_len, out_size - prefix_len, "%d%s", env->export_mesh_counter, suffix);
+        return;
+    }
+
+    if (env->export_mesh_counter == 0) {
+        snprintf(out, out_size, "%s", template);
+        return;
+    }
+
+    const char* slash = strrchr(template, '/');
+    const char* dot = strrchr(template, '.');
+    if (dot && (!slash || dot > slash)) {
+        int base_len = (int)(dot - template);
+        snprintf(out, out_size, "%.*s_%d%s", base_len, template, env->export_mesh_counter, dot);
+    } else {
+        snprintf(out, out_size, "%s_%d", template, env->export_mesh_counter);
+    }
+}
+
+static void export_mesh_obj(QuadMeshing* env) {
+    if (!env->export_meshes) {
+        return;
+    }
+
+    char path[1024];
+    build_export_mesh_path(env, path, sizeof(path));
+    if (path[0] == '\0') {
+        fprintf(stderr, "Mesh export path too long\n");
+        return;
+    }
+
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "Failed to open mesh export path: %s\n", path);
+        return;
+    }
+
+    fprintf(f, "# QuadMeshing OBJ export\n");
+    for (size_t i = 0; i < env->mesh.vertices.size; i++) {
+        Vec2 v = env->mesh.vertices.data[i];
+        fprintf(f, "v %.8f %.8f 0\n", v.x, v.y);
+    }
+    for (size_t i = 0; i < env->mesh.edges.size; i++) {
+        Edge e = env->mesh.edges.data[i];
+        fprintf(f, "l %zu %zu\n", e.v1 + 1, e.v2 + 1);
+    }
+
+    fclose(f);
+    env->export_mesh_counter++;
+}
 
 static float get_boundary_area(QuadMeshing* env) {
     if (env->cache.boundary_area_dirty) {
@@ -192,6 +262,7 @@ void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
     env->episode_max_length = (int)(2.0 * env->cache.starting_boundary_area / env->target_quad_area);
     
     env->active_vertex = 0;    
+    env->mesh_enabled = env->render_enabled || env->export_meshes;
 }
 
 void add_log(QuadMeshing* env) {
@@ -332,7 +403,8 @@ float compute_reward(QuadMeshing* env, Polygon2D quad) {
     const float dq = 1.0 / (1.0 + alpha * Ad*Ad);
 
     // return A * eq * dq;
-    return fmin(A / env->target_quad_area, 1.0) * eq;
+    // return fmin(A / env->target_quad_area, 1.0) * eq;
+    return (1.0 - fabs(A / env->target_quad_area - 1.0)) * eq;
     // return eq * dq;
     // return 0.5 * (eq + dq);
 }
@@ -377,7 +449,7 @@ void c_step(QuadMeshing* env) {
         env->quad.vertices.data[3] = Polygon2D_neighbor(env->boundary, 0, 3);
 
         // Add quad to mesh
-        if (env->render_enabled) {
+        if (env->mesh_enabled) {
             size_t quad_mesh_indices[4] = {0};
             quad_mesh_indices[0] = env->boundary_mesh_vertices.data[0];
             quad_mesh_indices[1] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, 0, 1)];
@@ -392,12 +464,14 @@ void c_step(QuadMeshing* env) {
         // Compute last reward
         env->rewards[0] = compute_reward(env, env->quad);
         add_log(env);
+        export_mesh_obj(env);
         c_reset(env);
         env->terminals[0] = 1;
         return;
     } else if (env->episode_length == env->episode_max_length) {
         env->rewards[0] = -1.0;
         add_log(env);
+        export_mesh_obj(env);
         c_reset(env);
         env->terminals[0] = 1;
         return;
@@ -519,7 +593,7 @@ void c_step(QuadMeshing* env) {
     }
 
     // Add latest quad to mesh
-    if (action_valid && env->render_enabled) {
+    if (action_valid && env->mesh_enabled) {
       assert(quad_mesh_indices_ready);
       mesh2D_add_edge(&env->mesh, quad_mesh_indices[0], quad_mesh_indices[1]);
       mesh2D_add_edge(&env->mesh, quad_mesh_indices[1], quad_mesh_indices[2]);
