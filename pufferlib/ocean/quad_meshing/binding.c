@@ -4,10 +4,15 @@
 #include "../env_binding.h"
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->observation_density = unpack(kwargs, "observation_density");
-    env->observation_radius = unpack(kwargs, "observation_radius");
-    env->action_radius = unpack(kwargs, "action_radius");
     env->random_active_vertex = unpack(kwargs, "random_active_vertex");
+
+    env->observe_remaining_area = unpack(kwargs, "observe_remaining_area");
+    env->observation_radius = unpack(kwargs, "observation_radius");
+    env->n_neighbors = unpack(kwargs, "n_neighbors");
+    env->n_sdf_samples = unpack(kwargs, "n_sdf_samples");
+
+    env->action_radius = unpack(kwargs, "action_radius");
+
     env->delayed_rewards = unpack(kwargs, "delayed_rewards");
 
     env->render_enabled = unpack(kwargs, "render_enabled");

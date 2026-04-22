@@ -19,6 +19,8 @@ typedef struct {
     float n;              // Required as the last field 
 } Log;
 
+DEFINE_VECTOR(float, FloatArray)
+
 typedef struct {
     float starting_boundary_area;
     float boundary_area;
@@ -26,6 +28,8 @@ typedef struct {
     bool render_bounds_dirty;
     Vec2 render_min;
     Vec2 render_max;
+    Vec2Array sdf_query_world;
+    FloatArray sdf_query_values;
 } QuadMeshingCache;
 
 typedef struct {
@@ -39,10 +43,18 @@ typedef struct {
     int episode_max_length;
     Polygon2D starting_boundary;
     float target_quad_area;
-    float action_radius;
-    float observation_radius;
-    int observation_density;
     bool random_active_vertex;
+
+    // Observations config
+    bool observe_remaining_area;
+    float observation_radius;
+    int n_neighbors;
+    int n_sdf_samples;
+
+    // Actions config
+    float action_radius;
+
+    // Rewards config
     bool delayed_rewards;
 
     // Rendering
@@ -59,6 +71,7 @@ typedef struct {
     Mesh2D mesh;
     SizeArray boundary_mesh_vertices;
     int active_vertex;
+    float local_radius;
     int episode_length;
     float episode_return;
 
@@ -245,6 +258,10 @@ void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
 
     mesh2D_init(&env->mesh);
     SizeArray_init(&env->boundary_mesh_vertices);
+    Vec2Array_init(&env->cache.sdf_query_world);
+    Vec2Array_resize(&env->cache.sdf_query_world, env->n_sdf_samples);
+    FloatArray_init(&env->cache.sdf_query_values);
+    FloatArray_resize(&env->cache.sdf_query_values, env->n_sdf_samples);
 
     // Calculate target_quad_area as square of average boundary segment length
     float perimeter = 0.0;
@@ -286,21 +303,18 @@ static Frame2D compute_active_local_frame(QuadMeshing* env) {
     Vec2 bis = add2(e1, e2);
 
     // 90 deg angle
-    if (norm2(bis) < 1e-6) {
+    if (dot2(bis, bis) < 1e-8) {
         bis = (Vec2){ -e1.y, e1.x };
     }
 
     bis = safe_normalize(bis);
+    float cross = cross2(e1, e2);
 
     // Build orthonormal frame
     Frame2D f;
     f.origin = v;
-    f.x = bis;
+    f.x = (env->boundary.isCCW && cross > 0) || (!env->boundary.isCCW && cross < 0) ? scalmul2(bis, -1.0) : bis;
     f.y = (Vec2){ -bis.y, bis.x };
-
-    if (!env->boundary.isCCW) {
-        f.x = scalmul2(f.x, -1.0);
-    }
 
     return f;
 }
@@ -327,6 +341,11 @@ void compute_observations(QuadMeshing* env) {
         }
     }
 
+    // Compute local radius
+    env->local_radius = 0.5 *
+      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
+      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
+
     // env->active_vertex = rand() % env->boundary.vertices.size;
     // int countdown = env->boundary.vertices.size;
     // while (polygonInteriorAngle(env->boundary, env->active_vertex) > M_PI) {
@@ -341,37 +360,37 @@ void compute_observations(QuadMeshing* env) {
     //     }
     // }
 
-    // Make SDF observations
-    // Frame2D frame = compute_active_local_frame(env);
-    // int N = env->observation_density;
-    //
-    // int obs_idx = 0;
-    // for (int y = 0; y < N; ++y) {
-    //     for (int x = 0; x < N; ++x) {
-    //         Vec2 query_local = {
-    //             env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
-    //             env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
-    //         };
-    //         Vec2 query_world = local_to_world(frame, query_local);
-    //         env->observations[obs_idx++] = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
-    //     }
-    // }
-
     int obs_idx = 0;
-    env->observations[obs_idx++] = get_boundary_area(env) / env->cache.starting_boundary_area;
+
+    if (env->observe_remaining_area) {
+        env->observations[obs_idx++] = get_boundary_area(env) / env->cache.starting_boundary_area;
+    }
 
     Frame2D frame = compute_active_local_frame(env);
-    for (int i=0; i<3; ++i) {
+    for (int i=0; i<env->n_neighbors; ++i) {
         Vec2 ln = world_to_local(frame, Polygon2D_neighbor(env->boundary, env->active_vertex, -i-1));
         Vec2 rn = world_to_local(frame, Polygon2D_neighbor(env->boundary, env->active_vertex,  i+1));
         float langle = atan2f(ln.y, ln.x);
         float rangle = atan2f(rn.y, rn.x);
         float lr = norm2(ln);
         float rr = norm2(rn);
-        env->observations[obs_idx++] = langle;
+        env->observations[obs_idx++] = langle / M_PI;
         env->observations[obs_idx++] = lr;
-        env->observations[obs_idx++] = rangle;
+        env->observations[obs_idx++] = rangle / M_PI;
         env->observations[obs_idx++] = rr;
+    }
+
+    // Make SDF observations
+    float r = env->local_radius * env->observation_radius / env->n_sdf_samples;
+    for (int i = 1; i < env->n_sdf_samples+1; ++i) {
+        Vec2 query_local = { r * i, 0 };
+        Vec2 query_world = local_to_world(frame, query_local);
+        float d = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
+        env->observations[obs_idx++] = d;
+        if (env->render_enabled) {
+            env->cache.sdf_query_world.data[i - 1] = query_world;
+            env->cache.sdf_query_values.data[i - 1] = d;
+        }
     }
 }
 
@@ -549,7 +568,7 @@ void c_step(QuadMeshing* env) {
         env->quad.vertices.data[1] = env->boundary.vertices.data[env->active_vertex];
         env->quad.vertices.data[2] = Polygon2D_neighbor(env->boundary, env->active_vertex,  1);
         const float t = 0.5 * (1.0 + action_angle);
-        const float r = env->action_radius * action_radius;
+        const float r = env->local_radius * env->action_radius * action_radius;
         const Vec2 dir = slerp2(
             sub2(env->quad.vertices.data[0], env->quad.vertices.data[1]),
             sub2(env->quad.vertices.data[2], env->quad.vertices.data[1]),
@@ -637,29 +656,20 @@ void c_render(QuadMeshing* env) {
     // Action radius
     DrawCircleLinesV(
         world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx),
-        world_to_screen_scale(env->action_radius, &ctx), RED);
+        world_to_screen_scale(env->local_radius * env->action_radius, &ctx), RED);
 
     // SDF grid
-    // Frame2D frame = compute_active_local_frame(env);
-    // int N = env->observation_density;
-    // int obs_idx = 0;
-    // for (int y = 0; y < N; ++y) {
-    //     for (int x = 0; x < N; ++x) {
-    //         Vec2 query_local = {
-    //             env->observation_radius * ((x + 0.5f) / N * 2.0 - 1.0),
-    //             env->observation_radius * ((y + 0.5f) / N * 2.0 - 1.0)
-    //         };
-    //         Vec2 query_world = local_to_world(frame, query_local);
-    //         float d = env->observations[obs_idx++];
-    //         Color c = {
-    //             (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.1)),
-    //             (unsigned char)(255 * clamp01(0.5 + 5.0*d * 0.4)),
-    //             (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.7)),
-    //             255
-    //         };
-    //         DrawCircleV(world_to_screen(query_world, &ctx), 3.0, c);
-    //     }
-    // }
+    for (int i = 0; i < env->n_sdf_samples; ++i) {
+        Vec2 query_world = env->cache.sdf_query_world.data[i];
+        float d = env->cache.sdf_query_values.data[i];
+        Color c = {
+            (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.1)),
+            (unsigned char)(255 * clamp01(0.5 + 5.0*d * 0.4)),
+            (unsigned char)(255 * clamp01(0.5 - 5.0*d * 0.7)),
+            255
+        };
+        DrawCircleV(world_to_screen(query_world, &ctx), 3.0, c);
+    }
 
     DrawText(TextFormat("S: SDF | ESC: Quit | Episode return: %f", env->episode_return), 10, 10, 20, DARKGRAY);
 
@@ -672,6 +682,8 @@ void c_close(QuadMeshing* env) {
     Vec2Array_free(&env->quad.vertices);
     mesh2D_free(&env->mesh);
     SizeArray_free(&env->boundary_mesh_vertices);
+    Vec2Array_free(&env->cache.sdf_query_world);
+    FloatArray_free(&env->cache.sdf_query_values);
     if (IsWindowReady()) {
         CloseWindow();
     }

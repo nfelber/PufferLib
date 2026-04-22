@@ -11,10 +11,18 @@ from pufferlib.ocean.quad_meshing import binding
 
 class QuadMeshing(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
-                 observation_density=8, observation_radius=0.3, action_radius=0.3,
-                 boundary_file=None, random_active_vertex=False, delayed_rewards=False,
-                 render_enabled=False, render_target_fps=60,
-                 export_meshes=False, export_mesh_path="mesh.obj"):
+                 boundary_file=None,
+                 random_active_vertex=False,
+                 observe_remaining_area=False,
+                 observation_radius=3,
+                 n_neighbors=0,
+                 n_sdf_samples=0,
+                 action_radius=3,
+                 delayed_rewards=False,
+                 render_enabled=False,
+                 render_target_fps=60,
+                 export_meshes=False,
+                 export_mesh_path="mesh.obj"):
         '''
         Initialize the QuadMeshing environment.
         
@@ -24,13 +32,15 @@ class QuadMeshing(pufferlib.PufferEnv):
             log_interval: Number of steps between log reports
             buf: Optional pre-allocated observation buffer
             seed: Random seed
-            observation_density: NxN grid size for SDF observations (default 32 = 1024 floats)
-            observation_radius: Spatial extent of observation region around active vertex
-            action_radius: Maximum radius multiplier for placing new vertices
             boundary_file: Path to JSON file containing boundary vertices. If not provided,
                            defaults to a hard-coded square boundary. JSON format:
                            {"vertices": [[x1, y1], [x2, y2], ...]}
             random_active_vertex: If True, the active vertex is chosen randomly at each step.
+            observe_remaining_area: If True, the agent observes the remaining fraction of area to mesh.
+            observation_radius: Observation radius multiplier.
+            n_neighbors: The number of left and right neighboring boundary vertices the agent observes.
+            n_sdf_samples: The number of sdf samples the agent observes.
+            action_radius: Maximum radius multiplier for placing new vertices.
             delayed_rewards: If True, only emit reward when the mesh is completed.
             render_enabled: If True, render-related work is enabled in the C env.
             render_target_fps: Target FPS used for rendering.
@@ -72,9 +82,11 @@ class QuadMeshing(pufferlib.PufferEnv):
                 raise ValueError(f"Invalid JSON in boundary file: {e}")
         
         # Observation space: observation_density x observation_density float32 SDF values
-        # num_obs = observation_density * observation_density
-        num_obs = 13
-        # num_obs = 12
+        num_obs = 0
+        if observe_remaining_area:
+            num_obs += 1
+        num_obs += 4 * n_neighbors
+        num_obs += n_sdf_samples
         self.single_observation_space = gymnasium.spaces.Box(
             low=-1.0, high=1.0,
             shape=(num_obs,),
@@ -94,11 +106,6 @@ class QuadMeshing(pufferlib.PufferEnv):
             high=np.array([2.0,  1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
-        # self.single_action_space = gymnasium.spaces.Box(
-        #     low=np.array([-1.0, -1.0, 0.0], dtype=np.float32),
-        #     high=np.array([1.0,  1.0, 1.0], dtype=np.float32),
-        #     dtype=np.float32
-        # )
         
         super().__init__(buf)
         
@@ -111,11 +118,13 @@ class QuadMeshing(pufferlib.PufferEnv):
             self.truncations,
             num_envs,
             seed,
-            observation_density=observation_density,
-            observation_radius=observation_radius,
-            action_radius=action_radius,
             boundary_vertices=boundary_vertices,
             random_active_vertex=random_active_vertex,
+            observe_remaining_area=observe_remaining_area,
+            observation_radius=observation_radius,
+            n_neighbors=n_neighbors,
+            n_sdf_samples=n_sdf_samples,
+            action_radius=action_radius,
             delayed_rewards=delayed_rewards,
             render_enabled=render_enabled,
             render_target_fps=render_target_fps,

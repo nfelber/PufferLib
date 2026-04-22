@@ -3,20 +3,17 @@ seed: 42
 stochastic_policy: true
 baseline_dir: baselines
 boundaries:
+  - name: square
+    boundary_file: boundaries/square.json
+    instant_faces: 200
+  - name: dolphin
+    boundary_file: boundaries/dolphin.json
+    instant_faces: 70
   - name: asterisk3
     boundary_file: boundaries/asterisk3.json
     instant_faces: 200
   - name: asterisk3_big
     boundary_file: boundaries/asterisk3_big.json
-    instant_faces: 200
-  - name: dolphin
-    boundary_file: boundaries/dolphin.json
-    instant_faces: 70
-  - name: rounded_square
-    boundary_file: boundaries/rounded_square.json
-    instant_faces: 200
-  - name: square
-    boundary_file: boundaries/square.json
     instant_faces: 200
 instant_meshes:
   enabled: true

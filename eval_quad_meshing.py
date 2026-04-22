@@ -5,7 +5,7 @@ import sys
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -15,12 +15,13 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from matplotlib.collections import PolyCollection
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import polygonize, triangulate
 
 import pufferlib
 from pufferlib import pufferl
-from pufferlib.ocean.quad_meshing_ee.env.free_mesh_rl_env import FreeMeshRLEnv
 
 try:
     import yaml
@@ -417,10 +418,44 @@ def _mesh_to_polygons(mesh_path: Path) -> list[np.ndarray]:
     raise ValueError(f"Unsupported mesh cells in {mesh_path}: {mesh.cells_dict.keys()}")
 
 
+def _measure_quad(quad: Polygon) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (side_lengths, diagonal_lengths, internal_angles)
+    """
+    verts = np.array(quad.exterior.coords[:-1])
+    assert(len(verts) == 4)
+
+    sides = np.roll(verts, -1, axis=0) - verts
+    side_lengths = np.linalg.norm(sides, axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        unit_sides = sides / side_lengths[:, None]
+
+    diagonal_lengths = np.linalg.norm(verts[:2] - verts[2:], axis=1)
+
+    angles = np.arccos(np.clip(np.sum(-unit_sides * np.roll(unit_sides, -1, axis=0), axis=1), -1.0, 1.0))
+    # Recompute largest angle from the 3 smaller ones to handle concavity
+    max_idx = np.argmax(angles)
+    angles[max_idx] = 2*np.pi - (np.sum(angles[:max_idx]) + np.sum(angles[max_idx+1:]))
+
+    return side_lengths, diagonal_lengths, angles
+
+
+def _compute_quad_score(quad: Polygon) -> float:
+    side_lengths, diagonal_lengths, angles = _measure_quad(quad)
+
+    q_edge = np.sqrt(2) * np.min(side_lengths) / np.max(diagonal_lengths)
+
+    q_angle = np.min(angles) / np.max(angles)
+    if np.isnan(q_angle):
+        q_angle = 0
+
+    return np.sqrt(q_edge * q_angle)
+
+
 def _save_mesh_scores(polygons: list[np.ndarray], out_file: Path) -> dict:
     scores = []
     for poly in polygons:
-        scores.append(FreeMeshRLEnv.quad_score_paper(Polygon(poly)))
+        scores.append(_compute_quad_score(Polygon(poly)))
 
     scores_arr = np.array(scores, dtype=np.float32)
     summary = {
@@ -437,45 +472,73 @@ def _save_mesh_scores(polygons: list[np.ndarray], out_file: Path) -> dict:
     return summary
 
 
-def _plot_mesh_scores(polygons: list[np.ndarray], summary: dict, out_file: Path) -> None:
-    fig, ax = plt.subplots()
+def _plot_polygons(
+    ax,
+    polygons: list[np.ndarray],
+    summary: dict,
+    show_summary: bool,
+    summary_fontsize: float = 9.0,
+    summary_box_pad: float = 0.3,
+) -> None:
     if polygons:
-        scores = [FreeMeshRLEnv.quad_score_paper(Polygon(poly)) for poly in polygons]
+        scores = [_compute_quad_score(Polygon(poly)) for poly in polygons]
         collection = PolyCollection(
             polygons,
             array=np.array(scores),
             cmap="viridis",
             edgecolors="k",
+            zorder=1,
+            linewidth=0.5,
         )
         collection.set_clim(0.0, 1.0)
         ax.add_collection(collection)
         ax.autoscale()
-        fig.colorbar(collection, ax=ax, label="Score")
         ax.set_aspect("equal")
-        plt.xlabel("X")
-        plt.ylabel("Y")
-        plt.title("Quad Element Scores")
-        summary_text = (
-            f"n={summary['n_elements']}\n"
-            f"score={summary['total']:.4f}\n"
-            f"mean={summary['mean']:.4f}\n"
-            f"median={summary['median']:.4f}\n"
-            f"low={summary['low']:.4f}\n"
-            f"high={summary['high']:.4f}"
-        )
-        ax.text(
-            0.02,
-            0.98,
-            summary_text,
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=9,
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if show_summary:
+            summary_text = (
+                f"n={summary['n_elements']}\n"
+                f"score={summary['total']:.3f}\n"
+                f"mean={summary['mean']:.3f}\n"
+                f"median={summary['median']:.3f}\n"
+                f"low={summary['low']:.3f}\n"
+                f"high={summary['high']:.3f}"
+            )
+            ax.text(
+                0.02,
+                0.98,
+                summary_text,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=summary_fontsize,
+                color="black",
+                bbox=dict(
+                    boxstyle=f"round,pad={summary_box_pad}",
+                    facecolor="white",
+                    edgecolor="black",
+                    alpha=0.5,
+                ),
+                clip_on=False,
+                zorder=3,
+            )
     else:
         ax.text(0.5, 0.5, "No quads found", ha="center", va="center")
         ax.set_axis_off()
+
+
+def _plot_mesh_scores(polygons: list[np.ndarray], summary: dict, out_file: Path) -> None:
+    fig, ax = plt.subplots()
+    _plot_polygons(ax, polygons, summary, show_summary=True)
+    if polygons:
+        mappable = ScalarMappable(norm=Normalize(0.0, 1.0), cmap="viridis")
+        fig.subplots_adjust(right=0.88)
+        cax = fig.add_axes([0.9, 0.15, 0.03, 0.7])
+        fig.colorbar(mappable, cax=cax, label="Score")
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.title("Quad Element Scores")
     plt.savefig(out_file)
     plt.close(fig)
 
@@ -485,6 +548,83 @@ def _evaluate_mesh(mesh_path: Path, scores_path: Path, fig_path: Path) -> dict:
     scores = _save_mesh_scores(polygons, scores_path)
     _plot_mesh_scores(polygons, scores, fig_path)
     return scores
+
+
+def _best_run(meshes_dir: Path, scores_dir: Path, boundary_name: str, rl_runs: int) -> tuple[Path | None, dict | None]:
+    best_score = None
+    best_mesh = None
+    best_summary = None
+    for run_idx in range(rl_runs):
+        score_path = scores_dir / boundary_name / f"run_{run_idx}.json"
+        mesh_path = meshes_dir / boundary_name / f"run_{run_idx}_episode0.obj"
+        if not score_path.exists() or not mesh_path.exists():
+            continue
+        summary = _load_scores(score_path)
+        total = summary.get("total")
+        if total is None:
+            continue
+        if best_score is None or total > best_score:
+            best_score = total
+            best_mesh = mesh_path
+            best_summary = summary
+
+    if best_mesh is None:
+        single_score = scores_dir / f"{boundary_name}.json"
+        single_mesh = meshes_dir / f"{boundary_name}.obj"
+        if single_score.exists() and single_mesh.exists():
+            summary = _load_scores(single_score)
+            return single_mesh, summary
+
+    return best_mesh, best_summary
+
+
+def _render_summary_grid(
+    output_dir: Path,
+    model_entries: list[dict],
+    boundaries: list[dict],
+    rl_runs: int,
+    include_instant: bool,
+) -> None:
+    model_names = [_safe_name(entry["name"]) for entry in model_entries]
+    if include_instant and "instant_meshes" not in model_names:
+        model_names.append("instant_meshes")
+    boundary_names = [_safe_name(b["name"]) for b in boundaries]
+    if not model_names or not boundary_names:
+        return
+
+    nrows = len(model_names)
+    ncols = len(boundary_names)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows), squeeze=False)
+
+    for row_idx, model_name in enumerate(model_names):
+        _, model_meshes_dir, _, model_scores_dir = _model_output_dirs(output_dir, model_name)
+        for col_idx, boundary_name in enumerate(boundary_names):
+            ax = axes[row_idx][col_idx]
+            mesh_path, summary = _best_run(model_meshes_dir, model_scores_dir, boundary_name, rl_runs)
+            if mesh_path is None or summary is None:
+                ax.text(0.5, 0.5, "Missing", ha="center", va="center")
+                ax.set_axis_off()
+            else:
+                polygons = _mesh_to_polygons(mesh_path)
+                _plot_polygons(
+                    ax,
+                    polygons,
+                    summary,
+                    show_summary=True,
+                    summary_fontsize=5.0,
+                )
+            if row_idx == 0:
+                ax.set_title(boundary_name, fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(model_name, fontsize=10)
+
+    mappable = ScalarMappable(norm=Normalize(0.0, 1.0), cmap="viridis")
+    fig.subplots_adjust(right=0.9, wspace=0.1, hspace=0.1)
+    cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    fig.colorbar(mappable, cax=cax, label="Score")
+    out_path = output_dir / "summary_grid.svg"
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -688,6 +828,8 @@ def main() -> None:
         else:
             shutil.rmtree(temp_root, ignore_errors=True)
             print("Baseline regression check passed; temp results removed.")
+
+    _render_summary_grid(output_dir, model_entries, boundaries, rl_runs, include_instant=instant_enabled)
 
 
 if __name__ == "__main__":
