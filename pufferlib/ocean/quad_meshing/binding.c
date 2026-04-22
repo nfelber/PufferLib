@@ -12,6 +12,8 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->n_sdf_samples = unpack(kwargs, "n_sdf_samples");
 
     env->action_radius = unpack(kwargs, "action_radius");
+    env->cartesian_actions = unpack(kwargs, "cartesian_actions");
+    env->fixed_local_radius = unpack(kwargs, "fixed_local_radius");
 
     env->delayed_rewards = unpack(kwargs, "delayed_rewards");
 

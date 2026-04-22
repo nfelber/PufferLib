@@ -18,6 +18,8 @@ class QuadMeshing(pufferlib.PufferEnv):
                  n_neighbors=0,
                  n_sdf_samples=0,
                  action_radius=3,
+                 cartesian_actions=False,
+                 fixed_local_radius=0.0,
                  delayed_rewards=False,
                  render_enabled=False,
                  render_target_fps=60,
@@ -41,6 +43,11 @@ class QuadMeshing(pufferlib.PufferEnv):
             n_neighbors: The number of left and right neighboring boundary vertices the agent observes.
             n_sdf_samples: The number of sdf samples the agent observes.
             action_radius: Maximum radius multiplier for placing new vertices.
+            cartesian_actions: If True, action[1:3] are local-frame (x, y) coordinates
+                               for vertex placement. The coordinates are scaled by
+                               local_radius * action_radius.
+            fixed_local_radius: If > 0, overrides the computed local radius for
+                               both actions and observations.
             delayed_rewards: If True, only emit reward when the mesh is completed.
             render_enabled: If True, render-related work is enabled in the C env.
             render_target_fps: Target FPS used for rendering.
@@ -99,11 +106,18 @@ class QuadMeshing(pufferlib.PufferEnv):
         #   - 0 = close_left
         #   - 1 = close_right
         #   - 2 = place_vertex
-        # action[1]: angle in [-1, 1] for vertex placement (continuous)
-        # action[2]: radius multiplier in [0, 1] (continuous)
+        # action[1:3]: either [angle, radius] or [x, y] (cartesian) depending on cartesian_actions
+        #   - polar: angle in [-1, 1], radius multiplier in [0, 1]
+        #   - cartesian: local-frame x in [0, 1], y in [-1, 1]
+        action_low = np.array([0.0, -1.0, -1.0], dtype=np.float32)
+        action_high = np.array([2.0,  1.0,  1.0], dtype=np.float32)
+        if cartesian_actions:
+            action_low[1] = 0.0
+        else:
+            action_low[2] = 0.0
         self.single_action_space = gymnasium.spaces.Box(
-            low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([2.0,  1.0, 1.0], dtype=np.float32),
+            low=action_low,
+            high=action_high,
             dtype=np.float32
         )
         
@@ -125,6 +139,8 @@ class QuadMeshing(pufferlib.PufferEnv):
             n_neighbors=n_neighbors,
             n_sdf_samples=n_sdf_samples,
             action_radius=action_radius,
+            cartesian_actions=cartesian_actions,
+            fixed_local_radius=fixed_local_radius,
             delayed_rewards=delayed_rewards,
             render_enabled=render_enabled,
             render_target_fps=render_target_fps,

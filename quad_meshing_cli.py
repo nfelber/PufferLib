@@ -1,24 +1,33 @@
 import argparse
+import sys
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 
+from pufferlib import pufferl
 from pufferlib.ocean.quad_meshing.quad_meshing import QuadMeshing
 
 
-HELP_TEXT = (
-    "Controls:\n"
-    "  0                  -> close_left\n"
-    "  1                  -> close_right\n"
-    "  2 <angle> <radius> -> place_vertex (angle in [-1,1], radius in [0,1])\n"
-    "  r                  -> reset\n"
-    "  h                  -> help\n"
-    "  q                  -> quit\n"
-)
+def _help_text(cartesian_actions: bool) -> str:
+    if cartesian_actions:
+        place = "  2 <x> <y>          -> place_vertex (local-frame x in [0,1], y in [-1,1])\n"
+    else:
+        place = "  2 <angle> <radius> -> place_vertex (angle in [-1,1], radius in [0,1])\n"
+    return (
+        "Controls:\n"
+        "  0                  -> close_left\n"
+        "  1                  -> close_right\n"
+        f"{place}"
+        "  r                  -> reset\n"
+        "  h                  -> help\n"
+        "  q                  -> quit\n"
+    )
 
 
-def _parse_command(line):
+def _parse_command(line, cartesian_actions: bool):
     if not line:
         return ("noop", None)
     text = line.strip()
@@ -43,13 +52,17 @@ def _parse_command(line):
         else:
             parts = parts[1:]
         if len(parts) != 2:
+            if cartesian_actions:
+                return ("error", "place_vertex requires: 2 <x> <y>")
             return ("error", "place_vertex requires: 2 <angle> <radius>")
         try:
-            angle = float(parts[0])
-            radius = float(parts[1])
+            value1 = float(parts[0])
+            value2 = float(parts[1])
         except ValueError:
+            if cartesian_actions:
+                return ("error", "x and y must be numbers")
             return ("error", "angle and radius must be numbers")
-        return ("action", np.array([[2.0, angle, radius]], dtype=np.float32))
+        return ("action", np.array([[2.0, value1, value2]], dtype=np.float32))
 
     return ("error", "unknown command; type 'h' for help")
 
@@ -64,36 +77,57 @@ def _render_loop(env, lock, stop_event, render_interval):
             time.sleep(render_interval - elapsed)
 
 
+@contextmanager
+def _clean_argv():
+    saved = sys.argv
+    sys.argv = [saved[0]]
+    try:
+        yield
+    finally:
+        sys.argv = saved
+
+
+def _load_quad_meshing_config():
+    config_path = Path(pufferl.__file__).resolve().parent / "config/ocean/quad_meshing.ini"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Quad meshing config not found: {config_path}")
+    with _clean_argv():
+        args = pufferl.load_config_file(str(config_path))
+    return args
+
+
 def main():
+    args = _load_quad_meshing_config()
+    env_cfg = args["env"]
+    cartesian_actions = bool(env_cfg.get("cartesian_actions", False))
+
     parser = argparse.ArgumentParser(
         description="Manual CLI control for the quad_meshing environment."
     )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--observation-density", type=int, default=8)
-    parser.add_argument("--observation-radius", type=float, default=0.3)
-    parser.add_argument("--action-radius", type=float, default=0.06)
     parser.add_argument("--boundary-file", type=str, default=None)
-    parser.add_argument("--delayed-rewards", action="store_true")
-    parser.add_argument("--render-fps", type=float, default=60.0)
-    parser.add_argument("--log-interval", type=int, default=128)
-    args = parser.parse_args()
+    cli_args = parser.parse_args()
 
     env = QuadMeshing(
         num_envs=1,
-        observation_density=args.observation_density,
-        observation_radius=args.observation_radius,
-        action_radius=args.action_radius,
-        boundary_file=args.boundary_file,
-        delayed_rewards=args.delayed_rewards,
-        log_interval=args.log_interval,
-        seed=args.seed,
+        boundary_file=cli_args.boundary_file or env_cfg.get("boundary_file"),
+        random_active_vertex=env_cfg.get("random_active_vertex", False),
+        observe_remaining_area=env_cfg.get("observe_remaining_area", False),
+        observation_radius=env_cfg.get("observation_radius", 1.0),
+        n_neighbors=env_cfg.get("n_neighbors", 0),
+        n_sdf_samples=env_cfg.get("n_sdf_samples", 0),
+        action_radius=env_cfg.get("action_radius", 1.0),
+        cartesian_actions=cartesian_actions,
+        fixed_local_radius=env_cfg.get("fixed_local_radius", 0.0),
+        delayed_rewards=env_cfg.get("delayed_rewards", False),
+        export_meshes=env_cfg.get("export_meshes", False),
+        export_mesh_path=env_cfg.get("export_mesh_path", "mesh.obj"),
         render_enabled=True,
     )
-    env.reset(seed=args.seed)
+    env.reset()
 
     stop_event = threading.Event()
     env_lock = threading.Lock()
-    render_interval = 1.0 / max(args.render_fps, 1.0)
+    render_interval = 1.0 / 30.0
     render_thread = threading.Thread(
         target=_render_loop,
         args=(env, env_lock, stop_event, render_interval),
@@ -102,7 +136,7 @@ def main():
     render_thread.start()
 
     try:
-        print(HELP_TEXT)
+        print(_help_text(cartesian_actions))
         while not stop_event.is_set():
             try:
                 line = input("action> ")
@@ -110,18 +144,18 @@ def main():
                 stop_event.set()
                 break
 
-            cmd, data = _parse_command(line)
+            cmd, data = _parse_command(line, cartesian_actions)
             if cmd == "noop":
                 continue
             if cmd == "quit":
                 stop_event.set()
                 break
             if cmd == "help":
-                print(HELP_TEXT)
+                print(_help_text(cartesian_actions))
                 continue
             if cmd == "reset":
                 with env_lock:
-                    env.reset(seed=args.seed)
+                    env.reset()
                 print("Environment reset")
                 continue
             if cmd == "error":
@@ -138,7 +172,7 @@ def main():
                     print(f"info: {info}")
                 if done or truncated:
                     with env_lock:
-                        env.reset(seed=args.seed)
+                        env.reset()
                     print("Episode ended; environment reset")
     finally:
         stop_event.set()

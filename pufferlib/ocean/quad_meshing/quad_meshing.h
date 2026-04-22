@@ -43,6 +43,7 @@ typedef struct {
     int episode_max_length;
     Polygon2D starting_boundary;
     float target_quad_area;
+    float fixed_local_radius;
     bool random_active_vertex;
 
     // Observations config
@@ -53,6 +54,7 @@ typedef struct {
 
     // Actions config
     float action_radius;
+    bool cartesian_actions;
 
     // Rewards config
     bool delayed_rewards;
@@ -342,9 +344,13 @@ void compute_observations(QuadMeshing* env) {
     }
 
     // Compute local radius
-    env->local_radius = 0.5 *
-      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
-      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
+    if (env->fixed_local_radius > 0.0f) {
+        env->local_radius = env->fixed_local_radius;
+    } else {
+        env->local_radius = 0.5 *
+          norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
+          norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
+    }
 
     // env->active_vertex = rand() % env->boundary.vertices.size;
     // int countdown = env->boundary.vertices.size;
@@ -499,6 +505,8 @@ void c_step(QuadMeshing* env) {
     const int action_kind = roundf(env->actions[0]);
     const float action_angle = env->actions[1];
     const float action_radius = env->actions[2];
+    const float action_x = env->actions[1];
+    const float action_y = env->actions[2];
 
     bool action_valid = false;
     bool quad_mesh_indices_ready = false;
@@ -567,14 +575,21 @@ void c_step(QuadMeshing* env) {
         env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
         env->quad.vertices.data[1] = env->boundary.vertices.data[env->active_vertex];
         env->quad.vertices.data[2] = Polygon2D_neighbor(env->boundary, env->active_vertex,  1);
-        const float t = 0.5 * (1.0 + action_angle);
-        const float r = env->local_radius * env->action_radius * action_radius;
-        const Vec2 dir = slerp2(
-            sub2(env->quad.vertices.data[0], env->quad.vertices.data[1]),
-            sub2(env->quad.vertices.data[2], env->quad.vertices.data[1]),
-            t, !env->boundary.isCCW
-        );
-        env->quad.vertices.data[3] = add2(env->quad.vertices.data[1], scalmul2(dir, r));
+        const float action_scale = env->local_radius * env->action_radius;
+        if (env->cartesian_actions) {
+            Frame2D frame = compute_active_local_frame(env);
+            Vec2 local = { action_x * action_scale, action_y * action_scale };
+            env->quad.vertices.data[3] = local_to_world(frame, local);
+        } else {
+            const float t = 0.5 * (1.0 + action_angle);
+            const float r = action_scale * action_radius;
+            const Vec2 dir = slerp2(
+                sub2(env->quad.vertices.data[0], env->quad.vertices.data[1]),
+                sub2(env->quad.vertices.data[2], env->quad.vertices.data[1]),
+                t, !env->boundary.isCCW
+            );
+            env->quad.vertices.data[3] = add2(env->quad.vertices.data[1], scalmul2(dir, r));
+        }
 
         const Segment2D new_edge1 = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
         const Segment2D new_edge2 = {env->quad.vertices.data[2], env->quad.vertices.data[3]};
@@ -653,10 +668,12 @@ void c_render(QuadMeshing* env) {
     // Active vertex
     DrawCircleV(world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx), 8.0, RED);
 
-    // Action radius
-    DrawCircleLinesV(
-        world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx),
-        world_to_screen_scale(env->local_radius * env->action_radius, &ctx), RED);
+    if (!env->cartesian_actions) {
+        // Action radius
+        DrawCircleLinesV(
+            world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx),
+            world_to_screen_scale(env->local_radius * env->action_radius, &ctx), RED);
+    }
 
     // SDF grid
     for (int i = 0; i < env->n_sdf_samples; ++i) {
