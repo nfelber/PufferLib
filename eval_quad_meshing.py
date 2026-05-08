@@ -140,6 +140,42 @@ def _select_action(logits, stochastic_policy: bool):
     return action
 
 
+def _init_action_counts(action_space) -> tuple[Optional[np.ndarray], Optional[str]]:
+    if hasattr(action_space, "n"):
+        return np.zeros(int(action_space.n), dtype=np.int64), "discrete"
+    if hasattr(action_space, "low") and hasattr(action_space, "high"):
+        low = np.asarray(action_space.low).ravel()
+        high = np.asarray(action_space.high).ravel()
+        if low.size and high.size:
+            low0 = float(low[0])
+            high0 = float(high[0])
+            rounded_high = int(round(high0))
+            if np.isclose(low0, 0.0) and np.isclose(high0, rounded_high) and rounded_high in (2, 5):
+                return np.zeros(rounded_high + 1, dtype=np.int64), "box0"
+    return None, None
+
+
+def _update_action_counts(
+    action_counts: Optional[np.ndarray],
+    action,
+    mode: Optional[str],
+) -> None:
+    if action_counts is None or mode is None:
+        return
+    action_arr = np.asarray(action)
+    if mode == "box0":
+        if action_arr.ndim == 0:
+            values = np.array([action_arr], dtype=np.float32)
+        else:
+            values = action_arr[..., 0].astype(np.float32, copy=False).ravel()
+        action_arr = np.rint(values).astype(np.int64, copy=False)
+    else:
+        action_arr = action_arr.astype(np.int64, copy=False).ravel()
+    for act in action_arr:
+        if 0 <= act < action_counts.shape[0]:
+            action_counts[act] += 1
+
+
 def _run_puffer_eval(
     env_name: str,
     model_path: str,
@@ -150,7 +186,7 @@ def _run_puffer_eval(
     device: str,
     max_steps: int,
     stochastic_policy: bool,
-) -> Path:
+) -> tuple[Path, Optional[np.ndarray]]:
     with _clean_argv():
         if config_path is None:
             args = pufferl.load_config(env_name)
@@ -160,7 +196,8 @@ def _run_puffer_eval(
     args["vec"]["num_envs"] = 1
     args["vec"]["num_workers"] = 1
     args["env"]["num_envs"] = 1
-    args["env"]["boundary_file"] = str(boundary_file)
+    args["env"].pop("boundary_file", None)
+    args["env"]["boundary_files"] = [str(boundary_file)]
     args["env"]["export_meshes"] = True
     args["env"]["export_mesh_path"] = str(export_template)
     args["env"]["render_enabled"] = False
@@ -180,6 +217,7 @@ def _run_puffer_eval(
     policy.eval()
 
     obs, _ = vecenv.reset(seed=seed)
+    action_counts, action_count_mode = _init_action_counts(vecenv.action_space)
     state = {}
     if args["train"].get("use_rnn"):
         num_agents = vecenv.observation_space.shape[0]
@@ -199,6 +237,7 @@ def _run_puffer_eval(
         if isinstance(logits, (torch.distributions.Normal, pufferlib.pytorch.HybridDistribution)):
             action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
+        _update_action_counts(action_counts, action, action_count_mode)
         obs, _, terminals, truncations, _ = vecenv.step(action)
         steps += 1
         if np.any(terminals) or np.any(truncations):
@@ -213,7 +252,7 @@ def _run_puffer_eval(
     exported_path = Path(str(export_template).replace("{episode}", "0"))
     if not exported_path.exists():
         raise FileNotFoundError(f"Expected exported mesh at {exported_path}")
-    return exported_path
+    return exported_path, action_counts
 
 
 def _run_instant_meshes(binary: Path, args: list[str], input_mesh: Path, output_mesh: Path) -> Path:
@@ -472,6 +511,28 @@ def _save_mesh_scores(polygons: list[np.ndarray], out_file: Path) -> dict:
     return summary
 
 
+def _overlay_action_barplot(
+    ax,
+    action_counts: np.ndarray,
+    fontsize: float,
+    loc: tuple[float, float, float, float],
+) -> None:
+    total = int(action_counts.sum())
+    if total == 0:
+        return
+    inset = ax.inset_axes(loc)
+    labels = np.arange(action_counts.shape[0], dtype=int)
+    inset.bar(labels, action_counts, color="#4c78a8", alpha=0.7)
+    inset.set_xticks(labels)
+    inset.tick_params(axis="both", labelsize=fontsize * 0.8, length=0)
+    inset.set_title("Actions", fontsize=fontsize)
+    inset.set_ylabel("count", fontsize=fontsize * 0.8)
+    inset.set_facecolor("white")
+    inset.patch.set_alpha(0.7)
+    for spine in inset.spines.values():
+        spine.set_linewidth(0.5)
+
+
 def _plot_polygons(
     ax,
     polygons: list[np.ndarray],
@@ -479,7 +540,15 @@ def _plot_polygons(
     show_summary: bool,
     summary_fontsize: float = 9.0,
     summary_box_pad: float = 0.3,
+    failure_text: str | None = None,
+    action_counts: Optional[np.ndarray] = None,
 ) -> None:
+    if failure_text:
+        ax.text(0.5, 0.5, failure_text, ha="center", va="center")
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
     if polygons:
         scores = [_compute_quad_score(Polygon(poly)) for poly in polygons]
         collection = PolyCollection(
@@ -523,15 +592,37 @@ def _plot_polygons(
                 clip_on=False,
                 zorder=3,
             )
+        if action_counts is not None:
+            _overlay_action_barplot(
+                ax,
+                action_counts,
+                fontsize=summary_fontsize,
+                loc=(0.76, 0.1, 0.20, 0.20),
+            )
     else:
         ax.text(0.5, 0.5, "No quads found", ha="center", va="center")
-        ax.set_axis_off()
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
 
 
-def _plot_mesh_scores(polygons: list[np.ndarray], summary: dict, out_file: Path) -> None:
+def _plot_mesh_scores(
+    polygons: list[np.ndarray],
+    summary: dict,
+    out_file: Path,
+    failure_text: str | None = None,
+    action_counts: Optional[np.ndarray] = None,
+) -> None:
     fig, ax = plt.subplots()
-    _plot_polygons(ax, polygons, summary, show_summary=True)
-    if polygons:
+    _plot_polygons(
+        ax,
+        polygons,
+        summary,
+        show_summary=True,
+        failure_text=failure_text,
+        action_counts=action_counts,
+    )
+    if polygons and not failure_text:
         mappable = ScalarMappable(norm=Normalize(0.0, 1.0), cmap="viridis")
         fig.subplots_adjust(right=0.88)
         cax = fig.add_axes([0.9, 0.15, 0.03, 0.7])
@@ -543,10 +634,31 @@ def _plot_mesh_scores(polygons: list[np.ndarray], summary: dict, out_file: Path)
     plt.close(fig)
 
 
-def _evaluate_mesh(mesh_path: Path, scores_path: Path, fig_path: Path) -> dict:
-    polygons = _mesh_to_polygons(mesh_path)
+def _evaluate_mesh(
+    mesh_path: Path,
+    scores_path: Path,
+    fig_path: Path,
+    action_counts: Optional[np.ndarray] = None,
+) -> dict:
+    failure_text = None
+    try:
+        polygons = _mesh_to_polygons(mesh_path)
+    except ValueError as exc:
+        polygons = []
+        failure_text = f"Mesh failed:\n{exc}"
     scores = _save_mesh_scores(polygons, scores_path)
-    _plot_mesh_scores(polygons, scores, fig_path)
+    if action_counts is not None:
+        scores["action_counts"] = action_counts.astype(int).tolist()
+        scores["action_total"] = int(action_counts.sum())
+        with open(scores_path, "w") as handle:
+            json.dump(scores, handle, indent=2)
+    _plot_mesh_scores(
+        polygons,
+        scores,
+        fig_path,
+        failure_text=failure_text,
+        action_counts=action_counts,
+    )
     return scores
 
 
@@ -603,15 +715,27 @@ def _render_summary_grid(
             mesh_path, summary = _best_run(model_meshes_dir, model_scores_dir, boundary_name, rl_runs)
             if mesh_path is None or summary is None:
                 ax.text(0.5, 0.5, "Missing", ha="center", va="center")
-                ax.set_axis_off()
+                ax.set_aspect("equal")
+                ax.set_xticks([])
+                ax.set_yticks([])
             else:
-                polygons = _mesh_to_polygons(mesh_path)
+                failure_text = None
+                try:
+                    polygons = _mesh_to_polygons(mesh_path)
+                except ValueError as exc:
+                    polygons = []
+                    failure_text = f"Mesh failed"
+                action_counts = None
+                if "action_counts" in summary:
+                    action_counts = np.asarray(summary["action_counts"], dtype=np.int64)
                 _plot_polygons(
                     ax,
                     polygons,
                     summary,
                     show_summary=True,
                     summary_fontsize=5.0,
+                    failure_text=failure_text,
+                    action_counts=action_counts,
                 )
             if row_idx == 0:
                 ax.set_title(boundary_name, fontsize=10)
@@ -724,7 +848,7 @@ def main() -> None:
 
             for run_idx in range(rl_runs):
                 export_template = boundary_mesh_dir / f"run_{run_idx}_episode{{episode}}.obj"
-                mesh_path = _run_puffer_eval(
+                mesh_path, action_counts = _run_puffer_eval(
                     env_name=args.env_name,
                     model_path=model_path,
                     config_path=model_entry.get("config_path"),
@@ -738,7 +862,7 @@ def main() -> None:
 
                 score_path = boundary_scores_dir / f"run_{run_idx}.json"
                 fig_path = boundary_fig_dir / f"run_{run_idx}.svg"
-                _evaluate_mesh(mesh_path, score_path, fig_path)
+                _evaluate_mesh(mesh_path, score_path, fig_path, action_counts=action_counts)
 
     if instant_enabled:
         instant_root, instant_meshes_dir, instant_figs_dir, instant_scores_dir = _model_output_dirs(
@@ -797,7 +921,7 @@ def main() -> None:
 
                 for run_idx in range(rl_runs):
                     export_template = boundary_mesh_dir / f"run_{run_idx}_episode{{episode}}.obj"
-                    mesh_path = _run_puffer_eval(
+                    mesh_path, action_counts = _run_puffer_eval(
                         env_name=args.env_name,
                         model_path=str(Path(baseline["path"]).resolve()),
                         config_path=baseline.get("config_path"),
@@ -810,7 +934,7 @@ def main() -> None:
                     )
                     score_path = boundary_scores_dir / f"run_{run_idx}.json"
                     fig_path = boundary_fig_dir / f"run_{run_idx}.svg"
-                    _evaluate_mesh(mesh_path, score_path, fig_path)
+                    _evaluate_mesh(mesh_path, score_path, fig_path, action_counts=action_counts)
 
             existing_root, _, _, existing_scores_dir = _model_output_dirs(output_dir, model_name)
             if not existing_scores_dir.exists():

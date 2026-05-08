@@ -209,6 +209,7 @@ class PuffeRL:
         self.profile = Profile()
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
+        self.best_perf = 0
         self.losses = {}
 
         # Dashboard
@@ -469,6 +470,12 @@ class PuffeRL:
             self.last_log_step = self.global_step
             profile.clear()
 
+        perf = self.last_stats['perf']
+        if isinstance(perf, float) and perf > self.best_perf:
+            self.save_checkpoint(f"best.pt")
+            self.msg = f'New best model saved at update {self.epoch}'
+            self.best_perf = perf
+
         if self.epoch % config['checkpoint_interval'] == 0 or done_training:
             self.save_checkpoint()
             self.msg = f'Checkpoint saved at update {self.epoch}'
@@ -521,7 +528,7 @@ class PuffeRL:
         shutil.copy(model_path, path)
         return path
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, model_name=None):
         if torch.distributed.is_initialized():
            if torch.distributed.get_rank() != 0:
                return
@@ -531,7 +538,8 @@ class PuffeRL:
         if not os.path.exists(path):
             os.makedirs(path)
 
-        model_name = f'model_{self.config["env"]}_{self.epoch:06d}.pt'
+        if model_name is None:
+            model_name = f'model_{self.config["env"]}_{self.epoch:06d}.pt'
         model_path = os.path.join(path, model_name)
         if os.path.exists(model_path):
             return model_path

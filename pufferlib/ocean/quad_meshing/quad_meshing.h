@@ -44,10 +44,16 @@ typedef struct {
     Polygon2D starting_boundary;
     float target_quad_area;
     float fixed_local_radius;
+    int boundary_set_count;
+    int boundary_set_index;
+    float** boundary_sets;
+    int* boundary_set_sizes;
     bool random_active_vertex;
+    bool edge_mode;
 
     // Observations config
     bool observe_remaining_area;
+    bool observe_local_radius;
     float observation_radius;
     int n_neighbors;
     int n_sdf_samples;
@@ -73,6 +79,7 @@ typedef struct {
     Mesh2D mesh;
     SizeArray boundary_mesh_vertices;
     int active_vertex;
+    int active_edge_start;
     float local_radius;
     int episode_length;
     float episode_return;
@@ -189,10 +196,10 @@ static void update_render_bounds(QuadMeshing* env) {
     env->cache.render_bounds_dirty = false;
 }
 
-void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
+static void load_starting_boundary(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
     // Initialize starting boundary from provided vertices or default to square
-    Vec2Array_init(&env->starting_boundary.vertices);
-    
+    Vec2Array_resize(&env->starting_boundary.vertices, 0);
+
     if (boundary_vertices && num_vertices >= 3) {
         // Load from provided vertices
         Vec2Array_reserve(&env->starting_boundary.vertices, num_vertices);
@@ -248,6 +255,35 @@ void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
     env->cache.starting_boundary_area = polygon2D_area(env->starting_boundary);
     env->cache.boundary_area = env->cache.starting_boundary_area;
 
+    if (env->starting_boundary.vertices.size == 0) {
+        env->target_quad_area = 1.0f;
+        env->episode_max_length = 1;
+        env->active_vertex = 0;
+        return;
+    }
+
+    // Calculate target_quad_area as square of average boundary segment length
+    float perimeter = 0.0f;
+    for (int i = env->starting_boundary.vertices.size - 1, j = 0; j < env->starting_boundary.vertices.size; i = j, ++j) {
+        Vec2 v_curr = env->starting_boundary.vertices.data[i];
+        Vec2 v_next = env->starting_boundary.vertices.data[j];
+        float dx = v_next.x - v_curr.x;
+        float dy = v_next.y - v_curr.y;
+        perimeter += sqrtf(dx * dx + dy * dy);
+    }
+    float avg_segment_length = perimeter / env->starting_boundary.vertices.size;
+    env->target_quad_area = avg_segment_length * avg_segment_length;
+
+    // Calculate episode_max_length as 2 * (boundary area) / (target quad area)
+    env->episode_max_length = (int)(2.0f * env->cache.starting_boundary_area / env->target_quad_area);
+
+    env->active_vertex = 0;
+}
+
+void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
+    Vec2Array_init(&env->starting_boundary.vertices);
+    load_starting_boundary(env, boundary_vertices, num_vertices);
+
     // Allocate boundary
     Vec2Array_init(&env->boundary.vertices);
     Vec2Array_reserve(&env->boundary.vertices, env->starting_boundary.vertices.size);
@@ -265,29 +301,14 @@ void init(QuadMeshing* env, float* boundary_vertices, int num_vertices) {
     FloatArray_init(&env->cache.sdf_query_values);
     FloatArray_resize(&env->cache.sdf_query_values, env->n_sdf_samples);
 
-    // Calculate target_quad_area as square of average boundary segment length
-    float perimeter = 0.0;
-    for (int i = env->starting_boundary.vertices.size - 1, j = 0; j < env->starting_boundary.vertices.size; i = j, ++j) {
-        Vec2 v_curr = env->starting_boundary.vertices.data[i];
-        Vec2 v_next = env->starting_boundary.vertices.data[j];
-        float dx = v_next.x - v_curr.x;
-        float dy = v_next.y - v_curr.y;
-        perimeter += sqrtf(dx * dx + dy * dy);
-    }
-    float avg_segment_length = perimeter / env->starting_boundary.vertices.size;
-    env->target_quad_area = avg_segment_length * avg_segment_length;
-
-    // Calculate episode_max_length as 2 * (boundary area) / (target quad area)
-    env->episode_max_length = (int)(2.0 * env->cache.starting_boundary_area / env->target_quad_area);
-    
-    env->active_vertex = 0;    
+    env->active_vertex = 0;
     env->mesh_enabled = env->render_enabled || env->export_meshes;
 }
 
 void add_log(QuadMeshing* env) {
     // env->log.perf += (env->episode_length < env->episode_max_length) ?
     //     env->episode_return / polygon2D_area(env->starting_boundary) : 0;
-    env->log.perf += env->episode_return / env->cache.starting_boundary_area;
+    env->log.perf += env->episode_return * env->target_quad_area / env->cache.starting_boundary_area;
     env->log.score += env->episode_return;
     env->log.episode_length += env->episode_length;
     env->log.episode_return += env->episode_return;
@@ -321,55 +342,74 @@ static Frame2D compute_active_local_frame(QuadMeshing* env) {
     return f;
 }
 
-void compute_observations(QuadMeshing* env) {
-    assert(env->boundary.vertices.size > 0);
-
-    // Determine active vertex
+static int select_active_vertex_index(QuadMeshing* env) {
     if (env->random_active_vertex) {
-        // Pick at random among interior angles <= pi
-        do {
-            env->active_vertex = rand() % env->boundary.vertices.size;
-        } while (polygonInteriorAngle(env->boundary, env->active_vertex) > M_PI);
-    } else {
-        // Pick vertex with smallest interior angle
-        env->active_vertex = 0;
-        float angleMin = polygonInteriorAngle(env->boundary, 0);
-        for (int i=1; i<env->boundary.vertices.size; ++i) {
-            const float angle = polygonInteriorAngle(env->boundary, i);
-            if (angle < angleMin) {
-                angleMin = angle;
-                env->active_vertex = i;
-            }
+        // int idx;
+        // int ctr = 0;
+        // do {
+        //     idx = rand() % env->boundary.vertices.size;
+        //     if (++ctr == 10) {
+        //       break;
+        //     }
+        // } while (polygonInteriorAngle(env->boundary, idx) > M_PI);
+        // return idx;
+
+        int idx = rand() % env->boundary.vertices.size;
+        int countdown = env->boundary.vertices.size;
+        while (polygonInteriorAngle(env->boundary, env->active_vertex) > M_PI && --countdown != 0) {
+            idx = polygon2D_neighbor_index(env->boundary, env->active_vertex, 1);
+        }
+        return idx;
+    }
+
+    int idx = 0;
+    float angleMin = polygonInteriorAngle(env->boundary, 0);
+    for (int i=1; i<env->boundary.vertices.size; ++i) {
+        const float angle = polygonInteriorAngle(env->boundary, i);
+        if (angle < angleMin) {
+            angleMin = angle;
+            idx = i;
         }
     }
+    return idx;
+}
 
-    // Compute local radius
-    if (env->fixed_local_radius > 0.0f) {
-        env->local_radius = env->fixed_local_radius;
-    } else {
-        env->local_radius = 0.5 *
-          norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
-          norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
+static Frame2D compute_edge_local_frame(QuadMeshing* env) {
+    Vec2 v0 = env->boundary.vertices.data[env->active_edge_start];
+    Vec2 v1 = Polygon2D_neighbor(env->boundary, env->active_edge_start, 1);
+    Vec2 tangent = safe_normalize(sub2(v1, v0));
+    Vec2 inward = env->boundary.isCCW
+        ? (Vec2){ -tangent.y, tangent.x }
+        : (Vec2){ tangent.y, -tangent.x };
+    Frame2D f;
+    f.origin = scalmul2(add2(v0, v1), 0.5f);
+    f.x = inward;
+    f.y = tangent;
+    return f;
+}
+
+static void write_sdf_observations(QuadMeshing* env, Frame2D frame, int* obs_idx) {
+    float r = env->local_radius * env->observation_radius / env->n_sdf_samples;
+    for (int i = 1; i < env->n_sdf_samples+1; ++i) {
+        Vec2 query_local = { r * i, 0 };
+        Vec2 query_world = local_to_world(frame, query_local);
+        float d = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
+        env->observations[(*obs_idx)++] = d;
+        if (env->render_enabled) {
+            env->cache.sdf_query_world.data[i - 1] = query_world;
+            env->cache.sdf_query_values.data[i - 1] = d;
+        }
     }
+}
 
-    // env->active_vertex = rand() % env->boundary.vertices.size;
-    // int countdown = env->boundary.vertices.size;
-    // while (polygonInteriorAngle(env->boundary, env->active_vertex) > M_PI) {
-    //     env->active_vertex = polygon2D_neighbor_index(env->boundary, env->active_vertex, 1);
-    //     if (--countdown == 0) {
-    //         printf("============ BOUNDARY ============\n");
-    //         for (int i=0; i<env->boundary.vertices.size; ++i) {
-    //             const float angle = polygonInteriorAngle(env->boundary, i);
-    //             printf("%d (%f, %f): %f\n", i, env->boundary.vertices.data[i].x, env->boundary.vertices.data[i].y, angle);
-    //         }
-    //         break;
-    //     }
-    // }
-
+static void compute_vertex_observations(QuadMeshing* env) {
     int obs_idx = 0;
-
     if (env->observe_remaining_area) {
         env->observations[obs_idx++] = get_boundary_area(env) / env->cache.starting_boundary_area;
+    }
+
+    if (env->observe_local_radius) {
+        env->observations[obs_idx++] = env->local_radius;
     }
 
     Frame2D frame = compute_active_local_frame(env);
@@ -386,18 +426,54 @@ void compute_observations(QuadMeshing* env) {
         env->observations[obs_idx++] = rr;
     }
 
-    // Make SDF observations
-    float r = env->local_radius * env->observation_radius / env->n_sdf_samples;
-    for (int i = 1; i < env->n_sdf_samples+1; ++i) {
-        Vec2 query_local = { r * i, 0 };
-        Vec2 query_world = local_to_world(frame, query_local);
-        float d = clampf(eval_polygon2D_sdf(env->boundary, query_world), -1.0, 1.0);
-        env->observations[obs_idx++] = d;
-        if (env->render_enabled) {
-            env->cache.sdf_query_world.data[i - 1] = query_world;
-            env->cache.sdf_query_values.data[i - 1] = d;
-        }
+    write_sdf_observations(env, frame, &obs_idx);
+}
+
+static void compute_edge_observations(QuadMeshing* env) {
+    int obs_idx = 0;
+    if (env->observe_remaining_area) {
+        env->observations[obs_idx++] = get_boundary_area(env) / env->cache.starting_boundary_area;
     }
+
+    if (env->observe_local_radius) {
+        env->observations[obs_idx++] = env->local_radius;
+    }
+
+    env->observations[obs_idx++] = env->local_radius;
+    Frame2D frame = compute_edge_local_frame(env);
+    for (int i=0; i<env->n_neighbors; ++i) {
+        int left_idx = polygon2D_neighbor_index(env->boundary, env->active_edge_start, -i-1);
+        int right_idx = polygon2D_neighbor_index(env->boundary, env->active_edge_start, i+2);
+        Vec2 ln = world_to_local(frame, env->boundary.vertices.data[left_idx]);
+        Vec2 rn = world_to_local(frame, env->boundary.vertices.data[right_idx]);
+        env->observations[obs_idx++] = ln.x;
+        env->observations[obs_idx++] = ln.y;
+        env->observations[obs_idx++] = rn.x;
+        env->observations[obs_idx++] = rn.y;
+    }
+
+    write_sdf_observations(env, frame, &obs_idx);
+}
+
+void compute_observations(QuadMeshing* env) {
+    assert(env->boundary.vertices.size > 0);
+
+    if (env->edge_mode) {
+        env->active_edge_start = select_active_vertex_index(env);
+        Vec2 v0 = env->boundary.vertices.data[env->active_edge_start];
+        Vec2 v1 = Polygon2D_neighbor(env->boundary, env->active_edge_start, 1);
+        float edge_length = norm2(sub2(v1, v0));
+        env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : edge_length;
+        compute_edge_observations(env);
+        return;
+    }
+
+    env->active_vertex = select_active_vertex_index(env);
+    float radius = 0.5 *
+      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
+      norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
+    env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : radius;
+    compute_vertex_observations(env);
 }
 
 float compute_reward(QuadMeshing* env, Polygon2D quad) {
@@ -434,15 +510,234 @@ float compute_reward(QuadMeshing* env, Polygon2D quad) {
     // return 0.5 * (eq + dq);
 }
 
+static void remove_adjacent_pair(QuadMeshing* env, int start_idx) {
+    const int size = env->boundary.vertices.size;
+    if (start_idx == size - 1) {
+        env->boundary.vertices.data[0] = env->boundary.vertices.data[size - 2];
+        env->boundary.vertices.size -= 2;
+        env->boundary_mesh_vertices.data[0] = env->boundary_mesh_vertices.data[size - 2];
+        env->boundary_mesh_vertices.size -= 2;
+    } else {
+        Vec2Array_remove_range(&env->boundary.vertices, start_idx, start_idx + 1);
+        SizeArray_remove_range(&env->boundary_mesh_vertices, start_idx, start_idx + 1);
+    }
+    mark_boundary_dirty(env);
+}
+
+static bool try_close_quad(
+    QuadMeshing* env,
+    int idx0,
+    int idx1,
+    int idx2,
+    int idx3,
+    int remove_start_idx,
+    size_t quad_mesh_indices[4],
+    bool* quad_mesh_indices_ready
+) {
+    env->quad.vertices.data[0] = env->boundary.vertices.data[idx0];
+    env->quad.vertices.data[1] = env->boundary.vertices.data[idx1];
+    env->quad.vertices.data[2] = env->boundary.vertices.data[idx2];
+    env->quad.vertices.data[3] = env->boundary.vertices.data[idx3];
+    const Segment2D new_edge = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
+    const float quad_area = polygon2D_area(env->quad);
+    const float boundary_area = get_boundary_area(env);
+
+    const bool action_valid = !(polygon2D_segment_intersect(env->boundary, new_edge, NULL, 1e-6) ||
+                                boundary_area < quad_area ||
+                                !(env->boundary.isCCW == is_polygon_ccw(env->quad)));
+    if (action_valid) {
+        quad_mesh_indices[0] = env->boundary_mesh_vertices.data[idx0];
+        quad_mesh_indices[1] = env->boundary_mesh_vertices.data[idx1];
+        quad_mesh_indices[2] = env->boundary_mesh_vertices.data[idx2];
+        quad_mesh_indices[3] = env->boundary_mesh_vertices.data[idx3];
+        *quad_mesh_indices_ready = true;
+        remove_adjacent_pair(env, remove_start_idx);
+    }
+    return action_valid;
+}
+
+static Vec2 edge_action_local(QuadMeshing* env, float a, float b) {
+    const float action_scale = env->local_radius * env->action_radius;
+    if (env->cartesian_actions) {
+        return (Vec2){ a * action_scale, b * action_scale };
+    }
+    const float theta = a * (float)M_PI;
+    const float r = action_scale * b;
+    return (Vec2){ cosf(theta) * r, sinf(theta) * r };
+}
+
+static void insert_two_boundary_vertices(
+    QuadMeshing* env,
+    int insert_after_idx,
+    Vec2 v_left,
+    Vec2 v_right,
+    size_t mesh_left,
+    size_t mesh_right
+) {
+    Vec2Array* verts = &env->boundary.vertices;
+    SizeArray* meshes = &env->boundary_mesh_vertices;
+    const size_t insert_pos = (size_t)insert_after_idx + 1;
+    Vec2Array_reserve(verts, verts->size + 2);
+    SizeArray_reserve(meshes, meshes->size + 2);
+    memmove(&verts->data[insert_pos + 2], &verts->data[insert_pos],
+            (verts->size - insert_pos) * sizeof(Vec2));
+    memmove(&meshes->data[insert_pos + 2], &meshes->data[insert_pos],
+            (meshes->size - insert_pos) * sizeof(size_t));
+    verts->data[insert_pos] = v_left;
+    verts->data[insert_pos + 1] = v_right;
+    meshes->data[insert_pos] = mesh_left;
+    meshes->data[insert_pos + 1] = mesh_right;
+    verts->size += 2;
+    meshes->size += 2;
+    mark_boundary_dirty(env);
+}
+
+static bool step_edge_actions(
+    QuadMeshing* env,
+    int action_kind,
+    float a1,
+    float b1,
+    float a2,
+    float b2,
+    size_t quad_mesh_indices[4],
+    bool* quad_mesh_indices_ready
+) {
+    const int s = env->active_edge_start;
+    const int s1 = polygon2D_neighbor_index(env->boundary, s, 1);
+    const int s_m1 = polygon2D_neighbor_index(env->boundary, s, -1);
+    const int s_m2 = polygon2D_neighbor_index(env->boundary, s, -2);
+    const int s_p1 = polygon2D_neighbor_index(env->boundary, s, 2);
+    const int s_p2 = polygon2D_neighbor_index(env->boundary, s, 3);
+
+    if (action_kind == 0) {
+        return try_close_quad(env, s_m2, s_m1, s, s1, s_m1, quad_mesh_indices, quad_mesh_indices_ready);
+    }
+    if (action_kind == 1) {
+        return try_close_quad(env, s_m1, s, s1, s_p1, s, quad_mesh_indices, quad_mesh_indices_ready);
+    }
+    if (action_kind == 2) {
+        return try_close_quad(env, s, s1, s_p1, s_p2, s1, quad_mesh_indices, quad_mesh_indices_ready);
+    }
+
+    Frame2D frame = compute_edge_local_frame(env);
+    if (action_kind == 3) {
+        Vec2 local = edge_action_local(env, a1, b1);
+        Vec2 world = local_to_world(frame, local);
+        env->quad.vertices.data[0] = env->boundary.vertices.data[s_m1];
+        env->quad.vertices.data[1] = env->boundary.vertices.data[s];
+        env->quad.vertices.data[2] = env->boundary.vertices.data[s1];
+        env->quad.vertices.data[3] = world;
+        const Segment2D new_edge1 = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
+        const Segment2D new_edge2 = {env->quad.vertices.data[2], env->quad.vertices.data[3]};
+        if (!polygon2D_segment_intersect(env->boundary, new_edge1, NULL, 1e-6) &&
+            !polygon2D_segment_intersect(env->boundary, new_edge2, NULL, 1e-6) &&
+            eval_polygon2D_sdf(env->boundary, env->quad.vertices.data[3]) < 0.0)
+        {
+            const size_t new_idx = mesh2D_add_vertex(&env->mesh, env->quad.vertices.data[3]);
+            quad_mesh_indices[0] = env->boundary_mesh_vertices.data[s_m1];
+            quad_mesh_indices[1] = env->boundary_mesh_vertices.data[s];
+            quad_mesh_indices[2] = env->boundary_mesh_vertices.data[s1];
+            quad_mesh_indices[3] = new_idx;
+            *quad_mesh_indices_ready = true;
+            env->boundary.vertices.data[s] = env->quad.vertices.data[3];
+            env->boundary_mesh_vertices.data[s] = new_idx;
+            mark_boundary_dirty(env);
+            return true;
+        }
+        return false;
+    }
+
+    if (action_kind == 4) {
+        Vec2 local = edge_action_local(env, a1, b1);
+        Vec2 world = local_to_world(frame, local);
+        env->quad.vertices.data[0] = env->boundary.vertices.data[s];
+        env->quad.vertices.data[1] = env->boundary.vertices.data[s1];
+        env->quad.vertices.data[2] = env->boundary.vertices.data[s_p1];
+        env->quad.vertices.data[3] = world;
+        const Segment2D new_edge1 = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
+        const Segment2D new_edge2 = {env->quad.vertices.data[2], env->quad.vertices.data[3]};
+        if (!polygon2D_segment_intersect(env->boundary, new_edge1, NULL, 1e-6) &&
+            !polygon2D_segment_intersect(env->boundary, new_edge2, NULL, 1e-6) &&
+            eval_polygon2D_sdf(env->boundary, env->quad.vertices.data[3]) < 0.0)
+        {
+            const size_t new_idx = mesh2D_add_vertex(&env->mesh, env->quad.vertices.data[3]);
+            quad_mesh_indices[0] = env->boundary_mesh_vertices.data[s];
+            quad_mesh_indices[1] = env->boundary_mesh_vertices.data[s1];
+            quad_mesh_indices[2] = env->boundary_mesh_vertices.data[s_p1];
+            quad_mesh_indices[3] = new_idx;
+            *quad_mesh_indices_ready = true;
+            env->boundary.vertices.data[s1] = env->quad.vertices.data[3];
+            env->boundary_mesh_vertices.data[s1] = new_idx;
+            mark_boundary_dirty(env);
+            return true;
+        }
+        return false;
+    }
+
+    if (action_kind == 5) {
+        Vec2 local1 = edge_action_local(env, a1, b1);
+        Vec2 local2 = edge_action_local(env, a2, b2);
+        Vec2 world1 = local_to_world(frame, local1);
+        Vec2 world2 = local_to_world(frame, local2);
+
+        Vec2 world_left = world1;
+        Vec2 world_right = world2;
+        if (local1.y > local2.y) {
+            world_left = world2;
+            world_right = world1;
+        }
+
+        env->quad.vertices.data[0] = env->boundary.vertices.data[s];
+        env->quad.vertices.data[1] = env->boundary.vertices.data[s1];
+        env->quad.vertices.data[2] = world_right;
+        env->quad.vertices.data[3] = world_left;
+        const Segment2D new_edge1 = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
+        const Segment2D new_edge2 = {env->quad.vertices.data[1], env->quad.vertices.data[2]};
+        const Segment2D new_edge3 = {env->quad.vertices.data[3], env->quad.vertices.data[2]};
+        if (!polygon2D_segment_intersect(env->boundary, new_edge1, NULL, 1e-6) &&
+            !polygon2D_segment_intersect(env->boundary, new_edge2, NULL, 1e-6) &&
+            !polygon2D_segment_intersect(env->boundary, new_edge3, NULL, 1e-6) &&
+            eval_polygon2D_sdf(env->boundary, env->quad.vertices.data[2]) < 0.0 &&
+            eval_polygon2D_sdf(env->boundary, env->quad.vertices.data[3]) < 0.0)
+        {
+            const size_t left_idx = mesh2D_add_vertex(&env->mesh, world_left);
+            const size_t right_idx = mesh2D_add_vertex(&env->mesh, world_right);
+            quad_mesh_indices[0] = env->boundary_mesh_vertices.data[s];
+            quad_mesh_indices[1] = env->boundary_mesh_vertices.data[s1];
+            quad_mesh_indices[2] = right_idx;
+            quad_mesh_indices[3] = left_idx;
+            *quad_mesh_indices_ready = true;
+            insert_two_boundary_vertices(env, s, world_left, world_right, left_idx, right_idx);
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 void c_reset(QuadMeshing* env) {
     // Reset episode metrics
     env->episode_length = 0;
     env->episode_return = 0.0;
 
+    if (env->boundary_set_count > 0) {
+        // int index = env->boundary_set_index;
+        // if (index < 0 || index >= env->boundary_set_count) {
+        //     index = 0;
+        // }
+        int index = rand() % env->boundary_set_count;
+        load_starting_boundary(env, env->boundary_sets[index], env->boundary_set_sizes[index]);
+        env->boundary_set_index = (index + 1) % env->boundary_set_count;
+        env->boundary.isCCW = env->starting_boundary.isCCW;
+        env->quad.isCCW = env->starting_boundary.isCCW;
+    }
+
     // Reset boundary
     Vec2Array_resize(&env->boundary.vertices, env->starting_boundary.vertices.size);
     memcpy(env->boundary.vertices.data, env->starting_boundary.vertices.data,
            env->starting_boundary.vertices.size * sizeof(Vec2));
+    env->boundary.isCCW = env->starting_boundary.isCCW;
     env->cache.boundary_area = env->cache.starting_boundary_area;
     env->cache.boundary_area_dirty = false;
     env->cache.render_bounds_dirty = true;
@@ -494,7 +789,7 @@ void c_step(QuadMeshing* env) {
         env->terminals[0] = 1;
         return;
     } else if (env->episode_length == env->episode_max_length) {
-        env->rewards[0] = -1.0;
+        // env->rewards[0] = -1.0;
         add_log(env);
         export_mesh_obj(env);
         c_reset(env);
@@ -502,76 +797,39 @@ void c_step(QuadMeshing* env) {
         return;
     }
 
-    const int action_kind = roundf(env->actions[0]);
-    const float action_angle = env->actions[1];
-    const float action_radius = env->actions[2];
-    const float action_x = env->actions[1];
-    const float action_y = env->actions[2];
-
     bool action_valid = false;
     bool quad_mesh_indices_ready = false;
     size_t quad_mesh_indices[4] = {0};
-    if (action_kind == 0) {
-        // Close left
-        env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -2);
-        env->quad.vertices.data[1] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
-        env->quad.vertices.data[2] = env->boundary.vertices.data[env->active_vertex];
-        env->quad.vertices.data[3] = Polygon2D_neighbor(env->boundary, env->active_vertex,  1);
-        const Segment2D new_edge = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
-        const float quad_area = polygon2D_area(env->quad);
-        const float boundary_area = get_boundary_area(env);
+    const int action_kind = roundf(env->actions[0]);
 
-        action_valid = !(polygon2D_segment_intersect(env->boundary, new_edge, NULL, 1e-6) ||
-                         boundary_area < quad_area ||
-                         !(env->boundary.isCCW == is_polygon_ccw(env->quad)));
-        if (action_valid) {
-            quad_mesh_indices[0] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, -2)];
-            quad_mesh_indices[1] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, -1)];
-            quad_mesh_indices[2] = env->boundary_mesh_vertices.data[env->active_vertex];
-            quad_mesh_indices[3] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, 1)];
-            quad_mesh_indices_ready = true;
-            if (env->active_vertex == 0) {
-                env->boundary.vertices.data[0] = env->boundary.vertices.data[env->boundary.vertices.size-2];
-                env->boundary.vertices.size -= 2;
-                env->boundary_mesh_vertices.data[0] = env->boundary_mesh_vertices.data[env->boundary_mesh_vertices.size-2];
-                env->boundary_mesh_vertices.size -= 2;
-            } else {
-                Vec2Array_remove_range(&env->boundary.vertices, env->active_vertex-1, env->active_vertex);
-                SizeArray_remove_range(&env->boundary_mesh_vertices, env->active_vertex-1, env->active_vertex);
-            }
-            mark_boundary_dirty(env);
-        }
+    if (env->edge_mode) {
+        const float a1 = env->actions[1];
+        const float b1 = env->actions[2];
+        const float a2 = env->actions[3];
+        const float b2 = env->actions[4];
+        action_valid = step_edge_actions(
+            env, action_kind, a1, b1, a2, b2, quad_mesh_indices, &quad_mesh_indices_ready);
+    } else if (action_kind == 0) {
+        // Close left
+        int idx0 = polygon2D_neighbor_index(env->boundary, env->active_vertex, -2);
+        int idx1 = polygon2D_neighbor_index(env->boundary, env->active_vertex, -1);
+        int idx2 = env->active_vertex;
+        int idx3 = polygon2D_neighbor_index(env->boundary, env->active_vertex, 1);
+        action_valid = try_close_quad(
+            env, idx0, idx1, idx2, idx3, idx1, quad_mesh_indices, &quad_mesh_indices_ready);
     } else if (action_kind == 1) {
         // Close right
-        env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
-        env->quad.vertices.data[1] = env->boundary.vertices.data[env->active_vertex];
-        env->quad.vertices.data[2] = Polygon2D_neighbor(env->boundary, env->active_vertex,  1);
-        env->quad.vertices.data[3] = Polygon2D_neighbor(env->boundary, env->active_vertex,  2);
-        const Segment2D new_edge = {env->quad.vertices.data[0], env->quad.vertices.data[3]};
-        const float quad_area = polygon2D_area(env->quad);
-        const float boundary_area = get_boundary_area(env);
-
-        action_valid = !(polygon2D_segment_intersect(env->boundary, new_edge, NULL, 1e-6) ||
-                         boundary_area < quad_area ||
-                         !(env->boundary.isCCW == is_polygon_ccw(env->quad)));
-        if (action_valid) {
-            quad_mesh_indices[0] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, -1)];
-            quad_mesh_indices[1] = env->boundary_mesh_vertices.data[env->active_vertex];
-            quad_mesh_indices[2] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, 1)];
-            quad_mesh_indices[3] = env->boundary_mesh_vertices.data[polygon2D_neighbor_index(env->boundary, env->active_vertex, 2)];
-            quad_mesh_indices_ready = true;
-            if (env->active_vertex == env->boundary.vertices.size-1) {
-                env->boundary.vertices.data[0] = env->boundary.vertices.data[env->boundary.vertices.size-2];
-                env->boundary.vertices.size -= 2;
-                env->boundary_mesh_vertices.data[0] = env->boundary_mesh_vertices.data[env->boundary_mesh_vertices.size-2];
-                env->boundary_mesh_vertices.size -= 2;
-            } else {
-                Vec2Array_remove_range(&env->boundary.vertices, env->active_vertex, env->active_vertex+1);
-                SizeArray_remove_range(&env->boundary_mesh_vertices, env->active_vertex, env->active_vertex+1);
-            }
-            mark_boundary_dirty(env);
-        }
+        int idx0 = polygon2D_neighbor_index(env->boundary, env->active_vertex, -1);
+        int idx1 = env->active_vertex;
+        int idx2 = polygon2D_neighbor_index(env->boundary, env->active_vertex, 1);
+        int idx3 = polygon2D_neighbor_index(env->boundary, env->active_vertex, 2);
+        action_valid = try_close_quad(
+            env, idx0, idx1, idx2, idx3, idx1, quad_mesh_indices, &quad_mesh_indices_ready);
     } else {
+        const float action_angle = env->actions[1];
+        const float action_radius = env->actions[2];
+        const float action_x = env->actions[1];
+        const float action_y = env->actions[2];
         env->quad.vertices.data[0] = Polygon2D_neighbor(env->boundary, env->active_vertex, -1);
         env->quad.vertices.data[1] = env->boundary.vertices.data[env->active_vertex];
         env->quad.vertices.data[2] = Polygon2D_neighbor(env->boundary, env->active_vertex,  1);
@@ -621,8 +879,8 @@ void c_step(QuadMeshing* env) {
             env->episode_return += env->rewards[0];
         }
     } else {
-        env->rewards[0] = -0.1f;
-        // env->rewards[0] = 0.0f;
+        // env->rewards[0] = -0.1f;
+        env->rewards[0] = 0.0f;
         env->episode_return += env->rewards[0];
     }
 
@@ -666,13 +924,30 @@ void c_render(QuadMeshing* env) {
     draw_boundary(&env->boundary, &ctx);
 
     // Active vertex
-    DrawCircleV(world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx), 8.0, RED);
+    if (env->edge_mode) {
+        Vec2 v0 = env->boundary.vertices.data[env->active_edge_start];
+        Vec2 v1 = Polygon2D_neighbor(env->boundary, env->active_edge_start, 1);
+        DrawLineV(world_to_screen(v0, &ctx), world_to_screen(v1, &ctx), RED);
+    } else {
+        DrawCircleV(world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx), 8.0, RED);
+    }
 
-    if (!env->cartesian_actions) {
-        // Action radius
+    // Action radius
+    const float r = env->local_radius * env->action_radius;
+    if (env->cartesian_actions) {
+        Frame2D frame = compute_edge_local_frame(env);
+        Vector2 p0 = world_to_screen(local_to_world(frame, (Vec2){0., -r}), &ctx);
+        Vector2 p1 = world_to_screen(local_to_world(frame, (Vec2){r,  -r}), &ctx);
+        Vector2 p2 = world_to_screen(local_to_world(frame, (Vec2){r,   r}), &ctx);
+        Vector2 p3 = world_to_screen(local_to_world(frame, (Vec2){0.,  r}), &ctx);
+        DrawLineV(p0, p1, RED);
+        DrawLineV(p1, p2, RED);
+        DrawLineV(p2, p3, RED);
+        DrawLineV(p3, p0, RED);
+    } else {
         DrawCircleLinesV(
             world_to_screen(env->boundary.vertices.data[env->active_vertex], &ctx),
-            world_to_screen_scale(env->local_radius * env->action_radius, &ctx), RED);
+            world_to_screen_scale(r, &ctx), RED);
     }
 
     // SDF grid
@@ -694,6 +969,18 @@ void c_render(QuadMeshing* env) {
 }
 
 void c_close(QuadMeshing* env) {
+    if (env->boundary_sets) {
+        for (int i = 0; i < env->boundary_set_count; ++i) {
+            free(env->boundary_sets[i]);
+        }
+        free(env->boundary_sets);
+        env->boundary_sets = NULL;
+    }
+    if (env->boundary_set_sizes) {
+        free(env->boundary_set_sizes);
+        env->boundary_set_sizes = NULL;
+    }
+    env->boundary_set_count = 0;
     Vec2Array_free(&env->starting_boundary.vertices);
     Vec2Array_free(&env->boundary.vertices);
     Vec2Array_free(&env->quad.vertices);

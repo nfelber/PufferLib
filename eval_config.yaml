@@ -15,6 +15,9 @@ boundaries:
   - name: asterisk3_big
     boundary_file: boundaries/asterisk3_big.json
     instant_faces: 200
+  - name: circle
+    boundary_file: boundaries/circle_32.json
+    instant_faces: 25
 instant_meshes:
   enabled: true
   binary: ./instant-meshes

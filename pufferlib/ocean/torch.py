@@ -970,8 +970,8 @@ class QuadMeshingPolicy(nn.Module):
     Policy for QuadMeshing with hybrid action space.
     
     Actions:
-    - 1 discrete dimension: action_choice (0=close_left, 1=place_vertex, 2=close_right)
-    - 2 continuous dimensions: angle (interpolant) and radius (ratio)
+    - Vertex mode: 1 discrete (3 choices), 2 continuous
+    - Edge mode: 1 discrete (6 choices), 4 continuous
     """
     
     def __init__(self, env, hidden_size=128, **kwargs):
@@ -990,14 +990,18 @@ class QuadMeshingPolicy(nn.Module):
             nn.GELU(),
         )
         
-        # Action heads - Discrete (3 choices)
+        action_dims = int(env.single_action_space.shape[0])
+        self.discrete_n = 6 if action_dims == 5 else 3
+        self.continuous_n = action_dims - 1
+
+        # Action heads - Discrete
         self.discrete_decoder = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 3), std=0.01)
+            nn.Linear(hidden_size, self.discrete_n), std=0.01)
         
-        # Action heads - Continuous (angle and radius)
+        # Action heads - Continuous
         self.continuous_decoder_mean = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 2), std=0.01)
-        self.continuous_decoder_logstd = nn.Parameter(torch.zeros(1, 2))
+            nn.Linear(hidden_size, self.continuous_n), std=0.01)
+        self.continuous_decoder_logstd = nn.Parameter(torch.zeros(1, self.continuous_n))
         
         # Value head
         self.value = pufferlib.pytorch.layer_init(
@@ -1021,14 +1025,12 @@ class QuadMeshingPolicy(nn.Module):
         Decode hidden state to HybridDistribution.
         
         Returns:
-            HybridDistribution with:
-            - 1 discrete action (3 choices)
-            - 2 continuous actions (angle, radius)
+            HybridDistribution with a discrete head and continuous parameters.
         """
-        # Discrete: action choice (3 possibilities)
+        # Discrete: action choice
         discrete_logits = [self.discrete_decoder(hidden)]
         
-        # Continuous: angle and radius
+        # Continuous parameters
         continuous_mean = self.continuous_decoder_mean(hidden)
         continuous_logstd = self.continuous_decoder_logstd.expand_as(continuous_mean)
 
@@ -1042,4 +1044,3 @@ class QuadMeshingPolicy(nn.Module):
         
         # Return HybridDistribution
         return dist, values
-
