@@ -879,8 +879,7 @@ void c_step(QuadMeshing* env) {
             env->episode_return += env->rewards[0];
         }
     } else {
-        // env->rewards[0] = -0.1f;
-        env->rewards[0] = 0.0f;
+        env->rewards[0] = -0.1f;
         env->episode_return += env->rewards[0];
     }
 
