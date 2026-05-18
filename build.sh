@@ -54,7 +54,7 @@ fi
 PLATFORM="$(uname -s)"
 if [ "$PLATFORM" = "Linux" ]; then
     RAYLIB_NAME='raylib-5.5_linux_amd64'
-    OMP_LIB=-lomp5
+    OMP_LIB=-lomp
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
@@ -118,6 +118,9 @@ elif [ "$ENV" = "impulse_wars" ]; then
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
+    if [ "$ENV" = "quad_meshing" ]; then
+        EXTRA_SRC="ocean/$ENV/geometry.c ocean/$ENV/mesh.c"
+    fi
 else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
@@ -140,6 +143,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
         "${LINK_ARCHIVES[@]}"
         "${STANDALONE_LDFLAGS[@]}"
+        "$EXTRA_LDFLAGS"
         -lm -lpthread -fopenmp
         -DPLATFORM_DESKTOP
     )
@@ -273,7 +277,7 @@ if [ -z "$MODE" ]; then
 
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings.o "$STATIC_LIB" "$RAYLIB_A" "$EXTRA_LDFLAGS"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
