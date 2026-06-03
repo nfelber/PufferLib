@@ -258,6 +258,7 @@ struct VecEnv {
     int total_agents;
     int obs_size;
     int num_atns;
+    int num_substeps;
     std::vector<int> act_sizes;
     std::string obs_dtype;
     size_t obs_elem_size;
@@ -283,6 +284,7 @@ std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
     ve->total_agents  = total_agents;
     ve->obs_size      = get_obs_size();
     ve->num_atns      = get_num_atns();
+    ve->num_substeps  = get_num_substeps();
     {
         int* raw = get_act_sizes();
         int  n   = get_num_act_sizes();
@@ -314,6 +316,25 @@ void cpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
     {
         py::gil_scoped_release no_gil;
         cpu_vec_step(ve.vec);
+    }
+}
+
+void gpu_vec_substep_py(VecEnv& ve, long long actions_ptr, int substep) {
+    cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float),
+        cudaMemcpyDeviceToDevice);
+    {
+        py::gil_scoped_release no_gil;
+        gpu_vec_substep(ve.vec, substep);
+    }
+}
+
+void cpu_vec_substep_py(VecEnv& ve, long long actions_ptr, int substep) {
+    memcpy(ve.vec->actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float));
+    {
+        py::gil_scoped_release no_gil;
+        cpu_vec_substep(ve.vec, substep);
     }
 }
 
@@ -536,6 +557,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("total_agents",  &VecEnv::total_agents)
         .def_readonly("obs_size",      &VecEnv::obs_size)
         .def_readonly("num_atns",      &VecEnv::num_atns)
+        .def_readonly("num_substeps",  &VecEnv::num_substeps)
         .def_readonly("act_sizes",     &VecEnv::act_sizes)
         .def_readonly("obs_dtype",     &VecEnv::obs_dtype)
         .def_readonly("obs_elem_size", &VecEnv::obs_elem_size)
@@ -551,6 +573,8 @@ PYBIND11_MODULE(_C, m) {
         .def("reset", &vec_reset)
         .def("gpu_step", &gpu_vec_step_py)
         .def("cpu_step", &cpu_vec_step_py)
+        .def("gpu_substep", &gpu_vec_substep_py)
+        .def("cpu_substep", &cpu_vec_substep_py)
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log",   &vec_log)
         .def("close", &vec_close);

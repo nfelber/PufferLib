@@ -118,9 +118,6 @@ elif [ "$ENV" = "impulse_wars" ]; then
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
-    if [ "$ENV" = "quad_meshing" ]; then
-        EXTRA_SRC="ocean/$ENV/geometry.c ocean/$ENV/mesh.c"
-    fi
 else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
@@ -250,7 +247,9 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -fno-semantic-interposition -fvisibility=hidden \
     -fPIC -fopenmp \
     "$BINDING_SRC" -o "$STATIC_OBJ"
-ar rcs "$STATIC_LIB" "$STATIC_OBJ"
+
+STATIC_OBJS=("$STATIC_OBJ")
+ar rcs "$STATIC_LIB" "${STATIC_OBJS[@]}"
 
 # Brittle hack: have to extract the tensor type from the static lib to build trainer
 OBS_TENSOR_T=$(awk '/^#define OBS_TENSOR_T/{print $3}' "$BINDING_SRC")

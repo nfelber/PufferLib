@@ -202,14 +202,31 @@ class PuffeRL:
         horizon = config['horizon']
 
         self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
-        o = self.vec_obs
-        r = torch.zeros(self.total_agents, device=device)
-        d = torch.zeros(self.total_agents, device=device)
+        self.logprobs = torch.zeros(horizon, self.total_agents, device=device)
 
         P = Profile
         prof.mark(0)
         for t in range(horizon):
-            o_device = torch.as_tensor(o, device=device)
+            # Environment substeps (if present)
+            for substep in range(self._vec.num_substeps):
+                o_device = torch.as_tensor(self.vec_obs, device=device)
+
+                with torch.no_grad():
+                    logits, _, state = self.policy.forward_eval(o_device, self.state)
+                    action, logprob, _ = sample_logits(logits)
+
+                actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
+                if self.gpu:
+                    actions_flat = actions_flat.cuda()
+                    self._vec.gpu_substep(actions_flat.data_ptr(), substep)
+                    torch.cuda.synchronize()
+                else:
+                    self._vec.cpu_substep(actions_flat.data_ptr(), substep)
+
+                with torch.no_grad():
+                    self.logprobs[t] += logprob
+
+            o_device = torch.as_tensor(self.vec_obs, device=device)
 
             prof.mark(1)
             with torch.no_grad():
@@ -221,12 +238,13 @@ class PuffeRL:
                 self.state = state
                 self.observations[t] = o_device
                 self.actions[t] = action
-                self.logprobs[t] = logprob
-                self.rewards[t] = torch.as_tensor(r, device=device)
-                self.terminals[t] = torch.as_tensor(d, device=device).float()
+                self.logprobs[t] += logprob
+                self.rewards[t] = torch.as_tensor(self.vec_rewards, device=device)
+                self.terminals[t] = torch.as_tensor(self.vec_terminals, device=device).float()
                 self.values[t] = value.flatten()
 
             prof.mark(2)
+            # Environment step
             actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
             if self.gpu:
                 actions_flat = actions_flat.cuda()
@@ -235,7 +253,6 @@ class PuffeRL:
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
-            o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
             prof.mark(3)
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)

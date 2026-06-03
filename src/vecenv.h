@@ -69,6 +69,10 @@ typedef struct CUstream_st* cudaStream_t;
 // Threading state
 typedef struct StaticThreading StaticThreading;
 
+#ifndef NUM_SUBSTEPS
+#define NUM_SUBSTEPS 0
+#endif
+
 // Generic VecEnv - envs is void* to be type-agnostic
 typedef struct StaticVec {
     void* envs;
@@ -90,6 +94,7 @@ typedef struct StaticVec {
     StaticThreading* threading;
     int obs_size;
     int num_atns;
+    int num_substeps;
     int gpu;
 } StaticVec;
 
@@ -120,6 +125,7 @@ void static_vec_read_profile(StaticVec* vec, float out[NUM_EVAL_PROF]);
 // Env info
 int get_obs_size(void);
 int get_num_atns(void);
+int get_num_substeps(void);
 int* get_act_sizes(void);
 int get_num_act_sizes(void);
 const char* get_obs_dtype(void);
@@ -129,6 +135,8 @@ size_t get_obs_elem_size(void);
 void static_vec_step(StaticVec* vec);
 void gpu_vec_step(StaticVec* vec);
 void cpu_vec_step(StaticVec* vec);
+void gpu_vec_substep(StaticVec* vec, int substep);
+void cpu_vec_substep(StaticVec* vec, int substep);
 
 // Optional shared state functions
 void* my_shared(void* env, Dict* kwargs);
@@ -381,6 +389,7 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
     vec->agents_per_buffer = total_agents / num_buffers;
     vec->obs_size = OBS_SIZE;
     vec->num_atns = NUM_ATNS;
+    vec->num_substeps = NUM_SUBSTEPS;
     vec->gpu = gpu;
 
     vec->buffer_env_starts = (int*)calloc(num_buffers, sizeof(int));
@@ -604,6 +613,7 @@ void static_vec_render(StaticVec* vec, int env_id) {
 
 int get_obs_size(void) { return OBS_SIZE; }
 int get_num_atns(void) { return NUM_ATNS; }
+int get_num_substeps(void) { return NUM_SUBSTEPS; }
 static int _act_sizes[] = ACT_SIZES;
 int* get_act_sizes(void) { return _act_sizes; }
 int get_num_act_sizes(void) { return (int)(sizeof(_act_sizes) / sizeof(_act_sizes[0])); }
@@ -650,6 +660,48 @@ void cpu_vec_step(StaticVec* vec) {
 void static_vec_step(StaticVec* vec) {
     if (vec->gpu) gpu_vec_step(vec);
     else cpu_vec_step(vec);
+}
+
+#if NUM_SUBSTEPS > 0
+#ifdef MY_VEC_SUBSTEP
+void MY_VEC_SUBSTEP(StaticVec* vec, int substep);
+static inline void _static_vec_env_substep(StaticVec* vec, int substep) {
+    MY_VEC_SUBSTEP(vec, substep);
+}
+#else
+static inline void _static_vec_env_substep(StaticVec* vec, int substep) {
+    Env* envs = (Env*)vec->envs;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < vec->size; i++) {
+        c_substep(&envs[i], substep);
+    }
+}
+#endif
+
+void gpu_vec_substep(StaticVec* vec, int substep) {
+    assert(vec->buffers == 1);
+    cudaMemcpy(vec->actions, vec->gpu_actions,
+        (size_t)vec->total_agents * NUM_ATNS * sizeof(float),
+        cudaMemcpyDeviceToHost);
+    _static_vec_env_substep(vec, substep);
+    cudaMemcpy(vec->gpu_observations, vec->observations,
+        (size_t)vec->total_agents * OBS_SIZE * obs_element_size(),
+        cudaMemcpyHostToDevice);
+}
+
+void cpu_vec_substep(StaticVec* vec, int substep) {
+    assert(vec->buffers == 1);
+    _static_vec_env_substep(vec, substep);
+}
+#else
+void gpu_vec_substep(StaticVec* vec, int substep) {}
+
+void cpu_vec_substep(StaticVec* vec, int substep) {}
+#endif // NUM_SUBSTEPS > 0
+
+void static_vec_substep(StaticVec* vec, int substep) {
+    if (vec->gpu) gpu_vec_substep(vec, substep);
+    else cpu_vec_substep(vec, substep);
 }
 
 // Optional shared state functions - default implementations
