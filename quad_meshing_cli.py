@@ -170,6 +170,7 @@ def main():
         boundary_files=boundary_files or env_cfg.get("boundary_files"),
         random_active_vertex=env_cfg.get("random_active_vertex", False),
         observe_remaining_area=env_cfg.get("observe_remaining_area", False),
+        observe_boundary_cost=env_cfg.get("observe_boundary_cost", False),
         observation_radius=env_cfg.get("observation_radius", 1.0),
         n_neighbors=env_cfg.get("n_neighbors", 0),
         n_sdf_samples=env_cfg.get("n_sdf_samples", 0),

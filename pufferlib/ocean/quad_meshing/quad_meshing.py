@@ -15,6 +15,7 @@ class QuadMeshing(pufferlib.PufferEnv):
                  random_active_vertex=False,
                  observe_remaining_area=False,
                  observe_local_radius=False,
+                 observe_boundary_cost=False,
                  observation_radius=3,
                  n_neighbors=0,
                  n_sdf_samples=0,
@@ -41,6 +42,7 @@ class QuadMeshing(pufferlib.PufferEnv):
             random_active_vertex: If True, the active vertex is chosen randomly at each step.
             observe_remaining_area: If True, the agent observes the remaining fraction of area to mesh.
             observe_local_radius: If True, the agent observes the current local radius.
+            observe_boundary_cost: If True, the agent observes the current cost of the boundary.
             observation_radius: Observation radius multiplier.
             n_neighbors: The number of left and right neighboring boundary vertices the agent observes.
             n_sdf_samples: The number of sdf samples the agent observes.
@@ -104,6 +106,8 @@ class QuadMeshing(pufferlib.PufferEnv):
             num_obs += 1
         if observe_local_radius:
             num_obs += 1
+        if observe_boundary_cost:
+            num_obs += 2
         if edge_mode:
             num_obs += 1  # local radius
             num_obs += 4 * n_neighbors  # left/right neighbor local coords
@@ -161,6 +165,7 @@ class QuadMeshing(pufferlib.PufferEnv):
             random_active_vertex=random_active_vertex,
             observe_remaining_area=observe_remaining_area,
             observe_local_radius=observe_local_radius,
+            observe_boundary_cost=observe_boundary_cost,
             observation_radius=observation_radius,
             n_neighbors=n_neighbors,
             n_sdf_samples=n_sdf_samples,

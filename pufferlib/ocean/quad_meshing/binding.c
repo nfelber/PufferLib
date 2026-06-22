@@ -94,6 +94,7 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
 
     env->observe_remaining_area = unpack(kwargs, "observe_remaining_area");
     env->observe_local_radius = unpack(kwargs, "observe_local_radius");
+    env->observe_boundary_cost = unpack(kwargs, "observe_boundary_cost");
     env->observation_radius = unpack(kwargs, "observation_radius");
     env->n_neighbors = unpack(kwargs, "n_neighbors");
     env->n_sdf_samples = unpack(kwargs, "n_sdf_samples");

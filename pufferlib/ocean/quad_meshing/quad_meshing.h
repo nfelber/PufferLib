@@ -54,6 +54,7 @@ typedef struct {
     // Observations config
     bool observe_remaining_area;
     bool observe_local_radius;
+    bool observe_boundary_cost;
     float observation_radius;
     int n_neighbors;
     int n_sdf_samples;
@@ -83,42 +84,43 @@ typedef struct {
     float local_radius;
     int episode_length;
     float episode_return;
+    int consecutive_invalid_actions;
 
     // Cache
     QuadMeshingCache cache;
 } QuadMeshing;
 
 static void build_export_mesh_path(QuadMeshing* env, char* out, size_t out_size) {
-    const char* template = env->export_mesh_path;
-    if (!template || template[0] == '\0') {
-        template = "mesh.obj";
+    const char* path_template = env->export_mesh_path;
+    if (!path_template || path_template[0] == '\0') {
+        path_template = "mesh.obj";
     }
 
-    const char* token = strstr(template, "{episode}");
+    const char* token = strstr(path_template, "{episode}");
     if (token) {
-        size_t prefix_len = (size_t)(token - template);
+        size_t prefix_len = (size_t)(token - path_template);
         const char* suffix = token + strlen("{episode}");
         if (prefix_len + strlen(suffix) + 32 >= out_size) {
             out[0] = '\0';
             return;
         }
-        memcpy(out, template, prefix_len);
+        memcpy(out, path_template, prefix_len);
         snprintf(out + prefix_len, out_size - prefix_len, "%d%s", env->export_mesh_counter, suffix);
         return;
     }
 
     if (env->export_mesh_counter == 0) {
-        snprintf(out, out_size, "%s", template);
+        snprintf(out, out_size, "%s", path_template);
         return;
     }
 
-    const char* slash = strrchr(template, '/');
-    const char* dot = strrchr(template, '.');
+    const char* slash = strrchr(path_template, '/');
+    const char* dot = strrchr(path_template, '.');
     if (dot && (!slash || dot > slash)) {
-        int base_len = (int)(dot - template);
-        snprintf(out, out_size, "%.*s_%d%s", base_len, template, env->export_mesh_counter, dot);
+        int base_len = (int)(dot - path_template);
+        snprintf(out, out_size, "%.*s_%d%s", base_len, path_template, env->export_mesh_counter, dot);
     } else {
-        snprintf(out, out_size, "%s_%d", template, env->export_mesh_counter);
+        snprintf(out, out_size, "%s_%d", path_template, env->export_mesh_counter);
     }
 }
 
@@ -402,6 +404,27 @@ static void write_sdf_observations(QuadMeshing* env, Frame2D frame, int* obs_idx
     }
 }
 
+static float compute_boundary_edge_cost(QuadMeshing* env) {
+    float cost = 0;
+    Vec2 from = env->boundary.vertices.data[0];
+    for (int i=0; i<env->boundary.vertices.size; ++i) {
+        const Vec2 to = Polygon2D_neighbor(env->boundary, i, 1);
+        const Vec2 edge = sub2(to, from);
+        cost += fabs(dot2(edge, edge) - env->target_quad_area);
+        from = to;
+    }
+    return cost / env->boundary.vertices.size;
+}
+
+static float compute_boundary_angle_cost(QuadMeshing* env) {
+    float cost = 0;
+    for (int i=0; i<env->boundary.vertices.size; ++i) {
+        const float angle = polygonInteriorAngle(env->boundary, i);
+        cost += fabs(0.75 * M_PI - fabs(M_PI - fabs(angle - M_PI) - 0.75 * M_PI) - 0.5 * M_PI);
+    }
+    return cost / (0.5 * M_PI * env->boundary.vertices.size);
+}
+
 static void compute_vertex_observations(QuadMeshing* env) {
     int obs_idx = 0;
     if (env->observe_remaining_area) {
@@ -410,6 +433,11 @@ static void compute_vertex_observations(QuadMeshing* env) {
 
     if (env->observe_local_radius) {
         env->observations[obs_idx++] = env->local_radius;
+    }
+
+    if (env->observe_boundary_cost) {
+        env->observations[obs_idx++] = compute_boundary_edge_cost(env);
+        env->observations[obs_idx++] = compute_boundary_angle_cost(env);
     }
 
     Frame2D frame = compute_active_local_frame(env);
@@ -437,6 +465,11 @@ static void compute_edge_observations(QuadMeshing* env) {
 
     if (env->observe_local_radius) {
         env->observations[obs_idx++] = env->local_radius;
+    }
+
+    if (env->observe_boundary_cost) {
+        env->observations[obs_idx++] = compute_boundary_edge_cost(env);
+        env->observations[obs_idx++] = compute_boundary_angle_cost(env);
     }
 
     env->observations[obs_idx++] = env->local_radius;
@@ -721,6 +754,8 @@ void c_reset(QuadMeshing* env) {
     env->episode_length = 0;
     env->episode_return = 0.0;
 
+    env->consecutive_invalid_actions = 0;
+
     if (env->boundary_set_count > 0) {
         // int index = env->boundary_set_index;
         // if (index < 0 || index >= env->boundary_set_count) {
@@ -878,9 +913,11 @@ void c_step(QuadMeshing* env) {
             env->rewards[0] = quad_reward;
             env->episode_return += env->rewards[0];
         }
+        env->consecutive_invalid_actions = 0;
     } else {
         env->rewards[0] = -0.1f;
         env->episode_return += env->rewards[0];
+        ++env->consecutive_invalid_actions;
     }
 
     // Add latest quad to mesh
@@ -962,7 +999,8 @@ void c_render(QuadMeshing* env) {
         DrawCircleV(world_to_screen(query_world, &ctx), 3.0, c);
     }
 
-    DrawText(TextFormat("S: SDF | ESC: Quit | Episode return: %f", env->episode_return), 10, 10, 20, DARKGRAY);
+    const float boundary_cost = compute_boundary_angle_cost(env) + compute_boundary_edge_cost(env);
+    DrawText(TextFormat("S: SDF | ESC: Quit | Boundary cost: %f | Episode return: %f", boundary_cost, env->episode_return), 10, 10, 20, DARKGRAY);
 
     EndDrawing();
 }
