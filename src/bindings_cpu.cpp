@@ -79,8 +79,27 @@ static Dict* py_dict_to_c_dict(py::dict py_dict) {
     Dict* c_dict = create_dict(py_dict.size());
     for (auto item : py_dict) {
         const char* key = PyUnicode_AsUTF8(item.first.ptr());
-        try { dict_set(c_dict, key, item.second.cast<double>()); }
-        catch (const py::cast_error&) {}
+        py::handle h = item.second;
+
+        // Numeric types → double
+        if (py::isinstance<py::float_>(h) || py::isinstance<py::int_>(h) || py::isinstance<py::bool_>(h)) {
+            dict_set(c_dict, key, h.cast<double>());
+        }
+        // Python list → char** pointer + count
+        else if (py::isinstance<py::list>(h)) {
+            py::list py_list = h.cast<py::list>();
+            int count = (int)py_list.size();
+            const char** arr = (const char**)calloc(count, sizeof(const char*));
+            for (int i = 0; i < count; i++) {
+                py::str s = py_list[i];
+                arr[i] = strdup(PyUnicode_AsUTF8(s.ptr()));
+            }
+            c_dict->items[c_dict->size].key = key;
+            c_dict->items[c_dict->size].ptr = (void*)arr;
+            c_dict->items[c_dict->size].value = (double)count;
+            c_dict->size++;
+        }
+        // Anything else (str, None, etc.) → silently skip
     }
     return c_dict;
 }
@@ -140,6 +159,15 @@ static void cpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
     }
 }
 
+static void cpu_vec_substep_py(VecEnv& ve, long long actions_ptr, int substep) {
+    memcpy(ve.vec->actions, (void*)actions_ptr,
+        (size_t)ve.total_agents * ve.num_atns * sizeof(float));
+    {
+        py::gil_scoped_release no_gil;
+        cpu_vec_substep(ve.vec, substep);
+    }
+}
+
 static py::dict vec_log(VecEnv& ve) {
     Dict* out = create_dict(32);
     static_vec_log(ve.vec, out);
@@ -181,6 +209,7 @@ PYBIND11_MODULE(_C, m) {
         .def_property_readonly("terminals_ptr", [](VecEnv& ve) { return (long long)ve.vec->terminals; })
         .def("reset", &vec_reset)
         .def("cpu_step", &cpu_vec_step_py)
+        .def("cpu_substep", &cpu_vec_substep_py)
         .def("render", [](VecEnv& ve, int env_id) { static_vec_render(ve.vec, env_id); })
         .def("log", &vec_log)
         .def("close", &vec_close);

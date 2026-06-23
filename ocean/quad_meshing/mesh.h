@@ -3,11 +3,13 @@
 #include "memory.h"
 #include "geometry.h"
 #include "helpers.h"
+#include "ugrid.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 typedef struct {
     Vec2 pos; 
@@ -22,7 +24,7 @@ typedef struct {
     int a;
     int b;
     unsigned char face_count;
-    bool face_orientation;
+    bool face_orientation_cw;
 } MeshEdge;
 
 DEFINE_VECTOR(MeshEdge, MeshEdgeArray)
@@ -34,6 +36,9 @@ typedef struct {
     IntArray neighbor_edges;
     IntArray frontier;
     int max_degree;
+    UGrid edge_grid;
+    UGridCellIteratorArray grid_it;
+    float intersection_tol;
 } QuadMesh;
 
 typedef enum {
@@ -43,16 +48,27 @@ typedef enum {
     MESH_VALID_DEGREE_FULL,
     MESH_VALID_INTERSECT,
     MESH_VALID_WEDGE_BLOCKED,
+    MESH_VALID_BOUNDARY_VIOLATION,
 } MeshValidReason;
 
 /** Allocates mesh buffers with capacity/degree limits. */
-void mesh_init(QuadMesh* mesh, int max_degree) {
+void mesh_init(
+    QuadMesh* mesh,
+    int max_degree,
+    unsigned int grid_res,
+    float grid_cell_size,
+    unsigned int grid_cell_cap,
+    float intersection_tol
+) {
     MeshVertexArray_init(&mesh->vertices);
     MeshEdgeArray_init(&mesh->edges);
     IntArray_init(&mesh->neighbors);
     IntArray_init(&mesh->neighbor_edges);
     IntArray_init(&mesh->frontier);
+    ugrid_init(&mesh->edge_grid, grid_res, grid_cell_size, grid_cell_cap);
+    UGridCellIteratorArray_init(&mesh->grid_it);
     mesh->max_degree = max_degree;
+    mesh->intersection_tol = intersection_tol;
 }
 
 /** Resets counters for a new episode. */
@@ -62,6 +78,8 @@ void mesh_reset(QuadMesh* mesh) {
     IntArray_resize(&mesh->neighbors, 0);
     IntArray_resize(&mesh->neighbor_edges, 0);
     IntArray_resize(&mesh->frontier, 0);
+    ugrid_reset(&mesh->edge_grid);
+    UGridCellIteratorArray_resize(&mesh->grid_it, 0);
 }
 
 /** Frees mesh buffers. */
@@ -71,6 +89,8 @@ void mesh_free(QuadMesh* mesh) {
     IntArray_free(&mesh->neighbors);
     IntArray_free(&mesh->neighbor_edges);
     IntArray_free(&mesh->frontier);
+    ugrid_free(&mesh->edge_grid);
+    UGridCellIteratorArray_free(&mesh->grid_it);
 }
 
 static bool mesh_is_edge_canonical(const QuadMesh* mesh, int a, int b) {
@@ -86,16 +106,13 @@ static inline int mesh_neighbor_idx(const QuadMesh* mesh, int v, int slot) {
 /** Sets a boundary edge face side based on polygon orientation. */
 void mesh_set_boundary_edge_face(QuadMesh* mesh, int edge_idx, int a, int b, bool boundary_ccw) {
     MeshEdge* e = &mesh->edges.data[edge_idx];
-    e->face_orientation = (a == e->a) == boundary_ccw;
+    e->face_orientation_cw = (a == e->a) == boundary_ccw;
     e->face_count = 1;
 }
 
 static bool mesh_edge_face_orientation_from_vertex(const QuadMesh* mesh, int edge_idx, int source) {
     MeshEdge e = mesh->edges.data[edge_idx];
-    if (source == e.a) return e.face_orientation;
-    if (source == e.b) return !e.face_orientation;
-    QM_ASSERT(!"source must be an endpoint of edge");
-    return e.face_orientation;
+    return (source == e.a) == e.face_orientation_cw;
 }
 
 /** Returns edge index or -1 if missing. */
@@ -109,15 +126,8 @@ int mesh_edge_index(const QuadMesh* mesh, int a, int b) {
 }
 
 static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2 target_pos, int target_idx) {
-    Vec2 sp = mesh->vertices.data[source].pos;
-    for (int i = 0; i < mesh->edges.size; i++) {
-        MeshEdge e = mesh->edges.data[i];
-        if (e.a == source || e.b == source || e.a == target_idx || e.b == target_idx) continue;
-        Vec2 q1 = mesh->vertices.data[e.a].pos;
-        Vec2 q2 = mesh->vertices.data[e.b].pos;
-        if (segments_intersect(sp, target_pos, q1, q2)) return MESH_VALID_INTERSECT;
-    }
-    Vec2 tvec = sub2(target_pos, sp);
+    Vec2 source_pos = mesh->vertices.data[source].pos;
+    Vec2 tvec = sub2(target_pos, source_pos);
     float best_angle = 1e9f;
     int best_edge = -1;
     for (int i = 0; i < mesh->vertices.data[source].degree; i++) {
@@ -126,7 +136,7 @@ static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2
         int eidx = mesh->neighbor_edges.data[nidx];
         if (mesh->edges.data[eidx].face_count != 1) continue;
         Vec2 np = mesh->vertices.data[nvidx].pos;
-        Vec2 evec = sub2(np, sp);
+        Vec2 evec = sub2(np, source_pos);
         float ang = atan2f(cross2(evec, tvec), dot2(evec, tvec));
         if (ang <= 0.0f) ang += 2.0f * M_PI;
         if (ang < best_angle) {
@@ -135,9 +145,34 @@ static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2
         }
     }
     if (best_edge >= 0) {
-        int ccw_face = mesh_edge_face_orientation_from_vertex(mesh, best_edge, source);
-        if (!ccw_face) return MESH_VALID_WEDGE_BLOCKED;
+        bool cw_face = mesh_edge_face_orientation_from_vertex(mesh, best_edge, source);
+        if (!cw_face) return MESH_VALID_WEDGE_BLOCKED;
     }
+
+    // for (int i = 0; i < mesh->edges.size; i++) {
+    //     int a = mesh->edges.data[i].a;
+    //     int b = mesh->edges.data[i].b;
+    //     if (a == source || b == source || a == target_idx || b == target_idx) continue;
+    //     Vec2 q1 = mesh->vertices.data[a].pos;
+    //     Vec2 q2 = mesh->vertices.data[b].pos;
+    //     if (segments_intersect(source_pos, target_pos, q1, q2)) return MESH_VALID_INTERSECT;
+    // }
+
+    // Intersection test
+    UGridCellIteratorArray_resize(&mesh->grid_it, 0);
+    ugrid_segment_query_dda(&mesh->edge_grid, source_pos, target_pos, &mesh->grid_it);
+    for (int i=0; i<mesh->grid_it.size; ++i) {
+        UGridCellIterator* it = &mesh->grid_it.data[i];
+        for (int eidx; (eidx = ugrid_cell_it_next(it)) != -1;) {
+            int a = mesh->edges.data[eidx].a;
+            int b = mesh->edges.data[eidx].b;
+            if (a == source || b == source || a == target_idx || b == target_idx) continue;
+            Vec2 q1 = mesh->vertices.data[a].pos;
+            Vec2 q2 = mesh->vertices.data[b].pos;
+            if (segments_intersect(source_pos, target_pos, q1, q2, mesh->intersection_tol)) return MESH_VALID_INTERSECT;
+        }
+    }
+
     return MESH_VALID_OK;
 }
 
@@ -196,7 +231,7 @@ int mesh_add_edge(QuadMesh* mesh, int a, int b) {
 
     // Add edge
     int idx = mesh->edges.size;
-    MeshEdgeArray_push(&mesh->edges, (MeshEdge){.a = a, .b = b, .face_count = 0, .face_orientation = 0});
+    MeshEdgeArray_push(&mesh->edges, (MeshEdge){.a = a, .b = b, .face_count = 0, .face_orientation_cw = false});
     mesh->vertices.data[a].open_edges += 1;
     mesh->vertices.data[b].open_edges += 1;
     QM_ASSERT(mesh->vertices.data[a].degree < mesh->max_degree);
@@ -214,7 +249,47 @@ int mesh_add_edge(QuadMesh* mesh, int a, int b) {
     mesh_update_frontier_vertex(mesh, a);
     mesh_update_frontier_vertex(mesh, b);
 
+    // Update edge grid
+    Vec2 from = mesh->vertices.data[a].pos;
+    Vec2 to   = mesh->vertices.data[b].pos;
+    UGridCellIteratorArray_resize(&mesh->grid_it, 0);
+    ugrid_segment_query(&mesh->edge_grid, from, to, mesh->intersection_tol, &mesh->grid_it);
+    for (int i=0; i<mesh->grid_it.size; ++i) {
+        ugrid_place(&mesh->edge_grid, mesh->grid_it.data[i].cell, idx);
+    }
+
     return idx;
+}
+
+/** Maybe useful at some point **/
+int mesh_distance_A_star(const QuadMesh* mesh, int u, int v, int max_dist) {
+    // TODO: implement
+    return -1; // distance between vertices is > max_dist
+}
+
+/** Returns the index of the n-th neighbor of v along the frontier assuming a ring-shaped frontier **/
+int mesh_ring_frontier_neighbor(const QuadMesh* mesh, int v, int n) {
+    QM_ASSERT(mesh->vertices.data[v].frontier_index >= 0);
+    bool neg_n = (n < 0);
+    n = neg_n ? -n : n;
+    int prev = -1;
+    int curr = v;
+    for (int i=0; i<n; ++i) {
+        for (int j=0; j<mesh->vertices.data[curr].degree; ++j) {
+            int nidx = mesh->neighbors.data[mesh_neighbor_idx(mesh, curr, j)];
+            if (nidx != prev && mesh->vertices.data[nidx].frontier_index >= 0) {
+                if (prev == -1 && neg_n) {
+                    // Skip first frontier neighbor if negative n
+                    neg_n = false;
+                    continue;
+                }
+                prev = curr;
+                curr = nidx;
+                break;
+            }
+        }
+    }
+    return curr;
 }
 
 /** Detects all 3-cycles involving edge (u,v). */
@@ -293,20 +368,20 @@ bool mesh_register_face(QuadMesh* mesh, const int* verts, int n) {
         int u = verts[i];
         int v = verts[(i + 1) % n];
         int eidx = mesh_edge_index(mesh, u, v);
-        QM_ASSERT(eidx != -1);
+        QM_ASSERT(eidx >= 0);
         MeshEdge* e = &mesh->edges.data[eidx];
         if (e->face_count == 2) return false;
         edges[i] = e;
         face_orientations[i] = (u == e->a) != face_ccw;
         // Return if edge is already part of a face on the same side
-        if (e->face_count == 1 && e->face_orientation == face_orientations[i]) return false;
+        if (e->face_count == 1 && e->face_orientation_cw == face_orientations[i]) return false;
     }
 
     for (int i = 0; i < n; ++i) {
         MeshEdge* e = edges[i];
         ++e->face_count;
         if (e->face_count == 1) {
-            e->face_orientation = face_orientations[i];
+            e->face_orientation_cw = face_orientations[i];
         } else if (e->face_count == 2) {
             mesh->vertices.data[e->a].open_edges -= 1;
             mesh->vertices.data[e->b].open_edges -= 1;
@@ -321,19 +396,33 @@ bool mesh_register_face(QuadMesh* mesh, const int* verts, int n) {
 
 
 /** Validates an existing target; returns reason. */
-MeshValidReason mesh_validate_existing_target(const QuadMesh* mesh, int source, int target) {
+MeshValidReason mesh_validate_existing_target(const QuadMesh* mesh, int source, int target, bool boundary_mode) {
     if (target == source) return MESH_VALID_SAME_VERTEX;
     if (mesh_edge_exists(mesh, source, target)) return MESH_VALID_EDGE_EXISTS;
     if (mesh->vertices.data[source].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
     if (mesh->vertices.data[target].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
+    if (boundary_mode) {
+        int l3 = mesh_ring_frontier_neighbor(mesh, source, -3);
+        int r3 = mesh_ring_frontier_neighbor(mesh, source,  3);
+        if (target != l3 && target != r3) return MESH_VALID_BOUNDARY_VIOLATION;
+    }
     Vec2 tp = mesh->vertices.data[target].pos;
     return mesh_validate_edge(mesh, source, tp, target);
 }
 
 /** Validates a candidate target position; returns reason. */
-MeshValidReason mesh_validate_candidate_target(const QuadMesh* mesh, int source, Vec2 target_pos) {
-    if (mesh->vertices.data[source].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
-    return mesh_validate_edge(mesh, source, target_pos, -1);
+MeshValidReason mesh_validate_candidate_target(const QuadMesh* mesh, int source, Vec2 target_pos, bool boundary_mode) {
+    if (boundary_mode) {
+        int l = mesh_ring_frontier_neighbor(mesh, source, -1);
+        int r = mesh_ring_frontier_neighbor(mesh, source,  1);
+        if (mesh->vertices.data[l].degree >= mesh->max_degree || mesh->vertices.data[r].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
+        MeshValidReason vr = mesh_validate_edge(mesh, l, target_pos, -1);
+        if (vr != MESH_VALID_OK) return vr;
+        return mesh_validate_edge(mesh, r, target_pos, -1);
+    } else {
+        if (mesh->vertices.data[source].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
+        return mesh_validate_edge(mesh, source, target_pos, -1);
+    }
 }
 
 /** Returns a reason string for debugging. */
@@ -345,7 +434,24 @@ const char* mesh_valid_reason_str(MeshValidReason r) {
         case MESH_VALID_DEGREE_FULL: return "degree-full";
         case MESH_VALID_INTERSECT: return "edge-intersection";
         case MESH_VALID_WEDGE_BLOCKED: return "wedge-blocked";
+        case MESH_VALID_BOUNDARY_VIOLATION: return "boundary-violation";
         default: return "invalid";
     }
+}
+
+/** Exports the mesh to an OBJ file (vertices + edges as lines). */
+void mesh_dump_obj(const QuadMesh* mesh, const char* filename) {
+    FILE* f = fopen(filename, "w");
+    QM_ASSERT(f != NULL);
+    fprintf(f, "# QuadMeshing OBJ export\n");
+    for (int i = 0; i < mesh->vertices.size; i++) {
+        MeshVertex* v = &mesh->vertices.data[i];
+        fprintf(f, "v %.8f %.8f 0\n", v->pos.x, v->pos.y);
+    }
+    for (int i = 0; i < mesh->edges.size; i++) {
+        MeshEdge* e = &mesh->edges.data[i];
+        fprintf(f, "l %d %d\n", e->a, e->b);
+    }
+    fclose(f);
 }
 

@@ -25,16 +25,19 @@ typedef struct {
 
 typedef struct {
     float starting_boundary_area;
+    IntArray valid_boundary_idx;
     IntArray valid_candidate_idx;
+    Vec2Array candidates_local;
 } QuadMeshingCache;
 
 // Required that you have some struct for your env
 typedef struct {
+    int num_agents;
     Log log;                     // Required field
     unsigned char* observations; // Required field. Ensure type matches in .py and .c
-    int* actions;                // Required field. Ensure type matches in .py and .c
+    float* actions;              // Required field. Ensure type matches in vecenv.h
     float* rewards;              // Required field
-    unsigned char* terminals;    // Required field
+    float* terminals;            // Required field. Ensure type matches in vecenv.h
     unsigned int rng;
 
     // Env state
@@ -49,13 +52,20 @@ typedef struct {
     int candidate_angles;
     float candidate_radius_min;
     float candidate_radius_max;
-    Vec2Array candidates_local;
     float target_quad_area;
     const char** boundary_paths; // Non-owning
     int boundary_count;
+    bool boundary_mode;
+
+    // Perf
+    int max_degree;
+    unsigned int grid_res;
+    float grid_cell_size;
+    unsigned int grid_cell_cap;
+    float intersection_tol;
 
     // Observation settings
-    uint16_t obs_max_frontier_size;
+    // ...
 
     // Action settings
     // ...
@@ -69,10 +79,10 @@ typedef struct {
     int render_height;
     bool render_show_frontier;
     bool render_show_candidates;
-    bool render_show_indices;
     float render_line_thickness;
     float render_point_radius;
-    float render_candidate_radius; Camera2D camera;
+    float render_candidate_radius;
+    Camera2D camera;
     float camera_zoom;
     int ui_pending_source;
 
@@ -83,15 +93,15 @@ typedef struct {
 static void init_candidates(QuadMeshingEnv* env) {
     int rings = env->candidate_rings;
     int angles = env->candidate_angles;
-    Vec2Array_reserve(&env->candidates_local, rings*angles);
-    for (int r = 1; r <= rings; r++) {
-        float frac = r / (float)rings;
+    Vec2Array_reserve(&env->cache.candidates_local, rings*angles);
+    for (int r = 0; r < rings; r++) {
+        float frac = r / (float)(rings-1);
         float radius = env->candidate_radius_min +
             frac * (env->candidate_radius_max - env->candidate_radius_min);
         for (int a = 0; a < angles; a++) {
             float theta = (2.0f * PI * a) / angles;
             float rr = radius;
-            Vec2Array_push(&env->candidates_local, (Vec2){
+            Vec2Array_push(&env->cache.candidates_local, (Vec2){
                 rr * cosf(theta),
                 rr * sinf(theta),
             });
@@ -100,17 +110,15 @@ static void init_candidates(QuadMeshingEnv* env) {
 }
 
 /** Allocates env buffers and computes observation layout. */
-void quad_meshing_init(
-  QuadMeshingEnv* env,
-  int max_degree,
-  uint16_t obs_max_frontier_size)
+void quad_meshing_init(QuadMeshingEnv* env)
 {
-    mesh_init(&env->mesh, max_degree);
+    mesh_init(&env->mesh, env->max_degree, env->grid_res, env->grid_cell_size, env->grid_cell_cap, env->intersection_tol);
     Vec2Array_init(&env->boundary_poly);
-    Vec2Array_init(&env->candidates_local);
+    Vec2Array_init(&env->cache.candidates_local);
+    IntArray_init(&env->cache.valid_boundary_idx);
     IntArray_init(&env->cache.valid_candidate_idx);
     init_candidates(env);
-    env->obs_max_frontier_size = obs_max_frontier_size;
+    env->ui_pending_source = -1;
 }
 
 void add_log(QuadMeshingEnv* env) {
@@ -174,19 +182,20 @@ typedef struct {
     SerialBuffer sb;
 } SerialObsBuffer;
 
-static void serialize_obs_substep(SerialObsBuffer* obs, uint8_t substep) {
-    obs->sb.pos = 0;
-    serialize_u8(&obs->sb, substep);
-}
-
-uint8_t deserialize_obs_substep(SerialObsBuffer* obs) {
-    obs->sb.pos = 0;
-    return deserialize_u8(&obs->sb);
-}
+// static void serialize_obs_substep(SerialObsBuffer* obs, uint8_t substep) {
+//     obs->sb.pos = 0;
+//     serialize_u8(&obs->sb, substep);
+// }
+//
+// uint8_t deserialize_obs_substep(SerialObsBuffer* obs) {
+//     obs->sb.pos = 0;
+//     return deserialize_u8(&obs->sb);
+// }
 
 static void serialize_obs_frontier(SerialObsBuffer* obs, const QuadMesh* mesh) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t);
+    // sb->pos = sizeof(uint8_t);
+    sb->pos = 0;
 
     // Frontier size
     serialize_u16(sb, mesh->frontier.size);
@@ -206,21 +215,42 @@ static void serialize_obs_frontier(SerialObsBuffer* obs, const QuadMesh* mesh) {
         int d = mesh->vertices.data[vidx].degree;
         int n_count = 0;
         for (int j=0; j<d; ++j) {
-            int nidx = mesh->neighbors.data[mesh_neighbor_idx(mesh, vidx, j)];
-            int nfidx = mesh->vertices.data[nidx].frontier_index;
-            if (nfidx < 0) continue;
+            int nidx = mesh_neighbor_idx(mesh, vidx, j);
+            int nvidx = mesh->neighbors.data[nidx];
+            int nfidx = mesh->vertices.data[nvidx].frontier_index;
+            int eidx = mesh->neighbor_edges.data[nidx];
+            int face_count = mesh->edges.data[eidx].face_count;
+            if (nfidx < 0 || face_count == 2) continue;
             serialize_u16(sb, nfidx);
+
+            // Serialize edge face incidence bitfield [incident ccw | incident cw]
+            QM_ASSERT(face_count < 2);
+            uint8_t face_incidence = 0b00;
+            if (face_count == 1) {
+                face_incidence = mesh_edge_face_orientation_from_vertex(mesh, eidx, vidx) ? 0b01 : 0b10;
+            }
+            serialize_u8(sb, face_incidence);
             ++n_count;
         }
+
+        // Debug code
+        if(n_count != 2) {
+            Vec2 v = mesh->vertices.data[vidx].pos;
+            printf("Invalid neighbor count at boundary vertex (%f, %f)\n", v.x, v.y);
+            mesh_dump_obj(mesh, "debug_mesh.obj");
+        }
+
         for (int j=0; j<mesh->max_degree - n_count; ++j) {
             serialize_u16(sb, UINT16_MAX);
+            serialize_u8(sb, 0);
         }
     }
 }
 
 void deserialize_obs_frontier(SerialObsBuffer* obs, QuadMesh* mesh) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t);
+    // sb->pos = sizeof(uint8_t);
+    sb->pos = 0;
 
     // Frontier size
     uint16_t frontier_size = deserialize_u16(sb);
@@ -238,32 +268,65 @@ void deserialize_obs_frontier(SerialObsBuffer* obs, QuadMesh* mesh) {
     for (int i=0; i<frontier_size; ++i) {
         for (int j=0; j<mesh->max_degree; ++j) {
             uint16_t nidx = deserialize_u16(sb);
+            uint8_t face_incidence = deserialize_u8(sb);
             if (nidx == UINT16_MAX) continue;
-            mesh_add_edge(mesh, i, nidx);
-            // TODO: Recover edge orientation?
+            int eidx = mesh_add_edge(mesh, i, nidx);
+
+            // Recover edge orientation from face incidence
+            if (face_incidence != 0b11) {
+                MeshEdge* e = &mesh->edges.data[eidx];
+                e->face_orientation_cw = (i == e->a) == (face_incidence == 0b01);
+                e->face_count = 1;
+            }
         }
     }
 }
 
-static size_t obs_frontier_bytes(QuadMesh* mesh) {
-    return 2*sizeof(uint16_t) + mesh->frontier.size * (2*sizeof(float) + mesh->max_degree * sizeof(uint16_t));
+static size_t obs_frontier_bytes(const QuadMesh* mesh) {
+    return 2*sizeof(uint16_t) + mesh->frontier.size * (2*sizeof(float) + mesh->max_degree * (sizeof(uint16_t) + sizeof(uint8_t)));
 }
 
-static void serialize_obs_validity_mask(SerialObsBuffer* obs, const QuadMesh* mesh, int source) {
+static void serialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+    // obs->sb.pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    obs->sb.pos = obs_frontier_bytes(mesh);
+    serialize_u16(&obs->sb, source);
+}
+
+uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+    // obs->sb.pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    obs->sb.pos = obs_frontier_bytes(mesh);
+    return deserialize_u16(&obs->sb);
+}
+
+static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    // sb->pos = sizeof(uint8_t) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t);
+    sb->pos = obs_frontier_bytes(&env->mesh) + sizeof(uint16_t);
+
+    // Empty valid index cache
+    IntArray_resize(&env->cache.valid_boundary_idx, 0);
+
+    int l3 = 0;
+    int r3 = 0;
+    if (boundary_mode) {
+        l3 = mesh_ring_frontier_neighbor(&env->mesh, source, -3);
+        r3 = mesh_ring_frontier_neighbor(&env->mesh, source,  3);
+    }
 
     // Frontier validity mask
-    for (int i=0; i<mesh->frontier.size; ++i) {
-        int target = mesh->frontier.data[i];
-        uint8_t valid = mesh_validate_existing_target(mesh, source, target) == MESH_VALID_OK;
+    for (int i=0; i<env->mesh.frontier.size; ++i) {
+        int target = env->mesh.frontier.data[i];
+        uint8_t valid = !boundary_mode || target == l3 || target == r3;
+        valid = valid && mesh_validate_existing_target(&env->mesh, source, target, false) == MESH_VALID_OK;
+        if (valid) IntArray_push(&env->cache.valid_boundary_idx, i);
         serialize_u8(sb, valid);
     }
 }
 
 void deserialize_obs_validity_mask(SerialObsBuffer* obs, QuadMesh* mesh, BoolArray* mask) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    // sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
+    sb->pos = obs_frontier_bytes(mesh) + sizeof(uint16_t);
 
     // Frontier validity mask
     BoolArray_reserve(mask, mesh->frontier.size);
@@ -278,7 +341,8 @@ static size_t obs_validity_bytes(QuadMesh* mesh) {
 
 static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(&env->mesh) + obs_validity_bytes(&env->mesh);
+    // sb->pos = sizeof(uint8_t) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
+    sb->pos = obs_frontier_bytes(&env->mesh) + sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_candidate_idx, 0);
@@ -288,8 +352,8 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
     size_t valid_count_pos = sb->pos;
     serialize_u16(sb, 0); // placeholder
     for (int i=0; i<env->candidate_angles * env->candidate_rings; ++i) {
-        Vec2 target_pos = add2(env->mesh.vertices.data[source].pos, env->candidates_local.data[i]);
-        if (mesh_validate_candidate_target(&env->mesh, source, target_pos) != MESH_VALID_OK) continue;
+        Vec2 target_pos = add2(env->mesh.vertices.data[source].pos, env->cache.candidates_local.data[i]);
+        if (mesh_validate_candidate_target(&env->mesh, source, target_pos, env->boundary_mode) != MESH_VALID_OK) continue;
         IntArray_push(&env->cache.valid_candidate_idx, i);
         serialize_float(sb, target_pos.x);
         serialize_float(sb, target_pos.y);
@@ -302,7 +366,8 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
 
 void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Array* candidates) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh) + obs_validity_bytes(mesh);
+    // sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh) + sizeof(uint16_t) + obs_validity_bytes(mesh);
+    sb->pos = obs_frontier_bytes(mesh) + sizeof(uint16_t) + obs_validity_bytes(mesh);
 
     int valid_count = deserialize_u16(sb);
 
@@ -315,22 +380,25 @@ void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Ar
     }
 }
 
-static void compute_observations(QuadMeshingEnv* env, unsigned char substep, int source) {
+static void compute_observations(QuadMeshingEnv* env, unsigned char substep, int source_slot) {
     QM_ASSERT(substep <= 1);
     QM_ASSERT(env->mesh.frontier.size > 0);
+
+    int source = env->mesh.frontier.data[source_slot];
 
     SerialObsBuffer obs = {
         .sb = env->observations,
     };
 
     // Substep
-    serialize_obs_substep(&obs, substep);
+    // serialize_obs_substep(&obs, substep);
 
     // Assume substep 0 obs remains valid for substep 1
     if (substep == 0) {
         serialize_obs_frontier(&obs, &env->mesh);
     } else {
-        serialize_obs_validity_mask(&obs, &env->mesh, source);
+        serialize_obs_source(&obs, &env->mesh, (uint16_t)source_slot);
+        serialize_obs_validity_mask(&obs, env, source, env->boundary_mode);
         serialize_obs_new_candidates(&obs, env, source);
     }
 }
@@ -387,9 +455,8 @@ void c_reset(QuadMeshingEnv* env) {
 
 void c_substep(QuadMeshingEnv* env, int substep) {
     QM_ASSERT(substep < 1);
-    int source_slot = env->actions[0];
-    int source = env->mesh.frontier.data[source_slot];
-    compute_observations(env, 1, source);
+    int source_slot = (int)env->actions[0];
+    compute_observations(env, 1, source_slot);
 }
 
 /** Advances one environment step using the current action buffer. */
@@ -398,26 +465,31 @@ void c_step(QuadMeshingEnv* env) {
     env->terminals[0] = 0;
     env->episode_length++;
 
-    int source_slot = env->actions[0];
-    int target_slot = env->actions[1];
+    int source_slot = (int)env->actions[0];
+    int target_slot = (int)env->actions[1];
     QM_ASSERT(source_slot >= 0 && source_slot < env->mesh.frontier.size);
-  if (!(target_slot >= 0 && target_slot < env->mesh.frontier.size + env->candidate_angles * env->candidate_rings)) {
-      printf("target_slot: %d, frontier size: %zu, candidates: %d\n", target_slot, env->mesh.frontier.size, env->candidate_angles * env->candidate_rings);
-  }
-    QM_ASSERT(target_slot >= 0 && target_slot < env->mesh.frontier.size + env->candidate_angles * env->candidate_rings);
+    size_t valid_boundary_size = env->cache.valid_boundary_idx.size;
+    if (target_slot < 0 || target_slot >= valid_boundary_size + env->cache.valid_candidate_idx.size) {
+        target_slot = 0;
+    }
 
     int source = env->mesh.frontier.data[source_slot];
+    QM_ASSERT(source < env->mesh.vertices.size);
 
     int valid = 0;
     int target_vertex = -1;
+    bool existing_target = target_slot < valid_boundary_size;
 
-    if (target_slot < env->mesh.frontier.size) {
-        target_vertex = env->mesh.frontier.data[target_slot];
-        valid = mesh_validate_existing_target(&env->mesh, source, target_vertex) == MESH_VALID_OK;
+    if (existing_target) {
+        int bidx = env->cache.valid_boundary_idx.data[target_slot];
+        QM_ASSERT(bidx < env->mesh.frontier.size);
+        target_vertex = env->mesh.frontier.data[bidx];
+        valid = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode) == MESH_VALID_OK;
     } else {
-        int cidx = env->cache.valid_candidate_idx.data[target_slot - env->mesh.frontier.size];
-        Vec2 target_pos = add2(env->mesh.vertices.data[source].pos, env->candidates_local.data[cidx]);
-        valid = mesh_validate_candidate_target(&env->mesh, source, target_pos) == MESH_VALID_OK;
+        int cidx = env->cache.valid_candidate_idx.data[target_slot - valid_boundary_size];
+        QM_ASSERT(cidx < env->cache.candidates_local.size);
+        Vec2 target_pos = add2(env->mesh.vertices.data[source].pos, env->cache.candidates_local.data[cidx]);
+        valid = mesh_validate_candidate_target(&env->mesh, source, target_pos, env->boundary_mode) == MESH_VALID_OK;
 
         // Add vertex
         if (valid) target_vertex = mesh_add_vertex(&env->mesh, target_pos);
@@ -426,44 +498,79 @@ void c_step(QuadMeshingEnv* env) {
     if (!valid) {
         env->rewards[0] += env->reward_invalid;
         env->episode_return += env->reward_invalid;
+
+        // Check episode termination
+        if (env->episode_length >= env->episode_max_length) {
+            env->terminals[0] = 1;
+            add_log(env);
+            c_reset(env);
+        } else {
+            compute_observations(env, 0, -1); // Reset to substep 0
+        }
         return;
     }
 
     // Add new edge
-    mesh_add_edge(&env->mesh, source, target_vertex);
+    if (env->boundary_mode && !existing_target) {
+        int l = mesh_ring_frontier_neighbor(&env->mesh, source, -1);
+        int r = mesh_ring_frontier_neighbor(&env->mesh, source,  1);
+        mesh_add_edge(&env->mesh, l, target_vertex);
+        mesh_add_edge(&env->mesh, r, target_vertex);
 
-    // Detect new potential quads/tris
-    int cycles[64] = {0};
-    int cycle_count = mesh_detect_quads(&env->mesh, source, target_vertex, cycles, 16);
-    int new_face_count = 0; // make sure at most 2 new faces are added
-    Vec2 face[4];
-    for (int i = 0; i < cycle_count; ++i) {
-        int* verts = &cycles[i * 4];
-        if (mesh_register_face(&env->mesh, verts, 4)) {
-            for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
-            env->rewards[0] += 0.5 * compute_quad_reward(env, face);
-            ++new_face_count;
-        };
-    }
-    cycle_count = mesh_detect_triangles(&env->mesh, source, target_vertex, cycles, 16);
-    for (int i = 0; i < cycle_count; ++i) {
-        int* verts = &cycles[i * 3];
-        if (mesh_register_face(&env->mesh, verts, 3)) {
-            for (int j = 0; j < 3; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
-            face[3] = face[2]; // Duplicate last vertex to make (degenerate) quad
-            env->rewards[0] += 0.5 * compute_quad_reward(env, face);
-            ++new_face_count;
-        };
-    }
-    QM_ASSERT(new_face_count <= 2);
+        int verts[4] = {l, source, r, target_vertex};
+        mesh_register_face(&env->mesh, verts, 4);
+        Vec2 face[4];
+        for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
+        env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+    } else {
+        mesh_add_edge(&env->mesh, source, target_vertex);
 
-    // Check episode termination
-    if ((env->mesh.frontier.size == 0) || (env->episode_length >= env->episode_max_length)) {
-        env->terminals[0] = 1;
-        add_log(env);
+        // Detect new potential quads/tris
+        int cycles[64] = {0};
+        int cycle_count = mesh_detect_quads(&env->mesh, source, target_vertex, cycles, 16);
+        int new_face_count = 0; // make sure at most 2 new faces are added
+        Vec2 face[4];
+        for (int i = 0; i < cycle_count; ++i) {
+            int* verts = &cycles[i * 4];
+            if (mesh_register_face(&env->mesh, verts, 4)) {
+                for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
+                env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+                ++new_face_count;
+            };
+        }
+        cycle_count = mesh_detect_triangles(&env->mesh, source, target_vertex, cycles, 16);
+        for (int i = 0; i < cycle_count; ++i) {
+            int* verts = &cycles[i * 3];
+            if (mesh_register_face(&env->mesh, verts, 3)) {
+                for (int j = 0; j < 3; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
+                face[3] = face[2]; // Duplicate last vertex to make (degenerate) quad
+                env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+                ++new_face_count;
+            };
+        }
+        QM_ASSERT(new_face_count <= 2);
     }
 
     env->episode_return += env->rewards[0];
+
+    // In boundary mode, mesh saturation breaks ring frontier constraint
+    bool mesh_saturated = false;
+    if (env->boundary_mode) {
+        for (int i=0; i<env->mesh.vertices.size; ++i) {
+            if (env->mesh.vertices.data[i].degree >= env->mesh.max_degree) {
+                mesh_saturated = true;
+                break;
+            }
+        }
+    }
+
+    // Check episode termination
+    if ((env->mesh.frontier.size == 0) || (env->episode_length >= env->episode_max_length) || mesh_saturated) {
+        env->terminals[0] = 1;
+        add_log(env);
+        c_reset(env);
+        return;
+    }
 
     compute_observations(env, 0, -1);
 }
@@ -474,7 +581,7 @@ void c_render(QuadMeshingEnv* env) {
         InitWindow(env->render_width, env->render_height, "PufferLib Quad Meshing");
         SetTargetFPS(env->render_target_fps);
         env->camera.offset = (Vector2){env->render_width / 2.0f, env->render_height / 2.0f};
-        env->camera.target = (Vector2){0.5f, 0.5f};
+        env->camera.target = (Vector2){0.5f, -0.5f};
         env->camera.rotation = 0.0f;
         env->camera_zoom = fminf(env->render_width, env->render_height) * 0.9f;
         env->camera.zoom = env->camera_zoom;
@@ -482,7 +589,6 @@ void c_render(QuadMeshingEnv* env) {
 
     if (IsKeyPressed(KEY_F)) env->render_show_frontier = !env->render_show_frontier;
     if (IsKeyPressed(KEY_C)) env->render_show_candidates = !env->render_show_candidates;
-    if (IsKeyPressed(KEY_I)) env->render_show_indices = !env->render_show_indices;
 
     float zoom_delta = GetMouseWheelMove();
     if (zoom_delta != 0.0f) {
@@ -498,15 +604,20 @@ void c_render(QuadMeshingEnv* env) {
     float point_radius = env->render_point_radius / env->camera.zoom;
     float candidate_radius = env->render_candidate_radius / env->camera.zoom;
 
+    Vector2 mouse = GetMousePosition();
+    Vector2 vmouse_world = GetScreenToWorld2D(mouse, env->camera);
+    Vec2 mouse_world = {vmouse_world.x, -vmouse_world.y};
+
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
+    DrawText(TextFormat("step: %d | return: %f", env->episode_length, env->episode_return), 20, 20, 20, RAYWHITE);
     BeginMode2D(env->camera);
 
     for (int i = 0; i < env->boundary_poly.size; ++i) {
         Vec2 a = env->boundary_poly.data[i];
         Vec2 b = env->boundary_poly.data[(i + 1) % env->boundary_poly.size];
-        Vector2 va = {a.x, a.y};
-        Vector2 vb = {b.x, b.y};
+        Vector2 va = {a.x, -a.y};
+        Vector2 vb = {b.x, -b.y};
         DrawLineEx(va, vb, line_thickness, (Color){60, 120, 120, 255});
     }
 
@@ -514,11 +625,22 @@ void c_render(QuadMeshingEnv* env) {
         MeshEdge e = env->mesh.edges.data[i];
         Vec2 a = env->mesh.vertices.data[e.a].pos;
         Vec2 b = env->mesh.vertices.data[e.b].pos;
-        Vector2 va = {a.x, a.y};
-        Vector2 vb = {b.x, b.y};
+        Vector2 va = {a.x, -a.y};
+        Vector2 vb = {b.x, -b.y};
         Color c = (Color){220, 80, 80, 255};
         if (e.face_count == 1) c = (Color){255, 200, 80, 255};
         if (e.face_count >= 2) c = (Color){80, 200, 120, 255};
+        DrawLineEx(va, vb, line_thickness, c);
+    }
+
+    UGridCellIterator it = ugrid_point_query(&env->mesh.edge_grid, mouse_world);
+    for (int eidx; (eidx = ugrid_cell_it_next(&it)) != -1;) {
+        MeshEdge e = env->mesh.edges.data[eidx];
+        Vec2 a = env->mesh.vertices.data[e.a].pos;
+        Vec2 b = env->mesh.vertices.data[e.b].pos;
+        Vector2 va = {a.x, -a.y};
+        Vector2 vb = {b.x, -b.y};
+        Color c = (Color){255, 0, 0, 255};
         DrawLineEx(va, vb, line_thickness, c);
     }
 
@@ -526,31 +648,28 @@ void c_render(QuadMeshingEnv* env) {
     int source = env->ui_pending_source >= 0 ? env->mesh.frontier.data[env->ui_pending_source] : -1;
 
     for (int i = 0; i < env->mesh.vertices.size; ++i) {
-        Vector2 p = {env->mesh.vertices.data[i].pos.x, env->mesh.vertices.data[i].pos.y};
+        Vector2 p = {env->mesh.vertices.data[i].pos.x, -env->mesh.vertices.data[i].pos.y};
         Color c = (Color){240, 240, 240, 255};
         int fidx = env->mesh.vertices.data[i].frontier_index;
         if (!selecting_target) {
             if (fidx >= 0) c = (Color){0, 140, 255, 255};
         } else if (source >= 0) {
             if (fidx >= 0) {
-                MeshValidReason r = mesh_validate_existing_target(&env->mesh, source, i);
+                MeshValidReason r = mesh_validate_existing_target(&env->mesh, source, i, env->boundary_mode);
                 c = (r == MESH_VALID_OK) ? (Color){0, 220, 120, 255} : (Color){220, 80, 80, 255};
             } else {
                 c = (Color){80, 80, 80, 255};
             }
         }
         DrawCircleV(p, point_radius, c);
-        if (env->render_show_indices) {
-            DrawText(TextFormat("%d", i), p.x + 0.005f, p.y + 0.005f, 10, RAYWHITE);
-        }
     }
 
     if (selecting_target && env->render_show_candidates) {
         Vec2 s = env->mesh.vertices.data[source].pos;
-        for (int i = 0; i < env->candidates_local.size; ++i) {
-            Vec2 cp = add2(s, env->candidates_local.data[i]);
-            Vector2 vcp = {cp.x, cp.y};
-            MeshValidReason r = mesh_validate_candidate_target(&env->mesh, source, cp);
+        for (int i = 0; i < env->cache.candidates_local.size; ++i) {
+            Vec2 cp = add2(s, env->cache.candidates_local.data[i]);
+            Vector2 vcp = {cp.x, -cp.y};
+            MeshValidReason r = mesh_validate_candidate_target(&env->mesh, source, cp, env->boundary_mode);
             Color c = (r == MESH_VALID_OK) ? (Color){0, 220, 120, 220} : (Color){220, 80, 80, 220};
             DrawCircleV(vcp, candidate_radius, c);
         }
@@ -559,15 +678,12 @@ void c_render(QuadMeshingEnv* env) {
     EndMode2D();
 
     if (selecting_target && source >= 0) {
-        Vector2 mouse = GetMousePosition();
-        Vector2 vmouse_world = GetScreenToWorld2D(mouse, env->camera);
-        Vec2 mouse_world = {vmouse_world.x, vmouse_world.y};
         float hover_radius = env->camera.zoom > 0 ? 10.0f / env->camera.zoom : 0.03f;
         float best = 1e9f;
         int best_target = -1;
         bool best_is_candidate = false;
-        for (int i = 0; i < env->candidates_local.size; ++i) {
-            Vec2 cp = add2(env->mesh.vertices.data[source].pos, env->candidates_local.data[i]);
+        for (int i = 0; i < env->cache.candidates_local.size; ++i) {
+            Vec2 cp = add2(env->mesh.vertices.data[source].pos, env->cache.candidates_local.data[i]);
             float d = sqrd_norm2(sub2(mouse_world, cp));
             if (d < best) {
                 best = d;
@@ -587,17 +703,19 @@ void c_render(QuadMeshingEnv* env) {
         }
         if (best_target >= 0 && best <= hover_radius*hover_radius) {
             MeshValidReason r = MESH_VALID_OK;
+            Vec2 tp;
             if (best_is_candidate) {
-                Vec2 tp = add2(
+                tp = add2(
                     env->mesh.vertices.data[source].pos,
-                    env->candidates_local.data[best_target]
+                    env->cache.candidates_local.data[best_target]
                 );
-                r = mesh_validate_candidate_target(&env->mesh, source, tp);
+                r = mesh_validate_candidate_target(&env->mesh, source, tp, env->boundary_mode);
             } else {
                 int target_vertex = env->mesh.frontier.data[best_target];
-                r = mesh_validate_existing_target(&env->mesh, source, target_vertex);
+                tp = env->mesh.vertices.data[target_vertex].pos;
+                r = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode);
             }
-            DrawText(TextFormat("Target: %s", mesh_valid_reason_str(r)), 20, 20, 20, RAYWHITE);
+            DrawText(TextFormat("Target: %s (%f, %f)", mesh_valid_reason_str(r), tp.x, tp.y), 20, GetScreenHeight() - 40, 20, RAYWHITE);
         }
     }
     EndDrawing();
@@ -610,7 +728,8 @@ void c_close(QuadMeshingEnv* env) {
     }
     mesh_free(&env->mesh);
     Vec2Array_free(&env->boundary_poly);
-    Vec2Array_free(&env->candidates_local);
+    Vec2Array_free(&env->cache.candidates_local);
+    IntArray_free(&env->cache.valid_boundary_idx);
     IntArray_free(&env->cache.valid_candidate_idx);
 }
 

@@ -6,6 +6,7 @@ import os
 import glob
 import time
 import ctypes
+import pprint
 from collections import defaultdict
 
 import numpy as np
@@ -177,8 +178,8 @@ class PuffeRL:
         self.verbose = verbose
 
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-        if verbose:
-            pufferlib.pufferl.print_dashboard(args, self.model_size, {}, clear=True)
+        # if verbose:
+        #     pufferlib.pufferl.print_dashboard(args, self.model_size, {}, clear=True)
 
 
     @property
@@ -211,17 +212,23 @@ class PuffeRL:
             for substep in range(self._vec.num_substeps):
                 o_device = torch.as_tensor(self.vec_obs, device=device)
 
+                prof.mark(1)
                 with torch.no_grad():
-                    logits, _, state = self.policy.forward_eval(o_device, self.state)
+                    logits, _, state = self.policy.forward_eval(o_device, self.state, substep)
                     action, logprob, _ = sample_logits(logits)
+                prof.mark(2)
+                prof.elapsed(P.EVAL_GPU, 1, 2)
 
-                actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
+                actions_flat = (action if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
                 if self.gpu:
                     actions_flat = actions_flat.cuda()
                     self._vec.gpu_substep(actions_flat.data_ptr(), substep)
                     torch.cuda.synchronize()
                 else:
                     self._vec.cpu_substep(actions_flat.data_ptr(), substep)
+                prof.mark(3)
+                # prof.elapsed(P.EVAL_ENV_SUBSTEP, 2, 3)
+                prof.elapsed(P.EVAL_ENV, 2, 3)
 
                 with torch.no_grad():
                     self.logprobs[t] += logprob
@@ -230,9 +237,10 @@ class PuffeRL:
 
             prof.mark(1)
             with torch.no_grad():
-                logits, value, state = self.policy.forward_eval(o_device, self.state)
+                logits, value, state = self.policy.forward_eval(o_device, self.state, self._vec.num_substeps)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
+            prof.elapsed(P.EVAL_GPU, 1, 2)
 
             with torch.no_grad():
                 self.state = state
@@ -245,7 +253,7 @@ class PuffeRL:
 
             prof.mark(2)
             # Environment step
-            actions_flat = (action.T if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
+            actions_flat = (action if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
             if self.gpu:
                 actions_flat = actions_flat.cuda()
                 self._vec.gpu_step(actions_flat.data_ptr())
@@ -254,7 +262,6 @@ class PuffeRL:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             prof.mark(3)
-            prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
 
         prof.mark(1)
@@ -314,11 +321,19 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
-            prof.mark(1)
-            logits, newvalue = self.policy(mb_obs)
-            actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
-            prof.mark(2)
-            prof.elapsed(P.TRAIN_FORWARD, 1, 2)
+            newlogprob = torch.zeros_like(mb_logprobs, device=device)
+            entropy = torch.zeros(config['minibatch_size'], device=device)
+            for substep in range(self._vec.num_substeps + 1):
+                prof.mark(1)
+                logits, newvalue = self.policy(mb_obs, substep)
+                masked_mb_actions = torch.zeros_like(mb_actions, device=device)
+                masked_mb_actions[:, :, :substep+1] = mb_actions[:, :, :substep+1] # Assumes each substep maps to exactly one action component
+                _, subaction_logprob, subaction_entropy = sample_logits(logits, action=masked_mb_actions)
+                prof.mark(2)
+                prof.elapsed(P.TRAIN_FORWARD, 1, 2)
+
+                newlogprob += subaction_logprob.reshape(mb_logprobs.shape)
+                entropy += subaction_entropy
 
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
@@ -387,6 +402,7 @@ class PuffeRL:
                 'rollout': perf[P.ROLLOUT],
                 'eval_gpu': perf[P.EVAL_GPU],
                 'eval_env': perf[P.EVAL_ENV],
+                'eval_env_substep': perf[P.EVAL_ENV_SUBSTEP],
                 'train': perf[P.TRAIN],
                 'train_misc': perf[P.TRAIN_MISC],
                 'train_forward': perf[P.TRAIN_FORWARD],
@@ -456,7 +472,7 @@ def compute_puff_advantage(values, rewards, terminals,
 
 class Profile:
     '''Matches pufferlib.cu profiling: accumulate ms, report seconds.'''
-    ROLLOUT, EVAL_GPU, EVAL_ENV, TRAIN, TRAIN_MISC, TRAIN_FORWARD, NUM = range(7)
+    ROLLOUT, EVAL_GPU, EVAL_ENV, EVAL_ENV_SUBSTEP, TRAIN, TRAIN_MISC, TRAIN_FORWARD, NUM = range(8)
 
     def __init__(self, gpu=True):
         self.accum = [0.0] * Profile.NUM
@@ -492,8 +508,10 @@ def load_policy(args, vec):
     decoder_cls = getattr(pufferlib.models, args['torch']['decoder'])
 
     network = network_cls(**policy_kwargs)
-    encoder = encoder_cls(vec.obs_size, policy_kwargs['hidden_size'])
-    decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
+    encoder = encoder_cls(vec.obs_size, **policy_kwargs)
+    decoder = decoder_cls(vec.act_sizes, **policy_kwargs)
+    # encoder = encoder_cls(vec.obs_size, policy_kwargs['hidden_size'])
+    # decoder = decoder_cls(vec.act_sizes, policy_kwargs['hidden_size'])
     policy = pufferlib.models.Policy(encoder, decoder, network)
 
     device = 'cuda' if _C.gpu else 'cpu'

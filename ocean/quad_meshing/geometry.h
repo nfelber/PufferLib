@@ -125,19 +125,95 @@ float polygonInteriorAngle(const Vec2* poly, int size, int i, bool isCCW) {
     return angle;
 }
 
+float point_segment_dist_sq(Vec2 p, Vec2 a, Vec2 b) {
+    const float eps = 1e-12f;
+
+    Vec2 ab = sub2(b, a);
+    float ab2 = dot2(ab, ab);
+
+    // Degenerate segment: a == b
+    if (ab2 < eps) {
+        Vec2 d = sub2(p, a);
+        return dot2(d, d);
+    }
+
+    float t = dot2(sub2(p, a), ab) / ab2;
+    t = clampf(t, 0.0f, 1.0f);
+
+    Vec2 closest = add2(a, scalmul2(ab, t));
+    Vec2 d = sub2(p, closest);
+
+    return dot2(d, d);
+}
+
 /** Strict segment-segment intersection test. */
-bool segments_intersect(Vec2 p1, Vec2 p2, Vec2 q1, Vec2 q2) {
+static bool segments_intersect_strict(Vec2 p1, Vec2 p2, Vec2 q1, Vec2 q2) {
+    const float eps = 1e-8;
+
     Vec2 r = sub2(p2, p1);
     Vec2 s = sub2(q2, q1);
+    Vec2 qmp = sub2(q1, p1);
+
     float rxs = cross2(r, s);
-    float q_p_r = cross2(sub2(q1, p1), r);
-    if (fabsf(rxs) < 1e-8f && fabsf(q_p_r) < 1e-8f) {
-        return 0;
+    float qmpxr = cross2(qmp, r);
+
+    // Parallel
+    if (fabsf(rxs) < eps) {
+        // Parallel but not colinear
+        if (fabsf(qmpxr) >= eps) return false;
+
+        // Colinear: check for overlap along p1 -> p2
+        float rr = dot2(r, r);
+
+        // Degenerate p segment: p1 == p2
+        if (rr < eps) {
+            // Treat as intersecting if p1 lies on q segment
+            float ss = dot2(s, s);
+
+            // Both are points
+            if (ss < eps) {
+                Vec2 d = sub2(q1, p1);
+                return dot2(d, d) < eps;
+            }
+
+            float tq = dot2(sub2(p1, q1), s) / ss;
+            return tq >= -eps && tq <= 1.0f + eps;
+        }
+
+        float t0 = dot2(sub2(q1, p1), r) / rr;
+        float t1 = dot2(sub2(q2, p1), r) / rr;
+
+        if (t0 > t1) {
+            float tmp = t0;
+            t0 = t1;
+            t1 = tmp;
+        }
+
+        return t0 <= 1.0f + eps && t1 >= -eps;
     }
-    if (fabsf(rxs) < 1e-8f && fabsf(q_p_r) >= 1e-8f) {
-        return 0;
-    }
-    float t = cross2(sub2(q1, p1), s) / rxs;
-    float u = cross2(sub2(q1, p1), r) / rxs;
-    return (t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f);
+
+    // Non-parallel: solve p1 + t*r = q1 + u*s
+    float t = cross2(qmp, s) / rxs;
+    float u = cross2(qmp, r) / rxs;
+
+    return t >= -eps && t <= 1.0f + eps &&
+           u >= -eps && u <= 1.0f + eps;
 }
+
+bool segments_intersect(Vec2 p1, Vec2 p2, Vec2 q1, Vec2 q2, float tol) {
+    if (tol < 0.0f) tol = 0.0f;
+
+    // First check true intersection.
+    if (segments_intersect_strict(p1, p2, q1, q2)) {
+        return true;
+    }
+
+    float tol2 = tol * tol;
+
+    // If they do not intersect, the closest points involve at least one endpoint.
+    return point_segment_dist_sq(p1, q1, q2) <= tol2 ||
+           point_segment_dist_sq(p2, q1, q2) <= tol2 ||
+           point_segment_dist_sq(q1, p1, p2) <= tol2 ||
+           point_segment_dist_sq(q2, p1, p2) <= tol2;
+}
+

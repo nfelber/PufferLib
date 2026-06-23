@@ -55,7 +55,7 @@ def abbreviate(num, b2, c2):
 
 def duration(seconds, b2, c2):
     if seconds < 0: return f"{b2}0{c2}s"
-    if seconds < 1: return f"{b2}{seconds*1000:.0f}{c2}ms"
+    if seconds < 10: return f"{b2}{seconds*1000:.0f}{c2}ms"
     seconds = int(seconds)
     d = f'{b2}{seconds // 86400}{c2}d '
     h = f'{b2}{(seconds // 3600) % 24}{c2}h '

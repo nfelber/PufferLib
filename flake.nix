@@ -28,6 +28,7 @@
               python3
               uv
               ninja
+              cmake
               ccache
               llvmPackages.libcxxClang
               llvmPackages.libcxx
@@ -35,12 +36,17 @@
               cudaPackages.cudnn
               cudaPackages.nccl
               libGL
+              libGLU
+              libXfixes
+              libXft
+              fontconfig
               # llvmPackages.lld
               # libllvm
               # glibc
               # glibc.dev
               # binutils
               zenity
+              gdb
             ];
 
             runScript = "nu";
@@ -54,6 +60,8 @@
               # Make OpenMP visible to puffer env builder
               export EXTRA_CFLAGS="-I${pkgs.llvmPackages.openmp.dev}/include"
               export EXTRA_LDFLAGS="-L${pkgs.llvmPackages.openmp}/lib"
+
+              # export LD_PRELOAD=$(clang -print-file-name=libclang_rt.asan-x86_64.so)
 
               export CC=clang
               export CXX=clang++
@@ -76,34 +84,6 @@
               fi
             '';
           }).env;
-          # default = pkgs.mkShell {
-          #   packages = [
-          #     pkgs.python3
-          #     pkgs.uv
-          #     pkgs.ninja
-          #     pkgs.cudatoolkit
-          #     pkgs.llvmPackages.libcxxClang
-          #     pkgs.llvmPackages.openmp
-          #   ];
-          #
-          #   env = lib.optionalAttrs pkgs.stdenv.isLinux {
-          #     # Python libraries often load native shared objects using dlopen(3).
-          #     # Setting LD_LIBRARY_PATH makes the dynamic library loader aware of libraries without using RPATH for lookup.
-          #     LD_LIBRARY_PATH = lib.makeLibraryPath pkgs.pythonManylinuxPackages.manylinux1;
-          #   };
-          #
-          #   shellHook = ''
-          #     # Required for Pytorch to find cuda libraries
-          #     export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
-          #     export LIBRARY_PATH=/run/opengl-driver/lib:$LIBRARY_PATH
-          #     export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib:$TRITON_LIBCUDA_PATH
-          #
-          #     unset PYTHONPATH
-          #     if [ -f ./.venv/bin/activate ]; then
-          #       source .venv/bin/activate
-          #     fi
-          #   '';
-          # };
         }
       );
     };

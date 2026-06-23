@@ -238,11 +238,27 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
     Dict* c_dict = create_dict(py_dict.size());
     for (auto item : py_dict) {
         const char* key = PyUnicode_AsUTF8(item.first.ptr());
-        try {
-            dict_set(c_dict, key, item.second.cast<double>());
-        } catch (const py::cast_error&) {
-            // Skip non-numeric values
+        py::handle h = item.second;
+
+        // Numeric types → double
+        if (py::isinstance<py::float_>(h) || py::isinstance<py::int_>(h) || py::isinstance<py::bool_>(h)) {
+            dict_set(c_dict, key, h.cast<double>());
         }
+        // Python list → char** pointer + count
+        else if (py::isinstance<py::list>(h)) {
+            py::list py_list = h.cast<py::list>();
+            int count = (int)py_list.size();
+            const char** arr = (const char**)calloc(count, sizeof(const char*));
+            for (int i = 0; i < count; i++) {
+                py::str s = py_list[i];
+                arr[i] = strdup(PyUnicode_AsUTF8(s.ptr()));
+            }
+            c_dict->items[c_dict->size].key = key;
+            c_dict->items[c_dict->size].ptr = (void*)arr;
+            c_dict->items[c_dict->size].value = (double)count;
+            c_dict->size++;
+        }
+        // Anything else (str, None, etc.) → silently skip
     }
     return c_dict;
 }

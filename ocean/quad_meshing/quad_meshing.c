@@ -7,32 +7,34 @@
 
 int main() {
     QuadMeshingEnv env = {0};
-    env.episode_length = 2048;
+    env.episode_max_length = 2048;
     static const char* boundary_paths[] = {
-      "resources/quad_meshing/boundaries/rat-18.json",
-      "resources/quad_meshing/boundaries/cup-13.json",
-      "resources/quad_meshing/boundaries/chopper-12.json",
-      "resources/quad_meshing/boundaries/classic-8.json",
-      "resources/quad_meshing/boundaries/dog-12.json",
-      "resources/quad_meshing/boundaries/Bone-11.json",
-      "resources/quad_meshing/boundaries/stef-19.json",
-      "resources/quad_meshing/boundaries/bell-19.json",
-      "resources/quad_meshing/boundaries/fork-18.json",
-      "resources/quad_meshing/boundaries/pencil-11.json"
+      "resources/quad_meshing/boundaries/square.json"
+      // "resources/quad_meshing/boundaries/rat-18.json",
+      // "resources/quad_meshing/boundaries/cup-13.json",
+      // "resources/quad_meshing/boundaries/chopper-12.json",
+      // "resources/quad_meshing/boundaries/classic-8.json",
+      // "resources/quad_meshing/boundaries/dog-12.json",
+      // "resources/quad_meshing/boundaries/Bone-11.json",
+      // "resources/quad_meshing/boundaries/stef-19.json",
+      // "resources/quad_meshing/boundaries/bell-19.json",
+      // "resources/quad_meshing/boundaries/fork-18.json",
+      // "resources/quad_meshing/boundaries/pencil-11.json"
     };
     env.boundary_paths = boundary_paths;
     env.boundary_count = (int)(sizeof(boundary_paths) / sizeof(boundary_paths[0]));
-    env.candidate_rings = 4;
-    env.candidate_angles = 16;
-    env.candidate_radius_min = 0.03f;
-    env.candidate_radius_max = 0.20f;
+    env.boundary_mode = true;
+    env.candidate_rings = 5;
+    env.candidate_angles = 64;
+    env.candidate_radius_min = 0.15;
+    env.candidate_radius_max = 0.20;
+    env.target_quad_area = 0.015625;
     env.reward_invalid = -0.1f;
     env.render_width = 1200;
     env.render_height = 900;
     env.render_target_fps = 144;
     env.render_show_frontier = true;
     env.render_show_candidates = true;
-    env.render_show_indices = false;
     env.render_line_thickness = 2.0f;
     env.render_point_radius = 4.0f;
     env.render_candidate_radius = 3.0f;
@@ -41,14 +43,18 @@ int main() {
     unsigned int rng = 42;
     double key_repeat_cd = 0.01;
 
-    const int max_degree = 16;
     const int max_frontier = 1024;
+    env.max_degree = 16;
+    env.grid_res = 32;
+    env.grid_cell_size = 1.0 / (float)env.grid_res;
+    env.grid_cell_cap = 8;
+    env.intersection_tol = 1e-3;
 
-    quad_meshing_init(&env, max_degree, max_frontier);
-    env.observations = (unsigned char*)calloc(1 + 4 + max_frontier * (8 + 2 * max_degree + 1) + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
-    env.actions = (int*)calloc(2, sizeof(int));
+    quad_meshing_init(&env);
+    env.observations = (unsigned char*)calloc(1 + 4 + max_frontier * (8 + 3 * env.max_degree + 1) + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
+    env.actions = (float*)calloc(2, sizeof(int));
     env.rewards = (float*)calloc(1, sizeof(float));
-    env.terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env.terminals = (float*)calloc(1, sizeof(unsigned char));
 
     c_reset(&env);
     c_render(&env);
@@ -68,7 +74,7 @@ int main() {
 
             // Pick source + target at random
             QuadMesh mesh;
-            mesh_init(&mesh, 0);
+            mesh_init(&mesh, 0, env.grid_res, env.grid_cell_size, env.grid_cell_cap, env.intersection_tol);
             deserialize_obs_frontier(&obs, &mesh);
 
             if (env.ui_pending_source < 0) {
@@ -97,8 +103,7 @@ int main() {
 
                 // Step
                 if (valid_targets.size > 0) {
-                    int target_idx = rand_range(&rng, valid_targets.size);
-                    env.actions[1] = valid_targets.data[target_idx];
+                    env.actions[1] = rand_range(&rng, valid_targets.size);
                 } else {
                     env.actions[1] = 0;
                 }
@@ -119,11 +124,11 @@ int main() {
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && IsWindowReady()) {
             Vector2 vmouse_world = GetScreenToWorld2D(GetMousePosition(), env.camera);
-            Vec2 mouse_world = {vmouse_world.x, vmouse_world.y};
+            Vec2 mouse_world = {vmouse_world.x, -vmouse_world.y};
             // uint8_t substep = deserialize_obs_substep(&obs);
             // printf("substep: %d\n", substep);
             QuadMesh mesh;
-            mesh_init(&mesh, 0);
+            mesh_init(&mesh, 0, env.grid_res, env.grid_cell_size, env.grid_cell_cap, env.intersection_tol);
             deserialize_obs_frontier(&obs, &mesh);
             if (env.ui_pending_source < 0) {
                 float best = 1e9f;
@@ -140,7 +145,6 @@ int main() {
                 if (best_idx >= 0 && best <= pick_radius*pick_radius) {
                     env.ui_pending_source = best_idx;
                     env.actions[0] = best_idx;
-                    // printf("source: %d\n", best_idx);
                     c_substep(&env, 0);
                 }
             } else {
@@ -153,14 +157,18 @@ int main() {
 
                 float best = 1e9f;
                 int best_target = -1;
+                int last_bounday_action_idx = 0;
 
                 for (int i = 0; i < mesh.frontier.size; i++) {
                     int vidx = mesh.frontier.data[i];
                     Vec2 p = mesh.vertices.data[vidx].pos;
                     float d = sqrd_norm2(sub2(mouse_world, p));
-                    if (d < best) {
-                        best = d;
-                        best_target = vidx;
+                    if (validity_mask.data[i]) {
+                        if (d < best) {
+                            best = d;
+                            best_target = last_bounday_action_idx;
+                        }
+                        ++last_bounday_action_idx;
                     }
                 }
 
@@ -169,15 +177,15 @@ int main() {
                     float d = sqrd_norm2(sub2(mouse_world, cp));
                     if (d < best) {
                         best = d;
-                        best_target = mesh.frontier.size + i;
+                        best_target = last_bounday_action_idx + i;
                     }
                 }
 
                 if (best_target >= 0 && best <= pick_radius*pick_radius) {
-                    // printf("target: %d\n", best_target);
                     env.actions[0] = env.ui_pending_source;
                     env.actions[1] = best_target;
                     c_step(&env);
+                    printf("reward: %f\n", env.rewards[0]);
                 }
 
                 env.ui_pending_source = -1;
