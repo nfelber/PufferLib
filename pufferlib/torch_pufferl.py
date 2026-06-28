@@ -156,6 +156,9 @@ class PuffeRL:
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
+        self.mb_observations = torch.empty(
+            self.minibatch_segments, horizon, vec.obs_size,
+            dtype=obs_dtype, device=device)
         self.total_epochs = max(1, config['total_timesteps'] // self.batch_size)
 
         self.policy = policy
@@ -209,35 +212,35 @@ class PuffeRL:
         prof.mark(0)
         for t in range(horizon):
             # Environment substeps (if present)
-            for substep in range(self._vec.num_substeps):
-                o_device = torch.as_tensor(self.vec_obs, device=device)
-
-                prof.mark(1)
-                with torch.no_grad():
-                    logits, _, state = self.policy.forward_eval(o_device, self.state, substep)
-                    action, logprob, _ = sample_logits(logits)
-                prof.mark(2)
-                prof.elapsed(P.EVAL_GPU, 1, 2)
-
-                actions_flat = (action if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
-                if self.gpu:
-                    actions_flat = actions_flat.cuda()
-                    self._vec.gpu_substep(actions_flat.data_ptr(), substep)
-                    torch.cuda.synchronize()
-                else:
-                    self._vec.cpu_substep(actions_flat.data_ptr(), substep)
-                prof.mark(3)
-                # prof.elapsed(P.EVAL_ENV_SUBSTEP, 2, 3)
-                prof.elapsed(P.EVAL_ENV, 2, 3)
-
-                with torch.no_grad():
-                    self.logprobs[t] += logprob
+            # for substep in range(self._vec.num_substeps):
+            #     o_device = torch.as_tensor(self.vec_obs, device=device)
+            #
+            #     prof.mark(1)
+            #     with torch.no_grad():
+            #         logits, _, state = self.policy.forward_eval(o_device, self.state, substep)
+            #         action, logprob, _ = sample_logits(logits)
+            #     prof.mark(2)
+            #     prof.elapsed(P.EVAL_GPU, 1, 2)
+            #
+            #     actions_flat = (action if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
+            #     if self.gpu:
+            #         actions_flat = actions_flat.cuda()
+            #         self._vec.gpu_substep(actions_flat.data_ptr(), substep)
+            #         torch.cuda.synchronize()
+            #     else:
+            #         self._vec.cpu_substep(actions_flat.data_ptr(), substep)
+            #     prof.mark(3)
+            #     # prof.elapsed(P.EVAL_ENV_SUBSTEP, 2, 3)
+            #     prof.elapsed(P.EVAL_ENV, 2, 3)
+            #
+            #     with torch.no_grad():
+            #         self.logprobs[t] += logprob
 
             o_device = torch.as_tensor(self.vec_obs, device=device)
 
             prof.mark(1)
             with torch.no_grad():
-                logits, value, state = self.policy.forward_eval(o_device, self.state, self._vec.num_substeps)
+                logits, value, state = self.policy.forward_eval(o_device, self.state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
             prof.elapsed(P.EVAL_GPU, 1, 2)
@@ -314,26 +317,32 @@ class PuffeRL:
                 self.minibatch_segments, replacement=True)
             mb_prio = (self.total_agents*prio_probs[idx, None])**-anneal_beta
 
-            mb_obs = obs[idx]
+            torch.index_select(obs, 0, idx, out=self.mb_observations)
+            mb_obs = self.mb_observations
             mb_actions = act[idx]
             mb_logprobs = lp[idx]
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
-            newlogprob = torch.zeros_like(mb_logprobs, device=device)
-            entropy = torch.zeros(config['minibatch_size'], device=device)
-            for substep in range(self._vec.num_substeps + 1):
-                prof.mark(1)
-                logits, newvalue = self.policy(mb_obs, substep)
-                masked_mb_actions = torch.zeros_like(mb_actions, device=device)
-                masked_mb_actions[:, :, :substep+1] = mb_actions[:, :, :substep+1] # Assumes each substep maps to exactly one action component
-                _, subaction_logprob, subaction_entropy = sample_logits(logits, action=masked_mb_actions)
-                prof.mark(2)
-                prof.elapsed(P.TRAIN_FORWARD, 1, 2)
-
-                newlogprob += subaction_logprob.reshape(mb_logprobs.shape)
-                entropy += subaction_entropy
+            # newlogprob = torch.zeros_like(mb_logprobs, device=device)
+            # entropy = torch.zeros(config['minibatch_size'], device=device)
+            # for substep in range(self._vec.num_substeps + 1):
+            #     prof.mark(1)
+            #     logits, newvalue = self.policy(mb_obs, substep)
+            #     masked_mb_actions = torch.zeros_like(mb_actions, device=device)
+            #     masked_mb_actions[:, :, :substep+1] = mb_actions[:, :, :substep+1] # Assumes each substep maps to exactly one action component
+            #     _, subaction_logprob, subaction_entropy = sample_logits(logits, action=masked_mb_actions)
+            #     prof.mark(2)
+            #     prof.elapsed(P.TRAIN_FORWARD, 1, 2)
+            #
+            #     newlogprob += subaction_logprob.reshape(mb_logprobs.shape)
+            #     entropy += subaction_entropy
+            prof.mark(1)
+            logits, newvalue = self.policy(mb_obs)
+            _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            prof.mark(2)
+            prof.elapsed(P.TRAIN_FORWARD, 1, 2)
 
             newlogprob = newlogprob.reshape(mb_logprobs.shape)
             logratio = newlogprob - mb_logprobs
@@ -543,4 +552,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

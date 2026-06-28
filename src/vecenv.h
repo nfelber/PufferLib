@@ -426,46 +426,6 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         cudaMemset(vec->gpu_actions, 0, total_agents * NUM_ATNS * sizeof(float));
         cudaMemset(vec->gpu_rewards, 0, total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, total_agents * sizeof(float));
-    // printf("%zu\n", total_agents * OBS_SIZE * obs_elem_size);
-    // CUDA_CHECK(cudaHostAlloc((void**)&vec->observations,
-    //     total_agents * OBS_SIZE * obs_elem_size,
-    //     cudaHostAllocPortable));
-    //
-    // CUDA_CHECK(cudaHostAlloc((void**)&vec->actions,
-    //     total_agents * NUM_ATNS * sizeof(float),
-    //     cudaHostAllocPortable));
-    //
-    // CUDA_CHECK(cudaHostAlloc((void**)&vec->rewards,
-    //     total_agents * sizeof(float),
-    //     cudaHostAllocPortable));
-    //
-    // CUDA_CHECK(cudaHostAlloc((void**)&vec->terminals,
-    //     total_agents * sizeof(float),
-    //     cudaHostAllocPortable));
-    //
-    // CUDA_CHECK(cudaMalloc((void**)&vec->gpu_observations,
-    //     total_agents * OBS_SIZE * obs_elem_size));
-    //
-    // CUDA_CHECK(cudaMalloc((void**)&vec->gpu_actions,
-    //     total_agents * NUM_ATNS * sizeof(float)));
-    //
-    // CUDA_CHECK(cudaMalloc((void**)&vec->gpu_rewards,
-    //     total_agents * sizeof(float)));
-    //
-    // CUDA_CHECK(cudaMalloc((void**)&vec->gpu_terminals,
-    //     total_agents * sizeof(float)));
-    //
-    // CUDA_CHECK(cudaMemset(vec->gpu_observations, 0,
-    //     total_agents * OBS_SIZE * obs_elem_size));
-    //
-    // CUDA_CHECK(cudaMemset(vec->gpu_actions, 0,
-    //     total_agents * NUM_ATNS * sizeof(float)));
-    //
-    // CUDA_CHECK(cudaMemset(vec->gpu_rewards, 0,
-    //     total_agents * sizeof(float)));
-    //
-    // CUDA_CHECK(cudaMemset(vec->gpu_terminals, 0,
-    //     total_agents * sizeof(float)));
     } else {
         vec->observations = calloc(total_agents * OBS_SIZE, obs_elem_size);
         vec->actions = (float*)calloc(total_agents * NUM_ATNS, sizeof(float));

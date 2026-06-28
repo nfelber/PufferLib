@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 from typing import Dict
 from contextlib import contextmanager
@@ -5,7 +7,8 @@ from contextlib import contextmanager
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import inspect
+import triton
+import triton.language as tl
 
 @contextmanager
 def nvtx_range(name: str):
@@ -22,50 +25,34 @@ class Policy(nn.Module):
         self.decoder = decoder
         self.network = network
 
-        sig = inspect.signature(encoder.forward)
-        self.accepts_substep = (
-            "substep" in sig.parameters
-            or any(p.kind == inspect.Parameter.VAR_KEYWORD
-                   for p in sig.parameters.values())
-        )
+        # sig = inspect.signature(encoder.forward)
+        # self.accepts_substep = (
+        #     "substep" in sig.parameters
+        #     or any(p.kind == inspect.Parameter.VAR_KEYWORD
+        #            for p in sig.parameters.values())
+        # )
 
     def initial_state(self, batch_size, device):
         return self.network.initial_state(batch_size, device)
 
-    def forward_eval(self, x, state, substep):
-        if self.accepts_substep:
-            with nvtx_range("encoder_eval"):
-                h = self.encoder(x, substep)
-            with nvtx_range("network_eval"):
-                h, state = self.network.forward_eval(h, state, substep)
-            with nvtx_range("decoder_eval"):
-                logits, values = self.decoder(h, substep)
-        else:
-            with nvtx_range("encoder_eval"):
-                h = self.encoder(x)
-            with nvtx_range("network_eval"):
-                h, state = self.network.forward_eval(h, state)
-            with nvtx_range("decoder_eval"):
-                logits, values = self.decoder(h)
+    def forward_eval(self, x, state):
+        with nvtx_range("encoder_eval"):
+            h = self.encoder(x)
+        with nvtx_range("network_eval"):
+            h, state = self.network.forward_eval(h, state)
+        with nvtx_range("decoder_eval"):
+            logits, values = self.decoder(h)
 
         return logits, values, state
 
-    def forward(self, x, substep):
+    def forward(self, x):
         B, TT = x.shape[:2]
-        if self.accepts_substep:
-            with nvtx_range("encoder_train"):
-                h = self.encoder(x.reshape(B*TT, *x.shape[2:]), substep)
-            with nvtx_range("network_train"):
-                h = self.network.forward_train(h if isinstance(h, dict) else h.reshape(B, TT, -1), substep)
-            with nvtx_range("decoder_train"):
-                logits, values = self.decoder(h if isinstance(h, dict) else h.reshape(B*TT, -1), substep)
-        else:
-            with nvtx_range("encoder_train"):
-                h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
-            with nvtx_range("network_train"):
-                h = self.network.forward_train(h if isinstance(h, dict) else h.reshape(B, TT, -1))
-            with nvtx_range("decoder_train"):
-                logits, values = self.decoder(h if isinstance(h, dict) else h.reshape(B*TT, -1))
+        with nvtx_range("encoder_train"):
+            h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        with nvtx_range("network_train"):
+            h = self.network.forward_train(h.reshape(B, TT, -1) if isinstance(h, torch.Tensor) else h)
+        with nvtx_range("decoder_train"):
+            logits, values = self.decoder(h.reshape(B*TT, -1) if isinstance(h, torch.Tensor) else h)
 
         return logits, values.reshape(B, TT) if values is not None else None
 
@@ -612,532 +599,987 @@ class SE2AngleMessagePassing(nn.Module):
         return self.phi_h(torch.cat([h, agg], dim=-1))
 
 
-UINT16_MAX = 65535
+@dataclass
+class CSRGraph:
+    vertices: torch.Tensor       # [N, 2] vertex positions
+    batch_offsets: torch.Tensor  # [B + 1] vertex offsets per batch
+    edges: torch.Tensor          # [2, E] edge indices
+    edge_features: torch.Tensor  # [E, f] edge features
+    edge_ptr: torch.Tensor       # [N + 1] CSR pointer for outgoing edges
 
 
-@torch.no_grad()
-def _u16_le(buf: torch.Tensor, byte_offset: int) -> torch.Tensor:
-    """
-    Decode little-endian uint16 from obs[:, byte_offset:byte_offset+2].
-
-    Returns:
-        long tensor [B]
-    """
-    lo = buf[:, byte_offset].to(torch.long)
-    hi = buf[:, byte_offset + 1].to(torch.long)
-    return lo | (hi << 8)
+@dataclass
+class CandidateTargets:
+    source_idx: torch.Tensor            # [B] local source vertex index per batch item
+    target_idx: torch.Tensor            # [Q] global frontier vertex index, or -1 for new candidates
+    target_batch_offsets: torch.Tensor  # [B + 1] target offsets per batch
+    target_batches: torch.Tensor        # [Q] batch index per target
+    target_positions: torch.Tensor      # [Q, 2] existing vertex or new candidate position
 
 
-@torch.no_grad()
-def _u16_le_offsets(buf: torch.Tensor, byte_offsets: torch.Tensor) -> torch.Tensor:
-    """
-    Decode little-endian uint16 from obs[:, byte_offset:byte_offset+2].
-
-    Returns:
-        long tensor [B]
-    """
-    rows = torch.arange(buf.shape[0], device=buf.device)
-    lo = buf[rows, byte_offsets].to(torch.long)
-    hi = buf[rows, byte_offsets + 1].to(torch.long)
-    return lo | (hi << 8)
-    
-
-@torch.no_grad()
-@torch.compile(fullgraph=True)
-def _extract_slices(buf: torch.Tensor, start: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-        buf: [B, M]
-        start: [B]
-        length: [B]
-
-    Returns:
-        contiguous buffer of all slices [length.sum()]
-    """
-    idx = torch.arange(buf.size(1), device=buf.device)
-    mask = (idx[None, :] >= start[:, None]) & (idx[None, :] < (start + length)[:, None])
-    return buf[mask]
+# =============================================================================
+# Triton kernels
+# =============================================================================
 
 
-@torch.no_grad()
-def deserialize_substep0_obs(obs):
-    """
-    Args:
-        obs: uint8 tensor [num_agents, obs_size]
+@triton.jit
+def _gf_init_offsets_kernel(
+    vertex_batch_offsets,   # int64*, [B + 1]
+    edge_ptr,               # int64*, [N_CAP + 1]
+):
+    tl.store(vertex_batch_offsets + 0, tl.full((), 0, tl.int64))
+    tl.store(edge_ptr + 0, tl.full((), 0, tl.int64))
 
-    Returns:
-        dict with:
-            x:                [total_nodes, 2] float32
-            edge_index:       [2, total_edges] long
-            edge_length:      [total_edges, 1] float32, edge length
-            edge_incidence:   [total_edges, 2] bool, [incident_ccw, incident_cw]
-            batch:            [total_nodes] long, graph id per node
-            ptr:              [num_agents + 1] long, node offsets per graph
-            edge_ptr:         [total_nodes + 1] long, CSR pointer for outgoing edges
-    """
 
-    # ------------------------------------------------------------------------
-    # Layout:
-    #   u16 frontier_size
-    #   u16 max_degree
-    #   frontier_size * (float x, float y)
-    #   frontier_size * max_degree * (u16 neighbor index, u8 face_incidence)
-    # ------------------------------------------------------------------------
+@triton.jit
+def _gf_decode_frontier_sizes_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    valid_batch_idx,        # int64*, [B]
+    frontier_size_out,      # int64*, [B]
+    OBS_SIZE: tl.constexpr,
+    B: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    off = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = off < B
 
-    assert obs.dtype == torch.uint8
-    device = obs.device
-    B, obs_size = obs.shape
+    physical_b = tl.load(valid_batch_idx + off, mask=mask, other=0)
+    row = physical_b * OBS_SIZE
 
-    frontier_size = _u16_le(obs, 0)      # [B]
-    max_degree = _u16_le(obs, 2)         # [B]
+    # frontier_size at byte offsets 1..2, little-endian u16
+    f_lo = tl.load(obs + row + 1, mask=mask, other=0).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2, mask=mask, other=0).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
 
-    max_F = int(frontier_size.max().item())
-    max_D = int(max_degree.max().item())
+    tl.store(frontier_size_out + off, frontier_size.to(tl.int64), mask=mask)
 
-    node_offsets = torch.zeros(B + 1, device=device, dtype=torch.long)
-    node_offsets[1:] = torch.cumsum(frontier_size, dim=0)
 
-    total_nodes = int(node_offsets[-1].item())
+@triton.jit
+def _gf_decode_vertices_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    vertices,               # float32*, [N_CAP, 2]
+    vertex_batch_offsets,   # int64*, [B + 1]
+    valid_batch_idx,        # int64*, [B]
+    OBS_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
 
-    local_nodes = torch.arange(max_F, device=device)
-    valid_nodes = local_nodes[None, :] < frontier_size[:, None]
+    i = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    byte_idx = torch.arange(max_F * 8, device=device)[None, :]
-    vertex_offsets = torch.full((B, 1), 4, device=device) + byte_idx
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
 
-    vertex_bytes = obs.gather(1, vertex_offsets)
-    vertex_xy = (
-        vertex_bytes.contiguous()
-        .view(torch.float32)
-        .view(B, max_F, 2)
+    # frontier_size at byte offsets 1..2, little-endian u16
+    f_lo = tl.load(obs + row + 1).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    valid = i < frontier_size
+
+    vertex_batch_offset = tl.load(vertex_batch_offsets + b)
+    global_i = vertex_batch_offset + i
+
+    # Vertices start at byte offset 5, each vertex is two little-endian f32s.
+    base = row + 5 + i * 8
+
+    x_u32 = (
+        tl.load(obs + base + 0, mask=valid, other=0).to(tl.uint32)
+        | (tl.load(obs + base + 1, mask=valid, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + base + 2, mask=valid, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + base + 3, mask=valid, other=0).to(tl.uint32) << 24)
     )
 
-    x = vertex_xy.reshape(B * max_F, 2)[valid_nodes.flatten()]
-
-    batch = torch.repeat_interleave(
-        torch.arange(B, device=device),
-        frontier_size,
+    y_u32 = (
+        tl.load(obs + base + 4, mask=valid, other=0).to(tl.uint32)
+        | (tl.load(obs + base + 5, mask=valid, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + base + 6, mask=valid, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + base + 7, mask=valid, other=0).to(tl.uint32) << 24)
     )
 
-    # ------------------------------------------------------------
-    # Vectorized decode of directed neighbors.
-    # ------------------------------------------------------------
-
-    node_offsets = torch.empty(B + 1, device=device, dtype=torch.long)
-    node_offsets[0] = 0
-    node_offsets[1:] = torch.cumsum(frontier_size, dim=0)
-
-    graph_grid = torch.arange(B, device=device)[:, None, None].expand(B, max_F, max_D)
-    src_grid = torch.arange(max_F, device=device)[None, :, None].expand(B, max_F, max_D)
-    slot_grid = torch.arange(max_D, device=device)[None, None, :].expand(B, max_F, max_D)
-
-    valid_slots = (
-        (src_grid < frontier_size[:, None, None])
-        & (slot_grid < max_degree[:, None, None])
+    tl.store(
+        vertices + global_i * 2 + 0,
+        x_u32.to(tl.float32, bitcast=True),
+        mask=valid,
     )
-
-    neigh_base = 4 + 8 * frontier_size
-
-    off = (
-        neigh_base[:, None, None]
-        + 3 * (src_grid * max_degree[:, None, None] + slot_grid)
-    )
-
-    lo = obs[graph_grid, off].long()
-    hi = obs[graph_grid, off + 1].long()
-    face_all = obs[graph_grid, off + 2].long()
-
-    nidx = lo | (hi << 8)
-    valid_edges = valid_slots & (nidx != UINT16_MAX)
-
-    graph_id = graph_grid[valid_edges]
-    src_local = src_grid[valid_edges]
-    dst_local = nidx[valid_edges]
-    face = face_all[valid_edges]
-
-    src = node_offsets[graph_id] + src_local
-    dst = node_offsets[graph_id] + dst_local
-
-    edge_index = torch.stack([src, dst], dim=0)
-
-    edge_length = (x[dst] - x[src]).norm(dim=-1, keepdim=True)
-
-    edge_incidence = torch.stack(
-        [
-            (face >> 1) & 1,  # incident_ccw
-            face & 1,         # incident_cw
-        ],
-        dim=-1,
-    ).bool()
-
-    out_deg = valid_edges.sum(dim=2)[valid_nodes]
-    edge_ptr = torch.empty(total_nodes + 1, device=device, dtype=torch.long)
-    edge_ptr[0] = 0
-    edge_ptr[1:] = torch.cumsum(out_deg, dim=0)
-
-    return dict(
-        x=x,
-        edge_index=edge_index,
-        edge_length=edge_length,
-        edge_incidence=edge_incidence,
-        batch=batch,
-        ptr=node_offsets,
-        edge_ptr=edge_ptr,
+    tl.store(
+        vertices + global_i * 2 + 1,
+        y_u32.to(tl.float32, bitcast=True),
+        mask=valid,
     )
 
 
-# @torch.no_grad()
-# def decode_substep0_obs_static(
-#     obs: torch.Tensor,
-#     max_F_cap: int,
-#     max_D_cap: int,
-# ) -> Dict[str, torch.Tensor]:
-#     """
-#     Shape-stable decoding helper.
-#
-#     This stage is intended for torch.compile. It returns fixed-capacity buffers
-#     and masks, but does not compact variable-length outputs.
-#
-#     Args:
-#         obs:
-#             uint8 tensor [B, obs_size]
-#         max_F_cap:
-#             static maximum frontier size to decode
-#         max_D_cap:
-#             static maximum degree to decode
-#
-#     Returns:
-#         dict with fixed-shape tensors:
-#             x_padded:        [B, max_F_cap, 2] float32
-#             node_mask:       [B, max_F_cap] bool
-#             dst_local:       [B, max_F_cap, max_D_cap] long
-#             face:            [B, max_F_cap, max_D_cap] long
-#             edge_mask:       [B, max_F_cap, max_D_cap] bool
-#             frontier_size:   [B] long
-#             max_degree:      [B] long
-#             node_offsets:    [B + 1] long
-#             out_deg_padded:  [B, max_F_cap] long
-#     """
-#
-#     assert obs.dtype == torch.uint8
-#
-#     device = obs.device
-#     B, _ = obs.shape
-#
-#     frontier_size = _u16_le(obs, 0)      # [B]
-#     max_degree = _u16_le(obs, 2)         # [B]
-#
-#     # ---------------------------------------------------------------------
-#     # Decode vertices into fixed-capacity [B, max_F_cap, 2].
-#     #
-#     # Layout:
-#     #   u16 frontier_size
-#     #   u16 max_degree
-#     #   frontier_size * (float x, float y)
-#     #
-#     # We decode max_F_cap vertices per graph. Entries beyond frontier_size are
-#     # garbage/padding and must be ignored using node_mask.
-#     # ---------------------------------------------------------------------
-#
-#     local_nodes = torch.arange(max_F_cap, device=device)
-#
-#     node_mask = local_nodes[None, :] < frontier_size[:, None]  # [B, F]
-#
-#     vertex_byte_offsets = 4 + torch.arange(
-#         max_F_cap * 8,
-#         device=device,
-#         dtype=torch.long,
-#     )  # [F * 8]
-#
-#     vertex_bytes = obs.gather(
-#         dim=1,
-#         index=vertex_byte_offsets[None, :].expand(B, max_F_cap * 8),
-#     )
-#
-#     # Reinterpret groups of 4 uint8 bytes as float32.
-#     x_padded = (
-#         vertex_bytes.contiguous()
-#         .view(torch.float32)
-#         .view(B, max_F_cap, 2)
-#     )
-#
-#     # ---------------------------------------------------------------------
-#     # Decode directed neighbor slots into fixed-capacity tensors.
-#     #
-#     # Layout after vertices:
-#     #   frontier_size * max_degree * (u16 neighbor index, u8 face_incidence)
-#     #
-#     # We decode [B, max_F_cap, max_D_cap]. Invalid slots are ignored using
-#     # edge_mask.
-#     # ---------------------------------------------------------------------
-#
-#     src_grid = torch.arange(
-#         max_F_cap,
-#         device=device,
-#         dtype=torch.long,
-#     )[None, :, None]  # [1, F, 1]
-#
-#     slot_grid = torch.arange(
-#         max_D_cap,
-#         device=device,
-#         dtype=torch.long,
-#     )[None, None, :]  # [1, 1, D]
-#
-#     src_grid = src_grid.expand(B, max_F_cap, max_D_cap)
-#     slot_grid = slot_grid.expand(B, max_F_cap, max_D_cap)
-#
-#     valid_slots = (
-#         (src_grid < frontier_size[:, None, None])
-#         & (slot_grid < max_degree[:, None, None])
-#     )
-#
-#     neigh_base = 4 + 8 * frontier_size  # [B]
-#
-#     # Per-row byte offsets for each neighbor slot.
-#     off = (
-#         neigh_base[:, None, None]
-#         + 3 * (src_grid * max_degree[:, None, None] + slot_grid)
-#     )  # [B, F, D]
-#
-#     off_flat = off.reshape(B, max_F_cap * max_D_cap)
-#
-#     lo = obs.gather(1, off_flat).reshape(B, max_F_cap, max_D_cap).to(torch.long)
-#     hi = obs.gather(1, off_flat + 1).reshape(B, max_F_cap, max_D_cap).to(torch.long)
-#     face = obs.gather(1, off_flat + 2).reshape(B, max_F_cap, max_D_cap).to(torch.long)
-#
-#     dst_local = lo | (hi << 8)
-#
-#     # Include dst_local < frontier_size as a defensive validity check.
-#     # If your serialized data guarantees this, it should not change semantics.
-#     edge_mask = (
-#         valid_slots
-#         & (dst_local != UINT16_MAX)
-#         & (dst_local < frontier_size[:, None, None])
-#     )
-#
-#     node_offsets = torch.empty(B + 1, device=device, dtype=torch.long)
-#     node_offsets[0] = 0
-#     node_offsets[1:] = torch.cumsum(frontier_size, dim=0)
-#
-#     out_deg_padded = edge_mask.sum(dim=2).to(torch.long)  # [B, F]
-#
-#     return {
-#         "x_padded": x_padded,
-#         "node_mask": node_mask,
-#         "dst_local": dst_local,
-#         "face": face,
-#         "edge_mask": edge_mask,
-#         "frontier_size": frontier_size,
-#         "max_degree": max_degree,
-#         "node_offsets": node_offsets,
-#         "out_deg_padded": out_deg_padded,
-#     }
-#
-#
-# @torch.no_grad()
-# def compact_decoded_substep0_obs(
-#     decoded: Dict[str, torch.Tensor],
-# ) -> Dict[str, torch.Tensor]:
-#     """
-#     Late compaction stage.
-#
-#     This takes the fixed-capacity decoded representation and produces the same
-#     compact outputs as your original function.
-#
-#     This stage is intentionally allowed to be dynamic.
-#     """
-#
-#     x_padded = decoded["x_padded"]                  # [B, F, 2]
-#     node_mask = decoded["node_mask"]                # [B, F]
-#     dst_local_padded = decoded["dst_local"]         # [B, F, D]
-#     face_padded = decoded["face"]                   # [B, F, D]
-#     edge_mask = decoded["edge_mask"]                # [B, F, D]
-#     frontier_size = decoded["frontier_size"]        # [B]
-#     node_offsets = decoded["node_offsets"]          # [B + 1]
-#     out_deg_padded = decoded["out_deg_padded"]      # [B, F]
-#
-#     device = x_padded.device
-#     B, F, _ = x_padded.shape
-#     D = dst_local_padded.shape[2]
-#
-#     # ---------------------------------------------------------------------
-#     # Compact nodes.
-#     # ---------------------------------------------------------------------
-#
-#     x = x_padded.reshape(B * F, 2)[node_mask.flatten()]
-#
-#     batch = torch.repeat_interleave(
-#         torch.arange(B, device=device, dtype=torch.long),
-#         frontier_size,
-#     )
-#
-#     # ---------------------------------------------------------------------
-#     # Compact edges.
-#     # ---------------------------------------------------------------------
-#
-#     graph_grid = torch.arange(
-#         B,
-#         device=device,
-#         dtype=torch.long,
-#     )[:, None, None].expand(B, F, D)
-#
-#     src_grid = torch.arange(
-#         F,
-#         device=device,
-#         dtype=torch.long,
-#     )[None, :, None].expand(B, F, D)
-#
-#     graph_id = graph_grid[edge_mask]
-#     src_local = src_grid[edge_mask]
-#     dst_local = dst_local_padded[edge_mask]
-#     face = face_padded[edge_mask]
-#
-#     src = node_offsets[graph_id] + src_local
-#     dst = node_offsets[graph_id] + dst_local
-#
-#     edge_index = torch.stack([src, dst], dim=0)
-#
-#     edge_length = (x[dst] - x[src]).norm(dim=-1, keepdim=True)
-#
-#     edge_incidence = torch.stack(
-#         [
-#             ((face >> 1) & 1),
-#             (face & 1),
-#         ],
-#         dim=-1,
-#     ).bool()
-#
-#     # ---------------------------------------------------------------------
-#     # CSR pointer over compact nodes.
-#     # ---------------------------------------------------------------------
-#
-#     out_deg = out_deg_padded[node_mask]
-#
-#     total_nodes = x.shape[0]
-#
-#     edge_ptr = torch.empty(total_nodes + 1, device=device, dtype=torch.long)
-#     edge_ptr[0] = 0
-#     edge_ptr[1:] = torch.cumsum(out_deg, dim=0)
-#
-#     return {
-#         "x": x,
-#         "edge_index": edge_index,
-#         "edge_length": edge_length,
-#         "edge_incidence": edge_incidence,
-#         "batch": batch,
-#         "ptr": node_offsets,
-#         "edge_ptr": edge_ptr,
-#     }
-#
-#
-# def make_compiled_substep0_decoder(
-#     max_F_cap: int,
-#     max_D_cap: int,
-#     *,
-#     fullgraph: bool = False,
-# ):
-#     """
-#     Build a compiled decoder specialized to fixed capacities.
-#
-#     Use fullgraph=False first. After it works, try fullgraph=True to force
-#     PyTorch to tell you whether anything still causes a graph break.
-#     """
-#
-#     @torch.no_grad()
-#     def _decode(obs: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         return decode_substep0_obs_static(
-#             obs,
-#             max_F_cap=max_F_cap,
-#             max_D_cap=max_D_cap,
-#         )
-#
-#     return torch.compile(
-#         _decode,
-#         mode="reduce-overhead",
-#         fullgraph=fullgraph,
-#     )
-#
-#
-# @torch.no_grad()
-# def deserialize_substep0_obs_hybrid(
-#     obs: torch.Tensor,
-#     compiled_decode,
-# ) -> Dict[str, torch.Tensor]:
-#     """
-#     Drop-in-ish replacement for the original deserialize_substep0_obs.
-#
-#     The decode stage is compiled and shape-stable.
-#     The compaction stage is dynamic and runs once at the end.
-#     """
-#
-#     decoded = compiled_decode(obs)
-#     return compact_decoded_substep0_obs(decoded)
+@triton.jit
+def _gf_count_neighbors_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    neighbor_count,         # int64*, [N_CAP]
+    vertex_batch_offsets,   # int64*, [B + 1]
+    valid_batch_idx,        # int64*, [B]
+    OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    F_CAP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
+
+    i = block_i * BLOCK_N + tl.arange(0, BLOCK_N)[:, None]
+    d = tl.arange(0, BLOCK_D)[None, :]
+
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+
+    f_lo = tl.load(obs + row + 1).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    valid_vertex = i < frontier_size
+    valid_i_cap = i < F_CAP
+    valid_d = d < D
+
+    vertex_batch_offset = tl.load(vertex_batch_offsets + b)
+    global_i = vertex_batch_offset + i
+
+    neighbor_base = row + 5 + frontier_size * 8
+    nb = neighbor_base + (i * D + d) * 2
+
+    mask = valid_i_cap & valid_vertex & valid_d
+
+    lo = tl.load(obs + nb + 0, mask=mask, other=255).to(tl.uint32)
+    hi = tl.load(obs + nb + 1, mask=mask, other=255).to(tl.uint32)
+
+    local_neighbor = lo | (hi << 8)
+    valid_edge = mask & (local_neighbor != 65535)
+
+    count = tl.sum(valid_edge.to(tl.int64), axis=1)
+
+    ii = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_store = ii < frontier_size
+
+    global_ii = tl.load(vertex_batch_offsets + b) + ii
+
+    tl.store(
+        neighbor_count + global_ii,
+        count,
+        mask=valid_store,
+    )
 
 
-@torch.no_grad()
-def deserialize_substep1_obs(obs):
-    """
-    Deserialize the validity mask and new vertex candidates for substep 1 observations.
+@triton.jit
+def _gf_write_sizes_kernel(
+    vertex_batch_offsets,   # int64*, [B + 1]
+    edge_ptr,               # int64*, [N_CAP + 1]
+    sizes_dev,              # int64*, [2], sizes_dev[0] = N, sizes_dev[1] = E
+    B: tl.constexpr,
+):
+    n = tl.load(vertex_batch_offsets + B)
+    e = tl.load(edge_ptr + n)
 
-    Args:
-        obs: uint8 tensor [num_agents, obs_size]
+    tl.store(sizes_dev + 0, n)
+    tl.store(sizes_dev + 1, e)
 
-    Returns:
-        dict with:
-            source_idx:    [num_agents] int64, source vertex index in frontier
-            validity:      [total_nodes] bool
-            candidates:    [total_candidates, 2] float32
-            counts:        [num_agents] long, candidate count per agent
-    """
 
-    assert obs.dtype == torch.uint8
-    device = obs.device
-    B, obs_size = obs.shape
+@triton.jit
+def _gf_scatter_edges_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    edges_flat,             # int64*, capacity [2 * E_CAP]
+    edge_features_flat,     # bool*, capacity [2 * E_CAP]
+    edge_ptr,               # int64*, [N_CAP + 1]
+    vertex_batch_offsets,   # int64*, [B + 1]
+    sizes_dev,              # int64*, [2], sizes_dev[1] = E actual
+    valid_batch_idx,        # int64*, [B]
+    OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    F_CAP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
 
-    frontier_size = _u16_le(obs, 0)
-    max_degree = _u16_le(obs, 2)
+    ii = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
+    dd = tl.arange(0, BLOCK_D)
 
-    max_F = int(frontier_size.max().item())
+    # Shape [BLOCK_N, 1]
+    i = ii[:, None]
 
-    neighbor_start = 4 + 8 * frontier_size
-    source_idx_pos = neighbor_start + frontier_size * max_degree * 3
+    # Shape [1, BLOCK_D]
+    d = dd[None, :]
+
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+
+    f_lo = tl.load(obs + row + 1).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    valid_i_cap = i < F_CAP
+    valid_vertex = i < frontier_size
+    valid_d = d < D
+
+    vertex_batch_offset = tl.load(vertex_batch_offsets + b)
+
+    # Shape [BLOCK_N]
+    global_src_vec = vertex_batch_offset + ii
+
+    neighbor_base = row + 5 + frontier_size * 8
+    face_base = neighbor_base + frontier_size * D * 2
+
+    nb = neighbor_base + (i * D + d) * 2
+
+    mask = valid_i_cap & valid_vertex & valid_d
+
+    lo = tl.load(obs + nb + 0, mask=mask, other=255).to(tl.uint32)
+    hi = tl.load(obs + nb + 1, mask=mask, other=255).to(tl.uint32)
+
+    local_neighbor = lo | (hi << 8)
+    valid_edge = mask & (local_neighbor != 65535)
+
+    face = tl.load(
+        obs + face_base + i * D + d,
+        mask=mask,
+        other=0,
+    ).to(tl.uint32)
+
+    # Per-row rank within each vertex's neighbor list.
+    # Layout is [BLOCK_N, BLOCK_D], so the D dimension is axis=1.
+    rank = tl.cumsum(valid_edge.to(tl.int64), axis=1) - 1
+
+    # Shape [BLOCK_N, 1]
+    global_src = global_src_vec[:, None]
+
+    # edge_ptr is indexed by compact global vertex id.
+    out_base = tl.load(edge_ptr + global_src_vec, mask=ii < frontier_size, other=0)
+    out = out_base[:, None] + rank
+
+    global_dst = vertex_batch_offset + local_neighbor.to(tl.int64)
+
+    E_actual = tl.load(sizes_dev + 1)
+
+    incident_ccw = ((face >> 1) & 1) != 0
+    incident_cw = (face & 1) != 0
+
+    tl.store(edges_flat + out, global_src, mask=valid_edge)
+    tl.store(edges_flat + E_actual + out, global_dst, mask=valid_edge)
+
+    tl.store(edge_features_flat + out * 2 + 0, incident_ccw, mask=valid_edge)
+    tl.store(edge_features_flat + out * 2 + 1, incident_cw, mask=valid_edge)
+
+
+@triton.jit
+def _cand_init_offsets_kernel(
+    target_batch_offsets,  # int64*, [B + 1]
+):
+    tl.store(target_batch_offsets + 0, tl.full((), 0, tl.int64))
+
+
+@triton.jit
+def _cand_decode_counts_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    valid_batch_idx,        # int64*, [B]
+    vertex_batch_offsets,   # int64*, [B + 1]
+    source_idx,             # int64*, [B]
+    candidate_count,        # int64*, [B]
+    valid_node_count,       # int64*, [B]
+    target_count,           # int64*, [B]
+    node_validity,          # bool*, [N_CAP]
+    OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    F_CAP: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    b = tl.program_id(0)
+    i = tl.arange(0, BLOCK_F)
+
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+
+    f_lo = tl.load(obs + row + 1).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    neighbor_start = row + 5 + frontier_size * 8
+    source_idx_pos = neighbor_start + frontier_size * D * 3
     validity_start = source_idx_pos + 2
-    source_idx = _u16_le_offsets(obs, source_idx_pos)
-
-    f_idx = torch.arange(max_F, device=device)[None, :]
-    valid_nodes = f_idx < frontier_size[:, None]
-
-    validity_offsets = validity_start[:, None] + f_idx
-    validity_bytes = obs.gather(1, validity_offsets.clamp_max(obs_size - 1))
-    validity_mask = validity_bytes.bool()[valid_nodes]
-
     candidates_start = validity_start + frontier_size
 
-    valid_count = _u16_le_offsets(obs, candidates_start)
-    max_V = int(valid_count.max().item())
+    src_lo = tl.load(obs + source_idx_pos + 0).to(tl.uint32)
+    src_hi = tl.load(obs + source_idx_pos + 1).to(tl.uint32)
+    src = src_lo | (src_hi << 8)
 
-    if max_V > 0:
-        byte_idx = torch.arange(max_V * 8, device=device)[None, :]
-        candidate_offsets = candidates_start[:, None] + 2 + byte_idx
+    cand_lo = tl.load(obs + candidates_start + 0).to(tl.uint32)
+    cand_hi = tl.load(obs + candidates_start + 1).to(tl.uint32)
+    cand_count = cand_lo | (cand_hi << 8)
 
-        candidate_bytes = obs.gather(1, candidate_offsets)
-        candidates = (
-            candidate_bytes.contiguous()
-            .view(torch.float32)
-            .view(B, max_V, 2)
+    valid_i = i < frontier_size
+    validity = tl.load(obs + validity_start + i, mask=valid_i, other=0) != 0
+    valid_count = tl.sum(validity.to(tl.int64), axis=0)
+
+    vertex_batch_offset = tl.load(vertex_batch_offsets + b)
+    tl.store(node_validity + vertex_batch_offset + i, validity, mask=i < frontier_size)
+
+    tl.store(source_idx + b, src.to(tl.int64))
+    tl.store(candidate_count + b, cand_count.to(tl.int64))
+    tl.store(valid_node_count + b, valid_count)
+    tl.store(target_count + b, valid_count + cand_count.to(tl.int64))
+
+
+@triton.jit
+def _cand_write_target_size_kernel(
+    target_batch_offsets,   # int64*, [B + 1]
+    sizes_dev,              # int64*, [3], sizes_dev[2] = Q
+    B: tl.constexpr,
+):
+    q = tl.load(target_batch_offsets + B)
+    tl.store(sizes_dev + 2, q)
+
+
+@triton.jit
+def _cand_scatter_existing_targets_kernel(
+    vertices,               # float32*, [N_CAP, 2]
+    vertex_batch_offsets,   # int64*, [B + 1]
+    target_batch_offsets,   # int64*, [B + 1]
+    valid_node_count,       # int64*, [B]
+    node_validity,          # bool*, [N_CAP]
+    target_idx,             # int64*, [Q_CAP]
+    target_batches,         # int64*, [Q_CAP]
+    target_positions,       # float32*, [Q_CAP, 2]
+    F_CAP: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    b = tl.program_id(0)
+    i = tl.arange(0, BLOCK_F)
+
+    vertex_begin = tl.load(vertex_batch_offsets + b)
+    vertex_end = tl.load(vertex_batch_offsets + b + 1)
+    frontier_size = vertex_end - vertex_begin
+
+    valid_i = i < frontier_size
+    global_i = vertex_begin + i
+    validity = tl.load(node_validity + global_i, mask=valid_i, other=0)
+    rank = tl.cumsum(validity.to(tl.int64), axis=0) - 1
+
+    target_begin = tl.load(target_batch_offsets + b)
+    out = target_begin + rank
+    mask = valid_i & validity
+
+    x = tl.load(vertices + global_i * 2 + 0, mask=mask, other=0.0)
+    y = tl.load(vertices + global_i * 2 + 1, mask=mask, other=0.0)
+
+    tl.store(target_idx + out, global_i, mask=mask)
+    tl.store(target_batches + out, b, mask=mask)
+    tl.store(target_positions + out * 2 + 0, x, mask=mask)
+    tl.store(target_positions + out * 2 + 1, y, mask=mask)
+
+
+@triton.jit
+def _cand_scatter_new_targets_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    valid_batch_idx,        # int64*, [B]
+    target_batch_offsets,   # int64*, [B + 1]
+    valid_node_count,       # int64*, [B]
+    candidate_count,        # int64*, [B]
+    target_idx,             # int64*, [Q_CAP]
+    target_batches,         # int64*, [Q_CAP]
+    target_positions,       # float32*, [Q_CAP, 2]
+    OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    C_CAP: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_j = tl.program_id(1)
+    j = block_j * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+
+    f_lo = tl.load(obs + row + 1).to(tl.uint32)
+    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    neighbor_start = row + 5 + frontier_size * 8
+    source_idx_pos = neighbor_start + frontier_size * D * 3
+    validity_start = source_idx_pos + 2
+    candidates_start = validity_start + frontier_size
+
+    cand_count = tl.load(candidate_count + b)
+    valid = (j < cand_count) & (j < C_CAP)
+
+    base = candidates_start + 2 + j * 8
+    x_u32 = (
+        tl.load(obs + base + 0, mask=valid, other=0).to(tl.uint32)
+        | (tl.load(obs + base + 1, mask=valid, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + base + 2, mask=valid, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + base + 3, mask=valid, other=0).to(tl.uint32) << 24)
+    )
+    y_u32 = (
+        tl.load(obs + base + 4, mask=valid, other=0).to(tl.uint32)
+        | (tl.load(obs + base + 5, mask=valid, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + base + 6, mask=valid, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + base + 7, mask=valid, other=0).to(tl.uint32) << 24)
+    )
+
+    out = tl.load(target_batch_offsets + b) + tl.load(valid_node_count + b) + j
+
+    tl.store(target_idx + out, tl.full((BLOCK_C,), -1, tl.int64), mask=valid)
+    tl.store(target_batches + out, b, mask=valid)
+    tl.store(target_positions + out * 2 + 0, x_u32.to(tl.float32, bitcast=True), mask=valid)
+    tl.store(target_positions + out * 2 + 1, y_u32.to(tl.float32, bitcast=True), mask=valid)
+
+
+# =============================================================================
+# CUDA-graph-backed deserializer
+# =============================================================================
+
+
+def _pow2_at_least_1(x: int) -> int:
+    x = max(int(x), 1)
+    return 1 << (x - 1).bit_length()
+
+
+def _assert_same_cuda_buffer(name, x, static):
+    if x.data_ptr() != static.data_ptr():
+        raise RuntimeError(
+            f"{name} data_ptr changed under copy_obs=False. "
+            f"capture ptr={static.data_ptr()}, call ptr={x.data_ptr()}. "
+            f"Use a persistent CUDA tensor and update it in-place, or set copy_obs=True."
+        )
+    if x.shape != static.shape:
+        raise RuntimeError(f"{name} shape changed: {x.shape} vs {static.shape}")
+    if x.dtype != static.dtype:
+        raise RuntimeError(f"{name} dtype changed: {x.dtype} vs {static.dtype}")
+    if x.device != static.device:
+        raise RuntimeError(f"{name} device changed: {x.device} vs {static.device}")
+
+
+class CUDAGraphObservationDeserializer:
+    """
+    CUDA-graph-backed observation deserializer.
+
+    Assumes:
+      - obs shape is fixed.
+      - valid_batch_idx length is fixed.
+      - D is fixed.
+      - F_CAP is an upper bound for frontier_size.
+      - C_CAP is an upper bound for new candidate count when candidates are decoded.
+      - Output buffers are reused across calls.
+
+    exact_output=True:
+      Returns exact compact CSR views, but pays one final synchronization
+      to read [N, E] to CPU for Python slicing.
+
+    exact_output=False:
+      Avoids the final sync, but returns capacity-sized buffers. This is the
+      fastest path only if downstream code can consume capacity buffers plus
+      device-side sizes.
+    """
+
+    def __init__(
+        self,
+        obs_example: torch.Tensor,
+        valid_batch_idx_example: torch.Tensor,
+        D: int,
+        F_CAP: int,
+        C_CAP: int = 0,
+        decode_candidates: bool = False,
+        exact_output: bool = True,
+        copy_obs: bool = True,
+        use_cuda_graph: bool = True,
+        warmup_iters: int = 3,
+    ):
+        assert obs_example.dtype == torch.uint8
+        assert obs_example.is_cuda
+        assert valid_batch_idx_example.dtype == torch.long
+        assert valid_batch_idx_example.is_cuda
+
+        self.device = obs_example.device
+        self.B_full, self.obs_size = obs_example.shape
+        self.B = int(valid_batch_idx_example.numel())
+
+        self.D = D
+        self.F_CAP = F_CAP
+        self.C_CAP = int(C_CAP)
+        self.decode_candidates = bool(decode_candidates)
+
+        self.BLOCK_B = 128
+        self.BLOCK_D = _pow2_at_least_1(self.D)
+        self.BLOCK_F = _pow2_at_least_1(self.F_CAP)
+        self.BLOCK_C = 128
+        self.num_warps_d = 1 if self.BLOCK_D <= 64 else 4
+
+        self.N_CAP = max(self.B * self.F_CAP, 1)
+        self.E_CAP = max(self.N_CAP * self.D, 1)
+        self.Q_CAP = max(self.B * (self.F_CAP + self.C_CAP), 1)
+
+        self.exact_output = bool(exact_output)
+        self.copy_obs = bool(copy_obs)
+        self.use_cuda_graph = bool(use_cuda_graph)
+
+        with torch.cuda.device(self.device):
+            if self.copy_obs:
+                self.obs_static = torch.empty_like(obs_example)
+                self.valid_batch_idx_static = torch.empty_like(valid_batch_idx_example)
+            else:
+                # Fastest mode, but caller must reuse the same tensor storage.
+                self.obs_static = obs_example
+                self.valid_batch_idx_static = valid_batch_idx_example
+
+            self.frontier_size = torch.empty(
+                (self.B,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            self.vertex_batch_offsets = torch.empty(
+                (self.B + 1,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            self.vertices = torch.empty(
+                (self.N_CAP, 2),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+            self.neighbor_count = torch.empty(
+                (self.N_CAP,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            self.edge_ptr = torch.empty(
+                (self.N_CAP + 1,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            # Flat capacity buffers so exact compact views can be contiguous:
+            #   edges_flat[:2 * E].view(2, E)
+            #   edge_features_flat[:2 * E].view(E, 2)
+            self.edges_flat = torch.empty(
+                (2 * self.E_CAP,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            self.edge_features_flat = torch.empty(
+                (2 * self.E_CAP,),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+            self.sizes_dev = torch.empty(
+                (3,),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            # Pinned host staging for exact Python views.
+            self.sizes_host = torch.empty(
+                (3,),
+                dtype=torch.long,
+                pin_memory=True,
+            )
+
+            if self.decode_candidates:
+                self.source_idx = torch.empty(
+                    (self.B,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.candidate_count = torch.empty(
+                    (self.B,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.valid_node_count = torch.empty(
+                    (self.B,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.target_count = torch.empty(
+                    (self.B,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.node_validity = torch.empty(
+                    (self.N_CAP,),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.target_batch_offsets = torch.empty(
+                    (self.B + 1,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.target_idx = torch.empty(
+                    (self.Q_CAP,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.target_batches = torch.empty(
+                    (self.Q_CAP,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                self.target_positions = torch.empty(
+                    (self.Q_CAP, 2),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.target_batch_offsets_tail = self.target_batch_offsets[1:]
+            else:
+                self.source_idx = None
+                self.candidate_count = None
+                self.valid_node_count = None
+                self.target_count = None
+                self.node_validity = None
+                self.target_batch_offsets = None
+                self.target_idx = None
+                self.target_batches = None
+                self.target_positions = None
+                self.target_batch_offsets_tail = None
+
+            self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
+            self.edge_ptr_tail = self.edge_ptr[1:]
+
+            if self.copy_obs:
+                self.obs_static.copy_(obs_example, non_blocking=True)
+                self.valid_batch_idx_static.copy_(valid_batch_idx_example, non_blocking=True)
+
+            if self.use_cuda_graph:
+                self.graph = torch.cuda.CUDAGraph()
+
+                # Warm up on a side stream, as recommended for PyTorch CUDA Graphs.
+                # This also forces Triton compilation before capture.
+                cur_stream = torch.cuda.current_stream(self.device)
+                warmup_stream = torch.cuda.Stream(device=self.device)
+                warmup_stream.wait_stream(cur_stream)
+
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(int(warmup_iters)):
+                        self._run_static_pipeline()
+
+                cur_stream.wait_stream(warmup_stream)
+                cur_stream.synchronize()
+
+                with torch.cuda.graph(self.graph):
+                    self._run_static_pipeline()
+            else:
+                self.graph = None
+
+    def _run_static_pipeline(self):
+        _gf_init_offsets_kernel[(1,)](
+            self.vertex_batch_offsets,
+            self.edge_ptr,
+            num_warps=1,
         )
 
-        valid_cands = torch.arange(max_V, device=device)[None, :] < valid_count[:, None]
-        candidates_flat = candidates[valid_cands]
-    else:
-        candidates_flat = torch.empty(0, 2, dtype=torch.float32, device=device)
+        _gf_decode_frontier_sizes_kernel[
+            (triton.cdiv(self.B, self.BLOCK_B),)
+        ](
+            self.obs_static,
+            self.valid_batch_idx_static,
+            self.frontier_size,
+            OBS_SIZE=self.obs_size,
+            B=self.B,
+            BLOCK_B=self.BLOCK_B,
+            num_warps=4,
+        )
 
-    return dict(
-        source_idx=source_idx,
-        validity=validity_mask,
-        candidates=candidates_flat,
-        counts=valid_count,
+        # vertex_batch_offsets[0] was set to 0 above.
+        torch.cumsum(
+            self.frontier_size,
+            dim=0,
+            out=self.vertex_batch_offsets_tail,
+        )
+
+        # Needed for correctness when scanning capacity buffers.
+        # Without this, invalid/padded entries may contain stale counts.
+        self.neighbor_count.zero_()
+
+        BLOCK_N = 128
+
+        _gf_decode_vertices_kernel[
+            (self.B, triton.cdiv(self.F_CAP, BLOCK_N))
+        ](
+            self.obs_static,
+            self.vertices,
+            self.vertex_batch_offsets,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+        )
+
+        # Try 8, 16, 32. For D=24, I would start with 16.
+        BLOCK_COUNT_N = 16
+
+        _gf_count_neighbors_kernel[
+            (self.B, triton.cdiv(self.F_CAP, BLOCK_COUNT_N))
+        ](
+            self.obs_static,
+            self.neighbor_count,
+            self.vertex_batch_offsets,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            D=self.D,
+            F_CAP=self.F_CAP,
+            BLOCK_N=BLOCK_COUNT_N,
+            BLOCK_D=self.BLOCK_D,
+            num_warps=1,
+        )
+
+        # edge_ptr[0] was set to 0 above.
+        # We scan the full capacity to keep the captured shape static.
+        torch.cumsum(
+            self.neighbor_count,
+            dim=0,
+            out=self.edge_ptr_tail,
+        )
+
+        _gf_write_sizes_kernel[(1,)](
+            self.vertex_batch_offsets,
+            self.edge_ptr,
+            self.sizes_dev,
+            B=self.B,
+            num_warps=1,
+        )
+
+        BLOCK_SCATTER_N = BLOCK_COUNT_N
+
+        # Always launch scatter. If E == 0, masks suppress all stores.
+        _gf_scatter_edges_kernel[
+            (self.B, triton.cdiv(self.F_CAP, BLOCK_SCATTER_N))
+        ](
+            self.obs_static,
+            self.edges_flat,
+            self.edge_features_flat,
+            self.edge_ptr,
+            self.vertex_batch_offsets,
+            self.sizes_dev,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            D=self.D,
+            F_CAP=self.F_CAP,
+            BLOCK_N=BLOCK_SCATTER_N,
+            BLOCK_D=self.BLOCK_D,
+            num_warps=1,
+        )
+
+        if self.decode_candidates:
+            _cand_init_offsets_kernel[(1,)](
+                self.target_batch_offsets,
+                num_warps=1,
+            )
+
+            _cand_decode_counts_kernel[(self.B,)](
+                self.obs_static,
+                self.valid_batch_idx_static,
+                self.vertex_batch_offsets,
+                self.source_idx,
+                self.candidate_count,
+                self.valid_node_count,
+                self.target_count,
+                self.node_validity,
+                OBS_SIZE=self.obs_size,
+                D=self.D,
+                F_CAP=self.F_CAP,
+                BLOCK_F=self.BLOCK_F,
+                num_warps=4,
+            )
+
+            torch.cumsum(
+                self.target_count,
+                dim=0,
+                out=self.target_batch_offsets_tail,
+            )
+
+            _cand_write_target_size_kernel[(1,)](
+                self.target_batch_offsets,
+                self.sizes_dev,
+                B=self.B,
+                num_warps=1,
+            )
+
+            _cand_scatter_existing_targets_kernel[(self.B,)](
+                self.vertices,
+                self.vertex_batch_offsets,
+                self.target_batch_offsets,
+                self.valid_node_count,
+                self.node_validity,
+                self.target_idx,
+                self.target_batches,
+                self.target_positions,
+                F_CAP=self.F_CAP,
+                BLOCK_F=self.BLOCK_F,
+                num_warps=4,
+            )
+
+            _cand_scatter_new_targets_kernel[
+                (self.B, triton.cdiv(max(self.C_CAP, 1), self.BLOCK_C))
+            ](
+                self.obs_static,
+                self.valid_batch_idx_static,
+                self.target_batch_offsets,
+                self.valid_node_count,
+                self.candidate_count,
+                self.target_idx,
+                self.target_batches,
+                self.target_positions,
+                OBS_SIZE=self.obs_size,
+                D=self.D,
+                C_CAP=max(self.C_CAP, 1),
+                BLOCK_C=self.BLOCK_C,
+                num_warps=4,
+            )
+
+    def _candidate_targets(self, Q: int | None = None) -> CandidateTargets:
+        if Q is None:
+            return CandidateTargets(
+                source_idx=self.source_idx,
+                target_idx=self.target_idx,
+                target_batch_offsets=self.target_batch_offsets,
+                target_batches=self.target_batches,
+                target_positions=self.target_positions,
+            )
+
+        return CandidateTargets(
+            source_idx=self.source_idx,
+            target_idx=self.target_idx[:Q],
+            target_batch_offsets=self.target_batch_offsets,
+            target_batches=self.target_batches[:Q],
+            target_positions=self.target_positions[:Q],
+        )
+
+    @torch.no_grad()
+    def __call__(self, obs: torch.Tensor, valid_batch_idx: torch.Tensor):
+        assert obs.dtype == torch.uint8
+        assert obs.is_cuda
+        assert valid_batch_idx.dtype == torch.long
+        assert valid_batch_idx.is_cuda
+        assert obs.shape == (self.B_full, self.obs_size)
+        assert valid_batch_idx.numel() == self.B
+
+        self.valid_batch_idx_static.copy_(valid_batch_idx, non_blocking=True)
+
+        if self.copy_obs:
+            self.obs_static.copy_(obs, non_blocking=True)
+        else:
+            # Fastest mode: no input staging copy.
+            # Requires the same underlying storage as the tensors used at capture.
+            _assert_same_cuda_buffer("obs", obs, self.obs_static)
+
+        if self.use_cuda_graph:
+            self.graph.replay()
+        else:
+            self._run_static_pipeline()
+
+        if not self.exact_output:
+            # Fastest return path. No CPU sync.
+            # Downstream must know that these are capacity-backed.
+            graph = CSRGraph(
+                vertices=self.vertices,
+                batch_offsets=self.vertex_batch_offsets,
+                edges=self.edges_flat.view(2, self.E_CAP),
+                edge_features=self.edge_features_flat.view(self.E_CAP, 2),
+                edge_ptr=self.edge_ptr,
+            )
+            if self.decode_candidates:
+                return graph, self._candidate_targets()
+            return graph
+
+        # Exact drop-in mode:
+        # Copy [N, E] to pinned host memory once, then synchronize once.
+        self.sizes_host.copy_(self.sizes_dev, non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+
+        N = int(self.sizes_host[0].item())
+        E = int(self.sizes_host[1].item())
+        Q = int(self.sizes_host[2].item()) if self.decode_candidates else 0
+
+        graph = CSRGraph(
+            vertices=self.vertices[:N],
+            batch_offsets=self.vertex_batch_offsets,
+            edges=self.edges_flat[: 2 * E].view(2, E),
+            edge_features=self.edge_features_flat[: 2 * E].view(E, 2),
+            edge_ptr=self.edge_ptr[: N + 1],
+        )
+
+        if self.decode_candidates:
+            return graph, self._candidate_targets(Q)
+        return graph
+
+
+_DESERIALIZE_OBSERVATION_CACHE = {}
+
+
+@torch.no_grad()
+def deserialize_observation(
+    obs: torch.Tensor,
+    valid_batch_idx: torch.Tensor,
+    D: int,
+    F_CAP: int,
+    C_CAP: int = 0,
+    deserialize_candidates: bool = False,
+    exact_output: bool = True,
+    copy_obs: bool = True,
+    use_cuda_graph: bool = True,
+) -> CSRGraph | tuple[CSRGraph, CandidateTargets]:
+    """
+    Deserializes frontier graph data, optionally with packed candidate targets.
+
+    Args:
+        obs: uint8 CUDA tensor [B, obs_size]
+        valid_batch_idx: long CUDA tensor [B]
+
+    Returns:
+        CSRGraph, or (CSRGraph, CandidateTargets) when deserialize_candidates=True.
+
+    Important:
+      - Returned tensors alias internal reusable buffers and are overwritten
+        on the next call. Use double buffering if consumers overlap calls.
+    """
+
+    assert obs.dtype == torch.uint8
+    assert obs.is_cuda
+    assert valid_batch_idx.dtype == torch.long
+    assert valid_batch_idx.is_cuda
+
+    key = (
+        obs.device.type,
+        obs.device.index,
+        tuple(obs.shape),
+        int(valid_batch_idx.numel()),
+        int(D),
+        int(F_CAP),
+        int(C_CAP),
+        bool(deserialize_candidates),
+        bool(exact_output),
+        bool(copy_obs),
+        bool(use_cuda_graph),
     )
+
+    deser = _DESERIALIZE_OBSERVATION_CACHE.get(key)
+    if deser is None:
+        deser = CUDAGraphObservationDeserializer(
+            obs,
+            valid_batch_idx,
+            D=D,
+            F_CAP=F_CAP,
+            C_CAP=C_CAP,
+            decode_candidates=deserialize_candidates,
+            exact_output=exact_output,
+            copy_obs=copy_obs,
+            use_cuda_graph=use_cuda_graph,
+        )
+        _DESERIALIZE_OBSERVATION_CACHE[key] = deser
+
+    return deser(obs, valid_batch_idx)
 
 
 # ============================================================================
@@ -1189,382 +1631,444 @@ class FourierEncoder2D(nn.Module):
         return feat
 
 
-@torch.no_grad()
-def _compute_interior_angles(
-    x,
-    edge_index,
-    edge_ptr,
-    edge_ccw,
-    eps=1e-8,
+@triton.jit
+def _ring_source_features_kernel(
+    vertices,       # float32*, [N, 2]
+    edges,          # int64*, [2, E]
+    edge_features,  # bool*, [E, 2]
+    edge_ptr,       # int64*, [N + 1]
+    out,            # float32*, [N, 2 + 2 * K * 3]
+    N,
+    E,
+    K: tl.constexpr,
+    OUT_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EPS: tl.constexpr,
 ):
-    """
-    Orientation-aware interior angle computation for CCW boundary topology.
+    offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < N
 
-    Args:
-        x: [N, 2] vertex coordinates
-        edge_index: [2, E] directed edges
-        edge_ptr: [N + 1] CSR pointer for outgoing edges
-        edge_ccw: [E] bool, True iff directed edge follows CCW boundary order
+    vx = tl.load(vertices + offs * 2 + 0, mask=mask, other=0.0)
+    vy = tl.load(vertices + offs * 2 + 1, mask=mask, other=0.0)
 
-    Returns:
-        cos_sin: [N, 2], where cos_sin[v] = (cos(theta_v), sin(theta_v))
-                 for the CCW-boundary interior angle at vertex v.
-    """
-    N = x.shape[0]
-    cos_sin = x.new_zeros((N, 2))
+    e0 = tl.load(edge_ptr + offs, mask=mask, other=0)
+    e1 = e0 + 1
+    e0_ccw = tl.load(edge_features + e0 * 2 + 1, mask=mask, other=0)
 
-    if N == 0 or edge_index.numel() == 0:
-        return cos_sin
+    ccw_edge = tl.where(e0_ccw, e0, e1)
+    cw_edge = tl.where(e0_ccw, e1, e0)
 
-    deg = edge_ptr[1:] - edge_ptr[:-1]
-    # if (deg.min().item() < 2 or deg.max().item() > 2):
-    #     print(f"deg min: {deg.min()}, deg max: {deg.max()}")
-    #     import time
-    #     time.sleep(300)
-    assert torch.all(deg == 2).item()
+    next_v = tl.load(edges + E + ccw_edge, mask=mask, other=0)
+    prev_v = tl.load(edges + E + cw_edge, mask=mask, other=0)
 
-    # Assumes the first two outgoing edges are the two ring neighbors.
-    idx_a = edge_ptr[:-1] # [N]
-    idx_b = idx_a + 1
+    next_x = tl.load(vertices + next_v * 2 + 0, mask=mask, other=0.0)
+    next_y = tl.load(vertices + next_v * 2 + 1, mask=mask, other=0.0)
+    prev_x = tl.load(vertices + prev_v * 2 + 0, mask=mask, other=0.0)
+    prev_y = tl.load(vertices + prev_v * 2 + 1, mask=mask, other=0.0)
 
-    ccw_a = edge_ccw[idx_a]
-    ccw_b = edge_ccw[idx_b]
+    dnx = next_x - vx
+    dny = next_y - vy
+    dpx = prev_x - vx
+    dpy = prev_y - vy
+    inv_next = tl.rsqrt(tl.maximum(dnx * dnx + dny * dny, EPS))
+    inv_prev = tl.rsqrt(tl.maximum(dpx * dpx + dpy * dpy, EPS))
+    dnx = dnx * inv_next
+    dny = dny * inv_next
+    dpx = dpx * inv_prev
+    dpy = dpy * inv_prev
 
-    # We need exactly one CCW and one non-CCW edge among the two neighbors.
-    assert torch.all(ccw_a ^ ccw_b).item()
+    cos_val = dnx * dpx + dny * dpy
+    sin_val = dnx * dpy - dny * dpx
 
-    # Edge marked CCW gives the "next" vertex along the boundary.
-    idx_next = torch.where(ccw_a, idx_a, idx_b)
+    tl.store(out + offs * OUT_DIM + 0, cos_val, mask=mask)
+    tl.store(out + offs * OUT_DIM + 1, sin_val, mask=mask)
 
-    # Other edge gives the "prev" vertex.
-    idx_prev = torch.where(ccw_a, idx_b, idx_a)
+    cur_cw_v = offs.to(tl.int64)
+    cur_ccw_v = offs.to(tl.int64)
 
-    n_next = edge_index[1, idx_next]
-    n_prev = edge_index[1, idx_prev]
+    for hop in range(1, K + 1):
+        cur_cw_e0 = tl.load(edge_ptr + cur_cw_v, mask=mask, other=0)
+        cur_cw_e1 = cur_cw_e0 + 1
+        cur_cw_e0_ccw = tl.load(edge_features + cur_cw_e0 * 2 + 1, mask=mask, other=0)
+        cur_cw_edge = tl.where(cur_cw_e0_ccw, cur_cw_e1, cur_cw_e0)
+        next_cw_v = tl.load(edges + E + cur_cw_edge, mask=mask, other=0)
 
-    d_next = x[n_next] - x
-    d_prev = x[n_prev] - x
+        cur_ccw_e0 = tl.load(edge_ptr + cur_ccw_v, mask=mask, other=0)
+        cur_ccw_e1 = cur_ccw_e0 + 1
+        cur_ccw_e0_ccw = tl.load(edge_features + cur_ccw_e0 * 2 + 1, mask=mask, other=0)
+        cur_ccw_edge = tl.where(cur_ccw_e0_ccw, cur_ccw_e0, cur_ccw_e1)
+        next_ccw_v = tl.load(edges + E + cur_ccw_edge, mask=mask, other=0)
 
-    d_next = F.normalize(d_next, p=2, dim=1, eps=eps)
-    d_prev = F.normalize(d_prev, p=2, dim=1, eps=eps)
+        for side in range(0, 2):
+            feat_v = tl.where(side == 0, next_cw_v, next_ccw_v)
+            feat_edge = tl.where(side == 0, cur_cw_edge, cur_ccw_edge)
+            col = tl.where(side == 0, K - hop, K + hop - 1)
+            base = 2 + col * 3
 
-    cos_val = (d_next * d_prev).sum(dim=1)
+            fx = tl.load(vertices + feat_v * 2 + 0, mask=mask, other=0.0)
+            fy = tl.load(vertices + feat_v * 2 + 1, mask=mask, other=0.0)
 
-    # 2D cross product z-component: d_next x d_prev
-    sin_val = (
-        d_next[:, 0] * d_prev[:, 1] -
-        d_next[:, 1] * d_prev[:, 0]
-    )
+            fe0 = tl.load(edge_ptr + feat_v, mask=mask, other=0)
+            fe1 = fe0 + 1
+            fe0_ccw = tl.load(edge_features + fe0 * 2 + 1, mask=mask, other=0)
+            f_ccw_edge = tl.where(fe0_ccw, fe0, fe1)
+            f_cw_edge = tl.where(fe0_ccw, fe1, fe0)
 
-    cos_sin[:, 0] = cos_val
-    cos_sin[:, 1] = sin_val
+            f_next_v = tl.load(edges + E + f_ccw_edge, mask=mask, other=0)
+            f_prev_v = tl.load(edges + E + f_cw_edge, mask=mask, other=0)
 
-    return cos_sin
+            f_next_x = tl.load(vertices + f_next_v * 2 + 0, mask=mask, other=0.0)
+            f_next_y = tl.load(vertices + f_next_v * 2 + 1, mask=mask, other=0.0)
+            f_prev_x = tl.load(vertices + f_prev_v * 2 + 0, mask=mask, other=0.0)
+            f_prev_y = tl.load(vertices + f_prev_v * 2 + 1, mask=mask, other=0.0)
 
-@torch.no_grad()
-def _compute_interior_angles_compilable(
-    x,
-    edge_index,
-    edge_ptr,
-    edge_ccw,
-    eps=1e-8,
+            fdnx = f_next_x - fx
+            fdny = f_next_y - fy
+            fdpx = f_prev_x - fx
+            fdpy = f_prev_y - fy
+            f_inv_next = tl.rsqrt(tl.maximum(fdnx * fdnx + fdny * fdny, EPS))
+            f_inv_prev = tl.rsqrt(tl.maximum(fdpx * fdpx + fdpy * fdpy, EPS))
+            fdnx = fdnx * f_inv_next
+            fdny = fdny * f_inv_next
+            fdpx = fdpx * f_inv_prev
+            fdpy = fdpy * f_inv_prev
+
+            f_cos = fdnx * fdpx + fdny * fdpy
+            f_sin = fdnx * fdpy - fdny * fdpx
+
+            edge_src = tl.load(edges + feat_edge, mask=mask, other=0)
+            edge_dst = tl.load(edges + E + feat_edge, mask=mask, other=0)
+            sx = tl.load(vertices + edge_src * 2 + 0, mask=mask, other=0.0)
+            sy = tl.load(vertices + edge_src * 2 + 1, mask=mask, other=0.0)
+            dx = tl.load(vertices + edge_dst * 2 + 0, mask=mask, other=0.0)
+            dy = tl.load(vertices + edge_dst * 2 + 1, mask=mask, other=0.0)
+            elen = tl.sqrt(tl.maximum((dx - sx) * (dx - sx) + (dy - sy) * (dy - sy), EPS))
+
+            tl.store(out + offs * OUT_DIM + base + 0, f_cos, mask=mask)
+            tl.store(out + offs * OUT_DIM + base + 1, f_sin, mask=mask)
+            tl.store(out + offs * OUT_DIM + base + 2, elen, mask=mask)
+
+        cur_cw_v = next_cw_v
+        cur_ccw_v = next_ccw_v
+
+
+@triton.jit
+def _ring_target_local_positions_kernel(
+    vertices,           # float32*, [N, 2]
+    edges,              # int64*, [2, E]
+    edge_features,      # bool*, [E, 2]
+    edge_ptr,           # int64*, [N + 1]
+    target_positions,   # float32*, [Q, 2]
+    global_source_idx,  # int64*, [B]
+    target_batches,     # int64*, [Q]
+    out,                # float32*, [Q, 2]
+    Q,
+    E,
+    BLOCK_Q: tl.constexpr,
+    EPS: tl.constexpr,
 ):
-    idx_a = edge_ptr[:-1]
-    idx_b = idx_a + 1
+    q = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    mask = q < Q
 
-    ccw_a = edge_ccw[idx_a]
-    ccw_b = edge_ccw[idx_b]
+    b = tl.load(target_batches + q, mask=mask, other=0)
+    src = tl.load(global_source_idx + b, mask=mask, other=0)
 
-    idx_next = torch.where(ccw_a, idx_a, idx_b)
-    idx_prev = torch.where(ccw_a, idx_b, idx_a)
+    sx = tl.load(vertices + src * 2 + 0, mask=mask, other=0.0)
+    sy = tl.load(vertices + src * 2 + 1, mask=mask, other=0.0)
 
-    n_next = edge_index[1, idx_next]
-    n_prev = edge_index[1, idx_prev]
+    e0 = tl.load(edge_ptr + src, mask=mask, other=0)
+    e1 = e0 + 1
+    e0_ccw = tl.load(edge_features + e0 * 2 + 1, mask=mask, other=0)
+    ccw_edge = tl.where(e0_ccw, e0, e1)
+    cw_edge = tl.where(e0_ccw, e1, e0)
 
-    d_next = F.normalize(x[n_next] - x, p=2, dim=1, eps=eps)
-    d_prev = F.normalize(x[n_prev] - x, p=2, dim=1, eps=eps)
+    next_v = tl.load(edges + E + ccw_edge, mask=mask, other=0)
+    prev_v = tl.load(edges + E + cw_edge, mask=mask, other=0)
 
-    cos_val = (d_next * d_prev).sum(dim=1)
-    sin_val = d_next[:, 0] * d_prev[:, 1] - d_next[:, 1] * d_prev[:, 0]
+    nx = tl.load(vertices + next_v * 2 + 0, mask=mask, other=0.0)
+    ny = tl.load(vertices + next_v * 2 + 1, mask=mask, other=0.0)
+    px = tl.load(vertices + prev_v * 2 + 0, mask=mask, other=0.0)
+    py = tl.load(vertices + prev_v * 2 + 1, mask=mask, other=0.0)
 
-    return torch.stack((cos_val, sin_val), dim=1)
+    t_in_x = sx - px
+    t_in_y = sy - py
+    t_out_x = nx - sx
+    t_out_y = ny - sy
+    inv_in = tl.rsqrt(tl.maximum(t_in_x * t_in_x + t_in_y * t_in_y, EPS))
+    inv_out = tl.rsqrt(tl.maximum(t_out_x * t_out_x + t_out_y * t_out_y, EPS))
+    t_in_x = t_in_x * inv_in
+    t_in_y = t_in_y * inv_in
+    t_out_x = t_out_x * inv_out
+    t_out_y = t_out_y * inv_out
 
+    x_axis_x = -t_in_y - t_out_y
+    x_axis_y = t_in_x + t_out_x
+    inv_axis = tl.rsqrt(tl.maximum(x_axis_x * x_axis_x + x_axis_y * x_axis_y, EPS))
+    x_axis_x = x_axis_x * inv_axis
+    x_axis_y = x_axis_y * inv_axis
 
-@torch.no_grad()
-def _boundary_k_neighbors(
-    x,
-    edge_index,
-    edge_ccw,
-    k=3,
-):
-    """
-    Return k-hop clockwise and counter-clockwise boundary neighbors for each vertex.
+    y_axis_x = -x_axis_y
+    y_axis_y = x_axis_x
 
-    Args:
-        x: [V, 2] vertex coordinates
-        edge_index: [2, E] directed edges. edge_index[0] is source, edge_index[1] is target.
-        edge_ccw: [E] bool. True iff edge follows CCW boundary direction.
-        k: number of hops in each direction.
+    tx = tl.load(target_positions + q * 2 + 0, mask=mask, other=0.0)
+    ty = tl.load(target_positions + q * 2 + 1, mask=mask, other=0.0)
+    cx = tx - sx
+    cy = ty - sy
 
-    Returns:
-        neighbors: [V, 2 * k] long tensor.
-        For k = 3, the columns are:
-            [cw_3, cw_2, cw_1, ccw_1, ccw_2, ccw_3]
-        That is, it starts with the 3-hop CW neighbor and ends with the 3-hop CCW neighbor.
-
-        edges: [V, 2 * k] long tensor.
-        For k = 3, the columns are:
-            [cw_2 -> cw_3, cw_1 -> cw_2, x -> cw_1, x -> ccw_1, ccw1 -> ccw_2, ccw2 -> ccw_3]
-    """
-    device = edge_index.device
-    V = x.shape[0]
-
-    if V == 0 or k == 0:
-        empty = torch.empty((V, 2 * k), device=device, dtype=torch.long)
-        return empty, empty
-
-    src = edge_index[0]
-    dst = edge_index[1]
-    E = edge_index.shape[1]
-
-    edge_ids = torch.arange(E, device=device, dtype=torch.long)
-
-    next_cw_edge = torch.empty((V,), device=device, dtype=torch.long)
-    next_ccw_edge = torch.empty((V,), device=device, dtype=torch.long)
-
-    # edge_ccw=True means src -> dst is the CCW successor edge.
-    next_ccw_edge[src[edge_ccw]] = edge_ids[edge_ccw]
-
-    # edge_ccw=False means src -> dst is the CW successor edge.
-    next_cw_edge[src[~edge_ccw]] = edge_ids[~edge_ccw]
-
-    vertices = torch.arange(V, device=device, dtype=torch.long)
-
-    def follow_edges(successor_edge):
-        """
-        Returns:
-            hop_vertices: [V, k], columns [hop_1, hop_2, ..., hop_k]
-            hop_edges:    [V, k], where hop_edges[:, i] is the edge used
-                          to reach hop_vertices[:, i].
-        """
-        hop_vertices = []
-        hop_edges = []
-
-        cur = vertices
-
-        for _ in range(k):
-            edge = successor_edge[cur]
-            cur = dst[edge]
-
-            hop_edges.append(edge)
-            hop_vertices.append(cur)
-
-        return (
-            torch.stack(hop_vertices, dim=1),
-            torch.stack(hop_edges, dim=1),
-        )
-
-    cw_vertices, cw_edges = follow_edges(next_cw_edge)
-    ccw_vertices, ccw_edges = follow_edges(next_ccw_edge)
-
-    # Desired order:
-    # [cw_k, ..., cw_1, ccw_1, ..., ccw_k]
-    neighbors = torch.cat(
-        [
-            torch.flip(cw_vertices, dims=[1]),
-            ccw_vertices,
-        ],
-        dim=1,
-    )
-
-    # Desired edge order:
-    # [cw_{k-1} -> cw_k, ..., x -> cw_1, x -> ccw_1, ..., ccw_{k-1} -> ccw_k]
-    edges = torch.cat(
-        [
-            torch.flip(cw_edges, dims=[1]),
-            ccw_edges,
-        ],
-        dim=1,
-    )
-
-    return neighbors, edges
+    tl.store(out + q * 2 + 0, cx * x_axis_x + cy * x_axis_y, mask=mask)
+    tl.store(out + q * 2 + 1, cx * y_axis_x + cy * y_axis_y, mask=mask)
 
 
 @torch.no_grad()
-def _compute_boundary_local_frames_2d(
-    x,
-    edge_index,
-    edge_ccw,
-    eps=1e-8,
+def compute_ring_source_features(graph: CSRGraph, n_neighbors: int, eps: float = 1e-8):
+    N = graph.vertices.shape[0]
+    out_dim = 2 + 2 * n_neighbors * 3
+    out = torch.empty((N, out_dim), device=graph.vertices.device, dtype=torch.float32)
+    if N == 0:
+        return out
+
+    E = graph.edges.shape[1]
+    block_n = 128
+    _ring_source_features_kernel[(triton.cdiv(N, block_n),)](
+        graph.vertices,
+        graph.edges,
+        graph.edge_features,
+        graph.edge_ptr,
+        out,
+        N=N,
+        E=E,
+        K=n_neighbors,
+        OUT_DIM=out_dim,
+        BLOCK_N=block_n,
+        EPS=eps,
+        num_warps=4,
+    )
+    return out
+
+
+@torch.no_grad()
+def compute_ring_target_local_positions(
+    graph: CSRGraph,
+    target_positions: torch.Tensor,
+    global_source_idx: torch.Tensor,
+    target_batches: torch.Tensor,
+    eps: float = 1e-8,
 ):
+    Q = target_positions.shape[0]
+    out = torch.empty_like(target_positions)
+    if Q == 0:
+        return out
+
+    E = graph.edges.shape[1]
+    block_q = 128
+    _ring_target_local_positions_kernel[(triton.cdiv(Q, block_q),)](
+        graph.vertices,
+        graph.edges,
+        graph.edge_features,
+        graph.edge_ptr,
+        target_positions,
+        global_source_idx,
+        target_batches,
+        out,
+        Q=Q,
+        E=E,
+        BLOCK_Q=block_q,
+        EPS=eps,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _csr_point_edge_distance_kernel(
+    vertices,              # float32 [N, 2]
+    edges,                 # int64   [2, E]
+    edge_ptr,              # int64   [N + 1]
+    vertex_batch_offsets,  # int64   [B + 1]
+    query_points,          # float32 [Q, 2]
+    query_batch_offsets,   # int64   [B + 1]
+    out,                   # float32 [Q]
+    E_TOTAL,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    b = tl.program_id(0)
+    qb = tl.program_id(1)
+
+    q_begin = tl.load(query_batch_offsets + b)
+    q_end = tl.load(query_batch_offsets + b + 1)
+
+    v_begin = tl.load(vertex_batch_offsets + b)
+    v_end = tl.load(vertex_batch_offsets + b + 1)
+
+    e_begin = tl.load(edge_ptr + v_begin)
+    e_end = tl.load(edge_ptr + v_end)
+
+    q_offsets = qb * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    q_idx = q_begin + q_offsets
+    valid_q = q_idx < q_end
+
+    px = tl.load(query_points + q_idx * 2 + 0, mask=valid_q, other=0.0)
+    py = tl.load(query_points + q_idx * 2 + 1, mask=valid_q, other=0.0)
+
+    best = tl.full((BLOCK_Q,), float("inf"), tl.float32)
+
+    e_offsets = tl.arange(0, BLOCK_E)
+    e_base = e_begin
+
+    while e_base < e_end:
+        e_idx = e_base + e_offsets
+        valid_e = e_idx < e_end
+
+        src = tl.load(edges + e_idx, mask=valid_e, other=0)
+        dst = tl.load(edges + E_TOTAL + e_idx, mask=valid_e, other=0)
+
+        ax = tl.load(vertices + src * 2 + 0, mask=valid_e, other=0.0)
+        ay = tl.load(vertices + src * 2 + 1, mask=valid_e, other=0.0)
+
+        bx = tl.load(vertices + dst * 2 + 0, mask=valid_e, other=0.0)
+        by = tl.load(vertices + dst * 2 + 1, mask=valid_e, other=0.0)
+
+        vx = bx - ax
+        vy = by - ay
+
+        len2 = vx * vx + vy * vy
+        len2_safe = tl.maximum(len2, EPS)
+
+        # Shapes:
+        #   query dimension: [BLOCK_Q, 1]
+        #   edge dimension:  [1, BLOCK_E]
+        apx = px[:, None] - ax[None, :]
+        apy = py[:, None] - ay[None, :]
+
+        t = (apx * vx[None, :] + apy * vy[None, :]) / len2_safe[None, :]
+        t = tl.minimum(tl.maximum(t, 0.0), 1.0)
+
+        cx = ax[None, :] + t * vx[None, :]
+        cy = ay[None, :] + t * vy[None, :]
+
+        dx = px[:, None] - cx
+        dy = py[:, None] - cy
+
+        d2 = dx * dx + dy * dy
+
+        valid = valid_q[:, None] & valid_e[None, :]
+        d2 = tl.where(valid, d2, float("inf"))
+
+        block_best = tl.min(d2, axis=1)
+        best = tl.minimum(best, block_best)
+
+        e_base += BLOCK_E
+
+    tl.store(out + q_idx, tl.sqrt(best), mask=valid_q)
+
+
+@torch.no_grad()
+def distance_to_graph_edges(
+    graph,
+    query_points: torch.Tensor,          # [Q, 2], float32 CUDA
+    query_batch_offsets: torch.Tensor,   # [B + 1], int64 CUDA
+    *,
+    block_q: int = 16,
+    block_e: int = 64,
+    eps: float = 1e-12,
+) -> torch.Tensor:
     """
-    Compute one 2D local frame per boundary vertex.
-
-    The local x-axis points along the interior angle bisector, towards the
-    interior, assuming the boundary orientation is CCW.
-
-    Args:
-        x: [V, 2] vertex coordinates.
-        edge_index: [2, E] directed edges.
-            edge_index[0] = source vertex
-            edge_index[1] = target vertex
-        edge_ccw: [E] bool.
-            True iff the directed edge follows the CCW boundary direction.
-            False iff the directed edge follows the CW boundary direction.
-        eps: numerical epsilon.
+    Compute shortest distance from each query point to graph edges in the same
+    batch.
 
     Returns:
-        basis: [V, 2, 2]
-            basis[v, :, 0] = local x-axis in global coordinates
-            basis[v, :, 1] = local y-axis in global coordinates
-
-    Convention:
-        local x-axis = inward angle bisector.
-        local y-axis = +90 degree rotation of local x-axis.
+        distances: [Q]
     """
-    V = x.shape[0]
-    device = x.device
 
-    basis = x.new_zeros((V, 2, 2))
+    vertices = graph.vertices
+    edges = graph.edges
+    edge_ptr = graph.edge_ptr
+    vertex_batch_offsets = graph.batch_offsets
 
-    if V == 0:
-        return basis
+    assert query_points.is_cuda
+    assert vertices.is_cuda
+    assert edges.is_cuda
+    assert edge_ptr.is_cuda
+    assert vertex_batch_offsets.is_cuda
+    assert query_batch_offsets.is_cuda
 
-    src = edge_index[0]
-    dst = edge_index[1]
+    assert query_points.dtype == torch.float32
+    assert vertices.dtype == torch.float32
+    assert edges.dtype == torch.long
+    assert edge_ptr.dtype == torch.long
+    assert vertex_batch_offsets.dtype == torch.long
+    assert query_batch_offsets.dtype == torch.long
 
-    # next_ccw[v] = next vertex when walking CCW along the boundary
-    # next_cw[v]  = next vertex when walking CW along the boundary
-    next_ccw = torch.full((V,), -1, device=device, dtype=torch.long)
-    next_cw = torch.full((V,), -1, device=device, dtype=torch.long)
-    next_ccw[src[edge_ccw]] = dst[edge_ccw]
-    next_cw[src[~edge_ccw]] = dst[~edge_ccw]
+    assert query_points.ndim == 2 and query_points.shape[1] == 2
+    assert vertices.ndim == 2 and vertices.shape[1] == 2
+    assert edges.ndim == 2 and edges.shape[0] == 2
+    assert vertex_batch_offsets.ndim == 1
+    assert query_batch_offsets.ndim == 1
+    assert vertex_batch_offsets.numel() == query_batch_offsets.numel()
 
-    assert torch.all((next_ccw >= 0) & (next_cw >= 0)).item() # Each vertex has 2 neighbors
+    # Important: make these preconditions explicit to avoid hidden PyTorch copies.
+    assert query_points.is_contiguous()
+    assert vertices.is_contiguous()
+    assert edges.is_contiguous()
+    assert edge_ptr.is_contiguous()
+    assert vertex_batch_offsets.is_contiguous()
+    assert query_batch_offsets.is_contiguous()
 
-    x_next = x[next_ccw]
-    x_prev = x[next_cw]
+    Q = query_points.shape[0]
+    B = query_batch_offsets.numel() - 1
+    E = edges.shape[1]
 
-    # Tangent of incoming and outgoing CCW edges
-    t_in = F.normalize(x - x_prev, p=2, dim=1, eps=eps)
-    t_out = F.normalize(x_next - x, p=2, dim=1, eps=eps)
+    out = torch.empty((Q,), dtype=torch.float32, device=query_points.device)
 
-    # For a CCW boundary, the interior lies to the left of each boundary tangent.
-    #
-    # left([x, y]) = [-y, x]
-    #
-    # Averaging the inward normals gives an interior bisector that works for both
-    # convex and reflex vertices.
-    n_in = torch.stack([-t_in[:, 1], t_in[:, 0]], dim=1)
-    n_out = torch.stack([-t_out[:, 1], t_out[:, 0]], dim=1)
+    if Q == 0:
+        return out
 
-    x_axis = F.normalize(n_in + n_out, p=2, dim=1, eps=eps)
+    if B == 0:
+        return out
 
-    # Local y-axis: +90 degree rotation of local x-axis.
-    y_axis = torch.stack([-x_axis[:, 1], x_axis[:, 0]], dim=1)
+    # Need a Python launch-grid size. This is one small sync.
+    query_counts = query_batch_offsets[1:] - query_batch_offsets[:-1]
+    max_q_per_batch = int(query_counts.max().item())
 
-    basis[:, :, 0] = x_axis
-    basis[:, :, 1] = y_axis
+    if max_q_per_batch == 0:
+        return out
 
-    return basis
-
-
-def _global_to_local(points_global, origins, basis):
-    """
-    Transform global 2D points into per-vertex local frames.
-
-    Args:
-        points_global: [V, ..., 2]
-        origins: [V, 2]
-        basis: [V, 2, 2]
-            basis[v, :, 0] = local x-axis in global coords
-            basis[v, :, 1] = local y-axis in global coords
-
-    Returns:
-        points_local with same leading shape as points_global.
-    """
-    # points_global shape: [V, ..., 2]
-    extra_dims = points_global.ndim - 2
-
-    o = origins.reshape(origins.shape[0], *([1] * extra_dims), 2)
-    R = basis.reshape(basis.shape[0], *([1] * extra_dims), 2, 2)
-
-    centered = points_global - o
-
-    # Since basis columns are local axes in global coordinates:
-    # local = centered @ basis
-    return torch.matmul(centered.unsqueeze(-2), R).squeeze(-2)
-
-
-def _local_to_global(points_local, origins, basis):
-    """
-    Transform per-vertex local 2D points into global coordinates.
-
-    Args:
-        points_local: [V, ..., 2]
-        origins: [V, 2]
-        basis: [V, 2, 2]
-
-    Returns:
-        points_global with same leading shape as points_local.
-    """
-    # points_local shape: [V, ..., 2]
-    extra_dims = points_local.ndim - 2
-
-    o = origins.reshape(origins.shape[0], *([1] * extra_dims), 2)
-    R_T = basis.transpose(-1, -2).reshape(
-        basis.shape[0], *([1] * extra_dims), 2, 2
+    grid = (
+        B,
+        triton.cdiv(max_q_per_batch, block_q),
     )
 
-    # global = local @ basis.T + origin
-    return torch.matmul(points_local.unsqueeze(-2), R_T).squeeze(-2) + o
+    _csr_point_edge_distance_kernel[grid](
+        vertices,
+        edges,
+        edge_ptr,
+        vertex_batch_offsets,
+        query_points,
+        query_batch_offsets,
+        out,
+        E_TOTAL=E,
+        BLOCK_Q=block_q,
+        BLOCK_E=block_e,
+        EPS=eps,
+        num_warps=4,
+    )
+
+    return out
 
 
-def _pack_candidate_indices(
-    node_validity: torch.Tensor,         # [N] bool
-    new_candidate_counts: torch.Tensor,  # [B]
-    node_ptr: torch.Tensor,              # [B + 1]
-):
-    device = node_validity.device
-    B = new_candidate_counts.numel()
-    N = node_ptr[1:] - node_ptr[:-1]  # [B]
-
-    node_batch = torch.repeat_interleave(
-        torch.arange(B, device=device),
-        N,
-    )  # [N]
-
-    valid_counts = torch.zeros(B, device=device, dtype=torch.long)
-    valid_counts.scatter_add_(0, node_batch, node_validity.long())
-
-    out_counts = valid_counts + new_candidate_counts
-
-    out_ptr = torch.empty(B + 1, device=device, dtype=torch.long)
-    out_ptr[0] = 0
-    out_ptr[1:] = out_counts.cumsum(dim=0)
-
-    total_out = int(out_ptr[-1].item())
-    idx = torch.full((total_out,), -1, device=device, dtype=torch.long)
-
-    # Global indices of valid nodes
-    node_idx = torch.arange(node_validity.numel(), device=device)
-    valid_node_idx = node_idx[node_validity]
-    valid_node_batch = node_batch[node_validity]
-
-    # Rank of each valid node within its batch
-    valid_cumsum = node_validity.long().cumsum(dim=0) - 1
-
-    valid_ptr = torch.empty(B + 1, device=device, dtype=torch.long)
-    valid_ptr[0] = 0
-    valid_ptr[1:] = valid_counts.cumsum(dim=0)
-
-    valid_rank_in_batch = valid_cumsum[node_validity] - valid_ptr[valid_node_batch]
-
-    valid_out_idx = out_ptr[valid_node_batch] + valid_rank_in_batch
-
-    idx[valid_out_idx] = valid_node_idx
-
-    return idx, out_ptr
+@dataclass
+class QuadMeshEncoding:
+    substep: torch.Tensor                    # [B] substep per agent
+    h_source0: torch.Tensor                  # [total_nodes0, source_hidden_size], source vertex hidden states (substep 0)
+    h_source1: torch.Tensor                  # [total_nodes1, source_hidden_size], source vertex hidden states (substep 1)
+    h_source0_batch_offset: torch.Tensor     # [B0 + 1] h_source offsets per agent (substep 0)
+    h_source1_batch_offset: torch.Tensor     # [B1 + 1] h_source offsets per agent (substep 1)
+    source_idx: torch.Tensor                 # [B1] source index (substep 1)
+    h_target_source: torch.Tensor            # [total_targets, target_hidden_size], source vertex hidden states per target (substep 1)
+    h_target: torch.Tensor                   # [total_targets, target_hidden_size], target hidden states (substep 1)
+    h_target_batch_offset: torch.Tensor      # [B1 + 1] h_target offsets per agent
 
 
 class QuadMeshingBoundaryEncoder(nn.Module):
@@ -1578,8 +2082,24 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         n_neighbors: Number of boundary neighbors to embed in each direction
     """
 
-    def __init__(self, obs_size, source_hidden_size=128, target_hidden_size=128, pos_bands=6, n_neighbors=3, **kwargs):
+    def __init__(
+            self,
+            obs_size,
+            max_frontier=1024,
+            max_degree=24,
+            max_candidates=1024,
+            source_hidden_size=128,
+            target_hidden_size=128,
+            pos_bands=6,
+            n_neighbors=3,
+            **kwargs
+    ):
         super().__init__()
+
+        self.max_frontier = max_frontier
+        self.max_degree = max_degree
+        self.max_candidates = max_candidates
+
         self.source_hidden_size = source_hidden_size
         self.target_hidden_size = target_hidden_size
         self.n_neighbors = n_neighbors
@@ -1592,166 +2112,136 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         ))
 
         self.target_encoder = layer_init(nn.Linear(
-            in_features=self.pos_encoder.out_dim + 1,  # (4*bands+2) + is_boundary(1)
+            in_features=self.pos_encoder.out_dim + 2,  # (4*bands+2) + dist(1) + is_boundary(1)
             out_features=target_hidden_size,
         ))
 
-        # self.compiled_decode = lambda obs: decode_substep0_obs_static(obs, 1024, 8)
-        # self.compiled_decode = make_compiled_substep0_decoder(
-        #     1024,
-        #     8,
-        #     fullgraph=False,
-        # )
 
-        # self.compiled_cia = torch.compile(
-        #     _compute_interior_angles_compilable,
-        #     mode="reduce-overhead",
-        #     fullgraph=False,
-        # )
-
-
-
-    def forward(self, obs, substep):
+    def forward(self, obs) -> QuadMeshEncoding:
         """
         Args:
             obs: uint8 tensor [B, obs_size]
 
         Returns:
-            dict with:
-                source_idx:      source index (substep 1)
-                h_source:        [total_nodes, source_hidden_size], source vertex hidden states
-                h_target_source: [total_targets, target_hidden_size], source vertex hidden states per target (substep 1)
-                h_target:        [total_targets, target_hidden_size], target hidden states (substep 1)
-                h_source_ptr:    [B + 1] h_source offsets per agent
-                h_target_ptr:    [B + 1] h_target offsets per agent
+            QuadMeshEncoding with initial hidden states
         """
         assert obs.dtype == torch.uint8
         device = obs.device
         B, _ = obs.shape
 
-        with nvtx_range("deserialize_substep0_obs"):
-            obs0 = deserialize_substep0_obs(obs)
+        substep = obs[:, 0]
+        # assert torch.all(substep <= 1).item() # Ensure no invalid substeps
 
-        V = obs0['x'].shape[0]
-        K = 2 * self.n_neighbors
+        B1 = int(torch.count_nonzero(substep).item())
+        B0 = B - B1
 
-        edge_ccw = obs0['edge_incidence'][:, 1]
-        with nvtx_range("compute_interior_angles"):
-            angles = _compute_interior_angles(obs0['x'], obs0['edge_index'], obs0['edge_ptr'], edge_ccw) # [V, 2]
-        with nvtx_range("boundary_k_neighbors"):
-            neighbors, neigh_edges = _boundary_k_neighbors(obs0['x'], obs0['edge_index'], edge_ccw, self.n_neighbors) # [V, K]
+        substep0_idx = torch.nonzero(substep == 0, as_tuple=False)
+        substep1_idx = torch.nonzero(substep == 1, as_tuple=False)
 
-        source_idx = None
+        # SUBSTEP 0
+        if B0 > 0:
+            with nvtx_range("deserialize_observation (substep 0)"):
+                graph = deserialize_observation(
+                    obs,
+                    substep0_idx,
+                    D=self.max_degree,
+                    F_CAP=self.max_frontier,
+                    deserialize_candidates=False,
+                    exact_output=True,
+                    copy_obs=False,
+                    use_cuda_graph=True,
+                )
 
-        # [V, 2 + K * (2 + 1)]
-        source_features = torch.cat(
-            [
-                angles,
-                torch.cat(
-                    [
-                        angles[neighbors],                 # [V, K, 2]
-                        obs0['edge_length'][neigh_edges],  # [V, K, 1]
-                    ],
-                    dim=-1,
-                ).reshape(V, K * 3),
-            ],
-            dim=-1,
-        )
+            with nvtx_range("compute_ring_source_features"):
+                source_features = compute_ring_source_features(graph, self.n_neighbors)
 
-        with nvtx_range("source_encoder"):
-            h_source = self.source_encoder(source_features)
-        h_source_ptr = obs0['ptr']
-        h_target_source = None
-        h_target = None
-        h_target_ptr = None
+            with nvtx_range("source_encoder"):
+                h_source0 = self.source_encoder(source_features)
+            h_source0_batch_offset = graph.batch_offsets
+        else:
+            h_source0 = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_source0_batch_offset = torch.zeros(1, device=device)
 
-        if substep == 1:
-            with nvtx_range("deserialize_substep1_obs"):
-                obs1 = deserialize_substep1_obs(obs)
-            source_idx = obs1['source_idx']
-            global_source_idx = h_source_ptr[:-1] + source_idx
 
-            with nvtx_range("pack_candidate_indices"):
-                idx, idx_ptr = _pack_candidate_indices(obs1['validity'], obs1['counts'], obs0['ptr'])
-            targets_per_batch = idx_ptr[1:] - idx_ptr[:-1]
-            target_batches = torch.repeat_interleave(torch.arange(B, device=device), targets_per_batch)
+        # SUBSTEP 1
+        if B1 > 0:
+            with nvtx_range("deserialize_observation (substep 1)"):
+                graph, targets = deserialize_observation(
+                    obs,
+                    substep1_idx,
+                    D=self.max_degree,
+                    F_CAP=self.max_frontier,
+                    C_CAP=self.max_candidates,
+                    deserialize_candidates=True,
+                    exact_output=True,
+                    copy_obs=False,
+                    use_cuda_graph=True,
+                )
 
-            src_angles = angles[global_source_idx]              # [B, 2]
-            src_neighbors = neighbors[global_source_idx]        # [B, K]
-            src_neigh_edges = neigh_edges[global_source_idx]    # [B, K]
+            with nvtx_range("compute_ring_source_features"):
+                source_features = compute_ring_source_features(graph, self.n_neighbors)
 
-            src_neighbor_angles = angles[src_neighbors]                   # [B, K, 2]
-            src_neighbor_lengths = obs0['edge_length'][src_neigh_edges]   # [B, K, 1]
+            with nvtx_range("source_encoder"):
+                h_source1 = self.source_encoder(source_features)
+            h_source1_batch_offset = graph.batch_offsets
 
-            # [total_targets, 2 + K * (2 + 1)]
-            src_features = torch.cat(
-                [
-                    src_angles,
-                    torch.cat(
-                        [src_neighbor_angles, src_neighbor_lengths],
-                        dim=-1,
-                    ).reshape(B, -1),
-                ],
-                dim=-1,
-            )[target_batches]
+            source_idx = targets.source_idx
+            global_source_idx = h_source1_batch_offset[:-1] + source_idx
 
-            boundary_mask = idx >= 0
+            boundary_mask = targets.target_idx >= 0
 
-            positions = torch.empty(idx.numel(), 2, device=device, dtype=torch.float32) # (total_targets, 2)
-            positions[boundary_mask] = obs0['x'][idx[boundary_mask]]
-            positions[~boundary_mask] = obs1['candidates']
-
-            with nvtx_range("compute_boundary_local_frames_2d"):
-                basis = _compute_boundary_local_frames_2d(obs0['x'], obs0['edge_index'], edge_ccw) # [V, 2, 2]
-            src_nodes = obs0['x'][global_source_idx] # [B, 2]
-            src_basis = basis[global_source_idx]     # [B, 2, 2]
-            with nvtx_range("global_to_local"):
-                positions_local = _global_to_local(positions, src_nodes[target_batches], src_basis[target_batches])
+            with nvtx_range("compute_ring_target_local_positions"):
+                positions_local = compute_ring_target_local_positions(
+                    graph,
+                    targets.target_positions,
+                    global_source_idx,
+                    targets.target_batches,
+                )
 
             with nvtx_range("pos_encoder"):
                 encoded_pos = self.pos_encoder(positions_local) # (total_targets, 2 + 4*bands)
 
-            # (4*bands+2) + is_boundary(1)
+            with nvtx_range("distances"):
+                distances = distance_to_graph_edges(
+                    graph,
+                    targets.target_positions,
+                    targets.target_batch_offsets,
+                    block_q=16,
+                    block_e=64,
+                )
+
             target_features = torch.cat(
                 [
                     encoded_pos,
+                    distances.unsqueeze(-1),
                     boundary_mask.to(encoded_pos.dtype).unsqueeze(-1),
                 ],
                 dim=-1,
             )
 
-            # for i in range(obs0['x'].shape[0]):
-            #     print(f"{i}: ({angles[i][0]:.4f}, {angles[i][1]:.4f})")
-            # for i in range(obs0['x'].shape[0]):
-            #     print(f"{i}: ({basis[i][0][0]:.4f}, {basis[i][1][0]:.4f}), ({basis[i][0][1]:.4f}, {basis[i][1][1]:.4f})")
-
-            # for i in range(obs1['validity'].shape[0]):
-            #     print(f"{i}: {obs1['validity'][i]}")
-            #
-            # print(f"source idx: {source_idx.item()}, p: ({obs0['x'][source_idx][0][0]}, {obs0['x'][source_idx][0][1]})")
-            # for i in range(positions.shape[0]):
-            #     print(f"p: ({positions[i][0]:.4f}, {positions[i][1]:.4f}), lp: ({target_features[i][0]:.4f}, {target_features[i][1]:.4f}), is_bdry: {target_features[i][2]}, idx: {idx[i]}")
-
-            # print(src_features)
-            # import sys
-            # sys.exit()
-
             with nvtx_range("source_encoder"):
-                h_target_source = self.source_encoder(src_features)
+                h_target_source = h_source1[global_source_idx][targets.target_batches]
             with nvtx_range("target_encoder"):
                 h_target = self.target_encoder(target_features)
-            h_target_ptr = idx_ptr
-        elif substep > 1:
-            # Substep must be in {0, 1}
-            raise ValueError(f"Unknown substep: {substep}")
+            h_target_batch_offset = targets.target_batch_offsets
+        else:
+            h_source1 = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_source1_batch_offset = torch.zeros(1, device=device)
+            source_idx = torch.empty(0, device=device)
+            h_target_source = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_target = torch.empty(0, self.target_encoder.out_features, device=device)
+            h_target_batch_offset = torch.zeros(1, device=device)
 
-        return dict(
+        return QuadMeshEncoding(
+            substep=substep,
+            h_source0=h_source0,
+            h_source1=h_source1,
+            h_source0_batch_offset=h_source0_batch_offset,
+            h_source1_batch_offset=h_source1_batch_offset,
             source_idx=source_idx,
-            h_source=h_source,
             h_target_source=h_target_source,
             h_target=h_target,
-            h_source_ptr=h_source_ptr,
-            h_target_ptr=h_target_ptr,
+            h_target_batch_offset=h_target_batch_offset,
         )
 
 
@@ -1779,49 +2269,32 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         self.target_mlp = _MLP(pair_hidden_size, pair_hidden_size, pair_hidden_size, num_layers, final_activation=True)
 
 
-    def forward(self, encoded, substep):
-        return self.forward_train(encoded, substep)
+    def forward(self, encoded):
+        return self.forward_train(encoded)
 
 
-    def forward_train(self, encoded, substep):
+    def forward_train(self, encoded: QuadMeshEncoding) -> QuadMeshEncoding:
         """
         Args:
-            encoded:
-                h_source:        [total_nodes, source_hidden_size], source vertex hidden states
-                h_target_source: [total_targets, target_hidden_size], source vertex hidden states per target (substep 1)
-                h_target:        [total_targets, target_hidden_size], target hidden states (substep 1)
-                h_source_ptr:    [B + 1] h_source offsets per agent
-                h_target_ptr:    [B + 1] h_target offsets per agent
+            encoded: QuadMeshEncoding with source and target hidden states
 
         Returns:
-            dict with:
-                source_idx:      source index (substep 1)
-                h_source:        [total_nodes, source_hidden_size], source vertex hidden states
-                h_target_source: [total_targets, target_hidden_size], source vertex hidden states per target (substep 1)
-                h_target:        [total_targets, source_hidden_size + target_hidden_size], target hidden states (substep 1)
-                h_source_ptr:    [B + 1] h_source offsets per agent
-                h_target_ptr:    [B + 1] h_target offsets per agent
+            QuadMeshEncoding with updated hidden states
         """
-        h_source = encoded['h_source']
-        h_target_source = encoded['h_target_source']
-        h_target = encoded['h_target']
+        h_source0 = encoded.h_source0
+        h_source1 = encoded.h_source1
+        h_target_source = encoded.h_target_source
+        h_target = encoded.h_target
 
-        h_source = self.source_mlp(h_source)
-        encoded['h_source'] = h_source
-
-        if substep == 1:
-            h_target_source = self.source_mlp(h_target_source)
-            h_target = self.target_mlp(torch.cat([h_target_source, h_target], dim=-1))
-            encoded['h_target_source'] = h_target_source
-            encoded['h_target'] = h_target
-        elif substep > 1:
-            # Substep must be in {0, 1}
-            raise ValueError(f"Unknown substep: {substep}")
+        encoded.h_source0 = self.source_mlp(h_source0)
+        encoded.h_source1 = self.source_mlp(h_source1)
+        encoded.h_target_source = self.source_mlp(h_target_source)
+        encoded.h_target = self.target_mlp(torch.cat([h_target_source, h_target], dim=-1))
 
         return encoded
 
-    def forward_eval(self, encoded, state, substep):
-        return self.forward_train(encoded, substep), state
+    def forward_eval(self, encoded: QuadMeshEncoding, state):
+        return self.forward_train(encoded), state
 
 
     def initial_state(self, batch_size, device):
@@ -1839,7 +2312,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
     """
     def __init__(self, act_sizes, source_hidden_size, target_hidden_size, **kwargs):
         super().__init__()
-        assert len(act_sizes) == 2, "QuadMeshingBoundaryDecoder expects nvec=[1, 1]"
+        assert len(act_sizes) == 1, "QuadMeshingBoundaryDecoder expects nvec=[1]"
 
         self.source_hidden_size = source_hidden_size
         self.target_hidden_size = target_hidden_size
@@ -1849,77 +2322,75 @@ class QuadMeshingBoundaryDecoder(nn.Module):
         pair_hidden_size = source_hidden_size + target_hidden_size
         self.target_head = layer_init(nn.Linear(pair_hidden_size, 1), 0.01)
 
-        self.value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
+        self.source_value_head = layer_init(nn.Linear(1, 1), 1)
+        self.target_value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
 
 
-    def forward(self, encoded, substep):
+    def forward(self, encoded: QuadMeshEncoding):
         """
         Args:
-            encoded:
-                source_idx:      source index (substep 1)
-                h_source:        [total_nodes, source_hidden_size], source vertex hidden states
-                h_target_source: [total_targets, target_hidden_size], source vertex hidden states per target (substep 1)
-                h_target:        [total_targets, source_hidden_size + target_hidden_size], target hidden states (substep 1)
-                h_source_ptr:    [B + 1] h_source offsets per agent
-                h_target_ptr:    [B + 1] h_target offsets per agent
+            encoded: QuadMeshEncoding with source and target hidden states
 
         Returns:
             tuple of (logits, values)
-            - logits: ([B, S], [B, 1]) (substep 0)
-                      ([B, 1], [B, T]) (substep 1)
-            - values: [B] value estimates
+            - logits: [B, L]
+            - values: [B, 1] value estimates
         """
-        source_idx = encoded['source_idx']
-        h_source = encoded['h_source']
-        h_target = encoded['h_target']
-        h_source_ptr = encoded['h_source_ptr']
-        h_target_ptr = encoded['h_target_ptr']
+        substep = encoded.substep
+        h_source0 = encoded.h_source0
+        h_source1 = encoded.h_source1
+        h_source0_batch_offset = encoded.h_source0_batch_offset
+        h_source1_batch_offset = encoded.h_source1_batch_offset
+        source_idx = encoded.source_idx
+        h_target = encoded.h_target
+        h_target_batch_offset = encoded.h_target_batch_offset
 
-        device = h_source.device
+        device = h_source0_batch_offset.device
+        sources_per_batch = h_source0_batch_offset[1:] - h_source0_batch_offset[:-1]
+        targets_per_batch = h_target_batch_offset[1:] - h_target_batch_offset[:-1]
+        B  = substep.numel()
+        B0 = sources_per_batch.numel()
+        B1 = targets_per_batch.numel()
+        L = int(max(
+            sources_per_batch.max().item() if B0 > 0 else 1,
+            targets_per_batch.max().item() if B1 > 0 else 1,
+        ))
 
-        values = None
+        logits = torch.full((B, L), -torch.inf, device=device)
+        values = torch.zeros(B, 1, device=device)
 
-        if substep == 0:
-            packed_logits = self.source_head(h_source).squeeze(1)
+        # SUBSTEP 0
+        if B0 > 0:
+            packed_logits = self.source_head(h_source0).squeeze(1)
 
-            sources_per_batch = h_source_ptr[1:] - h_source_ptr[:-1]
-            B = sources_per_batch.numel()
-            S = sources_per_batch.max().item()
+            target_rows = (substep == 0).nonzero(as_tuple=True)[0] # [B0]
+            target_rows_2d = target_rows[:, None].expand(B0, L)    # [B0, L]
+            cols = torch.arange(L, device=device).expand(B0, L)    # [B0, L]
+            mask = cols < sources_per_batch[:, None]               # [B0, L]
 
-            source_logits = torch.full((B, S), -torch.inf, device=device)
+            idx = h_source0_batch_offset[:-1, None] + cols
+            logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
 
-            cols = torch.arange(S, device=device).expand(B, S)
-            mask = cols < sources_per_batch[:, None]
+            debug_zero = torch.zeros(B0, 1, device=device)
+            values[substep == 0] = self.source_value_head(debug_zero)
 
-            idx = h_source_ptr[:-1, None] + cols
-            source_logits[mask] = packed_logits[idx[mask]]
-            target_logits = torch.ones(B, 1, device=device, dtype=torch.float32)
-        elif substep == 1:
+        # SUBSTEP 1
+        if B1 > 0:
             packed_logits = self.target_head(h_target).squeeze(1)
 
-            targets_per_batch = h_target_ptr[1:] - h_target_ptr[:-1]
-            B = targets_per_batch.numel()
-            T = max(1, targets_per_batch.max().item())
-            S = source_idx.max().item() + 1
+            target_rows = (substep == 1).nonzero(as_tuple=True)[0] # [B1]
+            target_rows_2d = target_rows[:, None].expand(B1, L)    # [B1, L]
+            cols = torch.arange(L, device=device).expand(B1, L)    # [B1, L]
+            mask = cols < targets_per_batch[:, None]               # [B1, L]
 
-            target_logits = torch.full((B, T), -torch.inf, device=device)
+            idx = h_target_batch_offset[:-1, None] + cols
+            logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
 
-            cols = torch.arange(T, device=device).expand(B, T)
-            mask = cols < targets_per_batch[:, None]
+            # Fix no valid options
+            no_valid = targets_per_batch == 0                        # [B1]
+            logits[target_rows[no_valid], 0] = 1.0
 
-            idx = h_target_ptr[:-1, None] + cols
-            target_logits[mask] = packed_logits[idx[mask]]
-            target_logits[targets_per_batch == 0, 0] = 1.0 # Fix no valid options
-            source_logits = torch.full((B, S), -torch.inf, device=device)
-            rows = torch.arange(B, device=device)
-            source_logits[rows, source_idx] = 1.0
+            h_source_per_batch = h_source1[h_source1_batch_offset[:-1] + source_idx] # [B, source_hidden_size]
+            values[substep == 1] = self.target_value_head(h_source_per_batch)
 
-            h_source_per_batch = h_source[h_source_ptr[:-1] + source_idx] # [B, source_hidden_size]
-            # h_source_per_batch = h_source[source_idx] # [B, source_hidden_size]
-            h_source_per_batch = torch.zeros_like(h_source_per_batch, device=device) # [B, source_hidden_size]
-            values = self.value_head(h_source_per_batch) # [B, 1]
-        else:
-            raise ValueError(f"Unknown substep: {substep[0]}")
-
-        return (source_logits, target_logits), values
-
+        return logits, values

@@ -1,11 +1,12 @@
 #include "quad_meshing.h"
 #include <assert.h>
 // ACTION BUFFER
-#define NUM_ATNS 2
-#define ACT_SIZES {1, 1}
-#define NUM_SUBSTEPS 1
+#define NUM_ATNS 1
+#define ACT_SIZES {1}
+// #define NUM_SUBSTEPS 1
 
 // OBSERVATION BUFFER (in bytes)
+// - substep [1]
 // - frontier size [2]
 // - max degree [2]
 // - frontier vertices [MAX_FRONTIER_SIZE * 8]
@@ -15,11 +16,12 @@
 // - valid new vertex candidates count [2]
 // - valid new vertex candidates [MAX_NEW_CANDIDATES * 8]
 #define OBS_TENSOR_T ByteTensor // Pack observations in raw bytes buffer
-#define MAX_FRONTIER_SIZE 1024 // Assume less than 2^16
-#define MAX_DEGREE 24
-#define MAX_NEW_CANDIDATES 256 // Assume less than 2^16
+#define MAX_FRONTIER_SIZE 256 // Assume less than 2^16
+#define MAX_DEGREE 8
+#define MAX_NEW_CANDIDATES 768 // Assume less than 2^16
 
 #define OBS_SIZE ( \
+  1 + \
   2 + \
   2 + \
   MAX_FRONTIER_SIZE * 8 + \

@@ -9,7 +9,8 @@ int main() {
     QuadMeshingEnv env = {0};
     env.episode_max_length = 2048;
     static const char* boundary_paths[] = {
-      "resources/quad_meshing/boundaries/square.json"
+      // "resources/quad_meshing/boundaries/square.json"
+      "resources/quad_meshing/boundaries/dolphin.json"
       // "resources/quad_meshing/boundaries/rat-18.json",
       // "resources/quad_meshing/boundaries/cup-13.json",
       // "resources/quad_meshing/boundaries/chopper-12.json",
@@ -24,11 +25,14 @@ int main() {
     env.boundary_paths = boundary_paths;
     env.boundary_count = (int)(sizeof(boundary_paths) / sizeof(boundary_paths[0]));
     env.boundary_mode = true;
-    env.candidate_rings = 5;
+    env.candidate_rings = 12;
     env.candidate_angles = 64;
-    env.candidate_radius_min = 0.15;
-    env.candidate_radius_max = 0.20;
-    env.target_quad_area = 0.015625;
+    // env.candidate_radius_min = 0.15;
+    // env.candidate_radius_max = 0.20;
+    // env.target_quad_area = 0.015625;
+    env.candidate_radius_min = 0.025;
+    env.candidate_radius_max = 0.07;
+    env.target_quad_area = 0.0009;
     env.reward_invalid = -0.1f;
     env.render_width = 1200;
     env.render_height = 900;
@@ -81,7 +85,8 @@ int main() {
                 // Substep
                 env.actions[0] = rand_range(&rng, mesh.frontier.size);
                 env.ui_pending_source = env.actions[0];
-                c_substep(&env, 0);
+                // c_substep(&env, 0);
+                c_step(&env);
             } else {
                 BoolArray validity_mask;
                 BoolArray_init(&validity_mask);
@@ -103,9 +108,11 @@ int main() {
 
                 // Step
                 if (valid_targets.size > 0) {
-                    env.actions[1] = rand_range(&rng, valid_targets.size);
+                    // env.actions[1] = rand_range(&rng, valid_targets.size);
+                    env.actions[0] = rand_range(&rng, valid_targets.size);
                 } else {
-                    env.actions[1] = 0;
+                    // env.actions[1] = 0;
+                    env.actions[0] = 0;
                 }
                 env.ui_pending_source = -1;
                 c_step(&env);
@@ -145,7 +152,8 @@ int main() {
                 if (best_idx >= 0 && best <= pick_radius*pick_radius) {
                     env.ui_pending_source = best_idx;
                     env.actions[0] = best_idx;
-                    c_substep(&env, 0);
+                    // c_substep(&env, 0);
+                    c_step(&env);
                 }
             } else {
                 BoolArray validity_mask;
@@ -182,8 +190,9 @@ int main() {
                 }
 
                 if (best_target >= 0 && best <= pick_radius*pick_radius) {
-                    env.actions[0] = env.ui_pending_source;
-                    env.actions[1] = best_target;
+                    // env.actions[0] = env.ui_pending_source;
+                    // env.actions[1] = best_target;
+                    env.actions[0] = best_target;
                     c_step(&env);
                     printf("reward: %f\n", env.rewards[0]);
                 }
