@@ -389,6 +389,8 @@ class SE2AngleMessagePassing(nn.Module):
         edge_index[1] = target nodes
 
     For edge i -> j, neighbors k of j are outgoing edges j -> k.
+    edge_index must be sorted by source node and edge_ptr must be the matching
+    outgoing-edge CSR pointer.
     """
 
     def __init__(
@@ -450,27 +452,13 @@ class SE2AngleMessagePassing(nn.Module):
 
         return torch.cat(parts, dim=-1)
 
-    @staticmethod
-    def _make_csr_from_sources(src, num_nodes):
-        """
-        Sort directed edges by source node and construct CSR pointer.
-        """
-        perm = torch.argsort(src)
-        src_sorted = src[perm]
-
-        deg = torch.bincount(src, minlength=num_nodes)
-        ptr = torch.zeros(num_nodes + 1, device=src.device, dtype=torch.long)
-        ptr[1:] = torch.cumsum(deg, dim=0)
-
-        return perm, src_sorted, deg, ptr
-
-    def forward(self, h, x, edge_index, edge_ptr=None, edge_cont=None, edge_cat=None):
+    def forward(self, h, x, edge_index, edge_ptr, edge_cont=None, edge_cat=None):
         """
         Args:
             h:          [N, node_dim]
             x:          [N, 2] coordinates
             edge_index: [2, E], directed edges i -> j
-            edge_ptr:   [N + 1] CSR pointers for outgoing edges (optional; if None, computed from edge_index)
+            edge_ptr:   [N + 1] CSR pointers for outgoing edges. Must match edge_index source order.
             edge_cont:  [E, edge_cont_dim], optional continuous edge features
             edge_cat:   [E, num_edge_cat_features], optional categorical features
 
@@ -487,14 +475,12 @@ class SE2AngleMessagePassing(nn.Module):
 
         edge_feat = self.encode_edges(edge_cont, edge_cat)
 
-        # Sort edges by source so that outgoing neighbors of each node are contiguous.
-        if edge_ptr is not None:
-            # edge_ptr pre-computed: extract out-degrees from CSR pointers
-            out_deg = edge_ptr[1:] - edge_ptr[:-1]
-            perm = torch.arange(num_edges, device=device)
-            ptr = edge_ptr
-        else:
-            perm, _, out_deg, ptr = self._make_csr_from_sources(src, num_nodes)
+        if edge_ptr is None:
+            raise ValueError("edge_ptr must be provided and must match source-sorted edge_index.")
+        if edge_ptr.numel() != num_nodes + 1:
+            raise ValueError("edge_ptr must have shape [num_nodes + 1].")
+        out_deg = edge_ptr[1:] - edge_ptr[:-1]
+        ptr = edge_ptr
 
         # For every edge i -> j, enumerate outgoing edges j -> k.
         center = dst
@@ -519,7 +505,7 @@ class SE2AngleMessagePassing(nn.Module):
         local_offset = torch.arange(total_pairs, device=device) - pair_start
 
         edge_jk_sorted_pos = ptr[repeated_centers] + local_offset
-        edge_jk = perm[edge_jk_sorted_pos]
+        edge_jk = edge_jk_sorted_pos
 
         # Remove k == i.
         i = src[edge_ij]
@@ -582,7 +568,7 @@ class SE2AngleMessagePassing(nn.Module):
             denom = (out_deg[dst] - 1).clamp_min(1).to(msg.dtype).unsqueeze(-1)
             msg = msg / denom
 
-        # h_i receives m_ji, i.e. messages whose destination is i.
+        # m_ij is a message from node i to node j, so node j receives it here.
         receiver = dst
         agg = torch.zeros(
             num_nodes,
@@ -1631,6 +1617,209 @@ class FourierEncoder2D(nn.Module):
         return feat
 
 
+class PerceiverCrossAttention(nn.Module):
+    def __init__(self, d_model, num_heads, mlp_dim, dropout=0.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, query, key_value, key_padding_mask=None):
+        q = self.norm_q(query)
+        kv = self.norm_kv(key_value)
+        out, _ = self.attn(
+            q,
+            kv,
+            kv,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        query = query + self.dropout(out)
+        return query + self.mlp(self.norm_mlp(query))
+
+
+class PerceiverSelfAttentionBlock(nn.Module):
+    def __init__(self, d_model, num_heads, mlp_dim, dropout=0.0):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        h = self.norm_attn(x)
+        out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + self.dropout(out)
+        return x + self.mlp(self.norm_mlp(x))
+
+
+class SourceEdgePerceiverEncoder(nn.Module):
+    def __init__(
+        self,
+        source_hidden_size,
+        pos_bands,
+        d_model=None,
+        num_latents=32,
+        num_layers=2,
+        num_heads=4,
+        mlp_ratio=4,
+        dropout=0.0,
+        eps=1e-8,
+    ):
+        super().__init__()
+        d_model = source_hidden_size if d_model is None else d_model
+        if num_latents < 1:
+            raise ValueError("perceiver_num_latents must be at least 1.")
+        if num_layers < 1:
+            raise ValueError("perceiver_layers must be at least 1.")
+        if d_model % num_heads != 0:
+            raise ValueError("perceiver_d_model must be divisible by perceiver_heads.")
+
+        self.source_hidden_size = source_hidden_size
+        self.d_model = d_model
+        self.eps = eps
+        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+
+        edge_in_dim = self.pos_encoder.out_dim + 3  # midpoint PE + length + canonical direction
+        self.edge_proj = layer_init(nn.Linear(edge_in_dim, d_model))
+        self.query_proj = layer_init(nn.Linear(self.pos_encoder.out_dim, d_model))
+        self.out_proj = layer_init(nn.Linear(d_model, source_hidden_size))
+
+        self.latents = nn.Parameter(torch.empty(num_latents, d_model))
+        self.null_edge = nn.Parameter(torch.zeros(d_model))
+        nn.init.normal_(self.latents, std=0.02)
+
+        mlp_dim = int(d_model * mlp_ratio)
+        self.input_cross_attn = PerceiverCrossAttention(d_model, num_heads, mlp_dim, dropout)
+        self.blocks = nn.ModuleList([
+            PerceiverSelfAttentionBlock(d_model, num_heads, mlp_dim, dropout)
+            for _ in range(num_layers)
+        ])
+        self.query_cross_attn = PerceiverCrossAttention(d_model, num_heads, mlp_dim, dropout)
+
+    @staticmethod
+    def _batch_index_from_offsets(indices, offsets):
+        return torch.searchsorted(offsets[1:], indices, right=True)
+
+    @staticmethod
+    def _canonical_direction(delta, length, eps):
+        direction = delta / length.clamp_min(eps)
+        flip = (direction[:, 1] < 0) | ((direction[:, 1] == 0) & (direction[:, 0] < 0))
+        return torch.where(flip.unsqueeze(-1), -direction, direction)
+
+    @staticmethod
+    def _pad_by_batch(values, batch_idx, counts, fill_value=0.0, add_null=False, null_value=None):
+        B = counts.numel()
+        width = int(counts.max().item()) if counts.numel() > 0 else 0
+        if add_null:
+            width += 1
+        width = max(width, 1)
+
+        out = values.new_full((B, width, values.size(-1)), fill_value)
+        mask = torch.ones(B, width, dtype=torch.bool, device=values.device)
+        if add_null:
+            if null_value is None:
+                out[:, 0] = 0.0
+            else:
+                out[:, 0] = null_value
+            mask[:, 0] = False
+
+        if values.numel() == 0:
+            return out, mask
+
+        offsets = torch.empty(B + 1, dtype=torch.long, device=values.device)
+        offsets[0] = 0
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        pos = torch.arange(values.size(0), device=values.device) - offsets[batch_idx]
+        if add_null:
+            pos = pos + 1
+        out[batch_idx, pos] = values
+        mask[batch_idx, pos] = False
+        return out, mask
+
+    def _edge_tokens(self, graph):
+        src = graph.edges[0]
+        dst = graph.edges[1]
+        keep = src < dst
+        src = src[keep]
+        dst = dst[keep]
+
+        if src.numel() == 0:
+            return graph.vertices.new_empty(0, self.d_model), src
+
+        p0 = graph.vertices[src]
+        p1 = graph.vertices[dst]
+        delta = p1 - p0
+        length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+        direction = self._canonical_direction(delta, length, self.eps)
+        midpoint = 0.5 * (p0 + p1)
+        encoded_midpoint = self.pos_encoder(midpoint)
+        edge_features = torch.cat([encoded_midpoint, length, direction], dim=-1)
+        return self.edge_proj(edge_features), src
+
+    def forward(self, graph):
+        B = graph.batch_offsets.numel() - 1
+        if graph.vertices.numel() == 0:
+            return graph.vertices.new_empty(0, self.source_hidden_size)
+
+        edge_tokens, edge_src = self._edge_tokens(graph)
+        vertex_counts = graph.batch_offsets[1:] - graph.batch_offsets[:-1]
+
+        if edge_src.numel() == 0:
+            edge_counts = torch.zeros(B, dtype=torch.long, device=graph.vertices.device)
+            edge_batch = torch.empty(0, dtype=torch.long, device=graph.vertices.device)
+        else:
+            edge_batch = self._batch_index_from_offsets(edge_src, graph.batch_offsets)
+            edge_counts = torch.bincount(edge_batch, minlength=B)
+
+        padded_edges, edge_mask = self._pad_by_batch(
+            edge_tokens,
+            edge_batch,
+            edge_counts,
+            add_null=True,
+            null_value=self.null_edge,
+        )
+
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+        latents = self.input_cross_attn(latents, padded_edges, key_padding_mask=edge_mask)
+        for block in self.blocks:
+            latents = block(latents)
+
+        vertex_batch = torch.repeat_interleave(
+            torch.arange(B, device=graph.vertices.device), vertex_counts
+        )
+        vertex_queries = self.query_proj(self.pos_encoder(graph.vertices))
+        padded_queries, _ = self._pad_by_batch(vertex_queries, vertex_batch, vertex_counts)
+        decoded = self.query_cross_attn(padded_queries, latents)
+
+        offsets = torch.empty(B + 1, dtype=torch.long, device=graph.vertices.device)
+        offsets[0] = 0
+        offsets[1:] = torch.cumsum(vertex_counts, dim=0)
+        pos = torch.arange(graph.vertices.size(0), device=graph.vertices.device) - offsets[vertex_batch]
+        decoded = decoded[vertex_batch, pos]
+        return self.out_proj(decoded)
+
+
 @triton.jit
 def _ring_source_features_kernel(
     vertices,       # float32*, [N, 2]
@@ -2063,6 +2252,7 @@ class QuadMeshEncoding:
     substep: torch.Tensor                    # [B] substep per agent
     h_source0: torch.Tensor                  # [total_nodes0, source_hidden_size], source vertex hidden states (substep 0)
     h_source1: torch.Tensor                  # [total_nodes1, source_hidden_size], source vertex hidden states (substep 1)
+    h_source0_pooled: torch.Tensor           # [B0, source_hidden_size], mean-pooled source hidden states (substep 0)
     h_source0_batch_offset: torch.Tensor     # [B0 + 1] h_source offsets per agent (substep 0)
     h_source1_batch_offset: torch.Tensor     # [B1 + 1] h_source offsets per agent (substep 1)
     source_idx: torch.Tensor                 # [B1] source index (substep 1)
@@ -2080,6 +2270,8 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         target_hidden_size: Dimension of hidden target embeddings
         pos_bands: Number of Fourier frequency bands
         n_neighbors: Number of boundary neighbors to embed in each direction
+        source_encoder_type: "ring" for handcrafted ring features, "se2" for SE(2) angle message passing,
+            or "perceiver" for Perceiver-style edge-token source encoding
     """
 
     def __init__(
@@ -2092,6 +2284,14 @@ class QuadMeshingBoundaryEncoder(nn.Module):
             target_hidden_size=128,
             pos_bands=6,
             n_neighbors=3,
+            source_encoder_type="ring",
+            se2_source_layers=2,
+            perceiver_num_latents=32,
+            perceiver_layers=2,
+            perceiver_heads=4,
+            perceiver_mlp_ratio=4,
+            perceiver_dropout=0.0,
+            perceiver_d_model=None,
             **kwargs
     ):
         super().__init__()
@@ -2103,18 +2303,73 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         self.source_hidden_size = source_hidden_size
         self.target_hidden_size = target_hidden_size
         self.n_neighbors = n_neighbors
+        self.source_encoder_type = source_encoder_type
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
-        # Use same embedding for source selection and source observation
-        self.source_encoder = layer_init(nn.Linear(
-            in_features=2 + 2 * n_neighbors * 3,  # cos_sin(2) + 2 * n_neighbors * (cos_sin(2) + edge_length(1))
-            out_features=source_hidden_size,
-        ))
+        if source_encoder_type == "ring":
+            # Use same embedding for source selection and source observation
+            self.source_encoder = layer_init(nn.Linear(
+                in_features=2 + 2 * n_neighbors * 3,  # cos_sin(2) + 2 * n_neighbors * (cos_sin(2) + edge_length(1))
+                out_features=source_hidden_size,
+            ))
+        elif source_encoder_type == "se2":
+            if se2_source_layers < 1:
+                raise ValueError("se2_source_layers must be at least 1.")
+            self.source_initial = nn.Parameter(torch.zeros(source_hidden_size))
+            self.source_message_passing = nn.ModuleList([
+                SE2AngleMessagePassing(
+                    node_dim=source_hidden_size,
+                    out_dim=source_hidden_size,
+                    msg_dim=source_hidden_size,
+                    edge_cont_dim=3,
+                    hidden_dim=source_hidden_size,
+                )
+                for _ in range(se2_source_layers)
+            ])
+        elif source_encoder_type == "perceiver":
+            self.source_perceiver = SourceEdgePerceiverEncoder(
+                source_hidden_size=source_hidden_size,
+                pos_bands=pos_bands,
+                d_model=perceiver_d_model,
+                num_latents=perceiver_num_latents,
+                num_layers=perceiver_layers,
+                num_heads=perceiver_heads,
+                mlp_ratio=perceiver_mlp_ratio,
+                dropout=perceiver_dropout,
+            )
+        else:
+            raise ValueError("source_encoder_type must be 'ring', 'se2', or 'perceiver'.")
 
         self.target_encoder = layer_init(nn.Linear(
             in_features=self.pos_encoder.out_dim + 2,  # (4*bands+2) + dist(1) + is_boundary(1)
             out_features=target_hidden_size,
         ))
+
+    def _compute_se2_edge_cont(self, graph: CSRGraph):
+        src = graph.edges[0]
+        dst = graph.edges[1]
+        lengths = torch.linalg.vector_norm(graph.vertices[dst] - graph.vertices[src], dim=-1, keepdim=True)
+        flags = graph.edge_features.to(dtype=graph.vertices.dtype)
+        return torch.cat([lengths, flags], dim=-1)
+
+    def _encode_sources(self, graph: CSRGraph):
+        if self.source_encoder_type == "ring":
+            with nvtx_range("compute_ring_source_features"):
+                source_features = compute_ring_source_features(graph, self.n_neighbors)
+            with nvtx_range("source_encoder"):
+                return self.source_encoder(source_features)
+
+        if self.source_encoder_type == "perceiver":
+            with nvtx_range("source_edge_perceiver_encoder"):
+                return self.source_perceiver(graph)
+
+        with nvtx_range("compute_se2_edge_cont"):
+            edge_cont = self._compute_se2_edge_cont(graph)
+        h = self.source_initial.unsqueeze(0).expand(graph.vertices.size(0), -1)
+        for layer in self.source_message_passing:
+            with nvtx_range("se2_source_message_passing"):
+                h = layer(h, graph.vertices, graph.edges, graph.edge_ptr, edge_cont=edge_cont)
+        return h
 
 
     def forward(self, obs) -> QuadMeshEncoding:
@@ -2152,14 +2407,10 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            with nvtx_range("compute_ring_source_features"):
-                source_features = compute_ring_source_features(graph, self.n_neighbors)
-
-            with nvtx_range("source_encoder"):
-                h_source0 = self.source_encoder(source_features)
+            h_source0 = self._encode_sources(graph)
             h_source0_batch_offset = graph.batch_offsets
         else:
-            h_source0 = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_source0 = torch.empty(0, self.source_hidden_size, device=device)
             h_source0_batch_offset = torch.zeros(1, device=device)
 
 
@@ -2178,11 +2429,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            with nvtx_range("compute_ring_source_features"):
-                source_features = compute_ring_source_features(graph, self.n_neighbors)
-
-            with nvtx_range("source_encoder"):
-                h_source1 = self.source_encoder(source_features)
+            h_source1 = self._encode_sources(graph)
             h_source1_batch_offset = graph.batch_offsets
 
             source_idx = targets.source_idx
@@ -2225,10 +2472,10 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                 h_target = self.target_encoder(target_features)
             h_target_batch_offset = targets.target_batch_offsets
         else:
-            h_source1 = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_source1 = torch.empty(0, self.source_hidden_size, device=device)
             h_source1_batch_offset = torch.zeros(1, device=device)
             source_idx = torch.empty(0, device=device)
-            h_target_source = torch.empty(0, self.source_encoder.out_features, device=device)
+            h_target_source = torch.empty(0, self.source_hidden_size, device=device)
             h_target = torch.empty(0, self.target_encoder.out_features, device=device)
             h_target_batch_offset = torch.zeros(1, device=device)
 
@@ -2236,6 +2483,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
             substep=substep,
             h_source0=h_source0,
             h_source1=h_source1,
+            h_source0_pooled=torch.empty(0, self.source_hidden_size, device=device),
             h_source0_batch_offset=h_source0_batch_offset,
             h_source1_batch_offset=h_source1_batch_offset,
             source_idx=source_idx,
@@ -2272,6 +2520,17 @@ class QuadMeshingBoundaryNetwork(nn.Module):
     def forward(self, encoded):
         return self.forward_train(encoded)
 
+    @staticmethod
+    def _mean_pool_by_offsets(h, offsets):
+        counts = offsets[1:] - offsets[:-1]
+        pooled = torch.zeros(counts.numel(), h.size(-1), device=h.device, dtype=h.dtype)
+        if h.numel() == 0:
+            return pooled
+
+        batch = torch.repeat_interleave(torch.arange(counts.numel(), device=h.device), counts)
+        pooled.index_add_(0, batch, h)
+        return pooled / counts.clamp_min(1).to(h.dtype).unsqueeze(-1)
+
 
     def forward_train(self, encoded: QuadMeshEncoding) -> QuadMeshEncoding:
         """
@@ -2287,6 +2546,10 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         h_target = encoded.h_target
 
         encoded.h_source0 = self.source_mlp(h_source0)
+        encoded.h_source0_pooled = self._mean_pool_by_offsets(
+            encoded.h_source0,
+            encoded.h_source0_batch_offset,
+        )
         encoded.h_source1 = self.source_mlp(h_source1)
         encoded.h_target_source = self.source_mlp(h_target_source)
         encoded.h_target = self.target_mlp(torch.cat([h_target_source, h_target], dim=-1))
@@ -2322,7 +2585,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
         pair_hidden_size = source_hidden_size + target_hidden_size
         self.target_head = layer_init(nn.Linear(pair_hidden_size, 1), 0.01)
 
-        self.source_value_head = layer_init(nn.Linear(1, 1), 1)
+        self.source_value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
         self.target_value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
 
 
@@ -2339,6 +2602,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
         substep = encoded.substep
         h_source0 = encoded.h_source0
         h_source1 = encoded.h_source1
+        h_source0_pooled = encoded.h_source0_pooled
         h_source0_batch_offset = encoded.h_source0_batch_offset
         h_source1_batch_offset = encoded.h_source1_batch_offset
         source_idx = encoded.source_idx
@@ -2371,8 +2635,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
             idx = h_source0_batch_offset[:-1, None] + cols
             logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
 
-            debug_zero = torch.zeros(B0, 1, device=device)
-            values[substep == 0] = self.source_value_head(debug_zero)
+            values[substep == 0] = self.source_value_head(h_source0_pooled)
 
         # SUBSTEP 1
         if B1 > 0:

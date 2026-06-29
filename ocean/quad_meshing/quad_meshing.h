@@ -14,7 +14,7 @@
 #include <math.h>
 #include <string.h>
 
-#define BENCHMARKING_ENABLED 1
+#define BENCHMARKING_ENABLED 0
 #define BENCHMARKING_PRINT_EVERY 100000ULL
 #include "benchmarking.h"
 
