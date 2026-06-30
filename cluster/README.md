@@ -134,7 +134,44 @@ puffer train quad_meshing --slowly --train.total-timesteps 16384
 The default image bakes in the source code and compiled backend. That is best
 for reproducible experiments.
 
-For debugging, you can mount a cluster checkout over the baked source:
+For fast iteration, keep using the same `.sif` and mount a cluster checkout over
+the baked source. The scripts below assume you submit from the checkout root, or
+set `SOURCE_DIR=/path/to/PufferLib`.
+
+Build only the mounted checkout's quad backend:
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif \
+sbatch cluster/slurm/dev_build_quad_meshing.run
+```
+
+Run training from the mounted checkout:
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif \
+WANDB_GROUP=quad_meshing_dev \
+sbatch cluster/slurm/dev_train_quad_meshing.run
+```
+
+Rebuild the backend at the start of the training job:
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif \
+BUILD_BACKEND=1 \
+WANDB_GROUP=quad_meshing_dev \
+sbatch cluster/slurm/dev_train_quad_meshing.run
+```
+
+Run a dev sweep. Request the same GPU count from Slurm and PufferLib:
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif \
+GPUS=4 \
+WANDB_GROUP=quad_meshing_dev_sweep \
+sbatch --gres=gpu:4 cluster/slurm/dev_sweep_quad_meshing.run
+```
+
+Equivalent raw Apptainer command:
 
 ```bash
 apptainer exec --nv \
@@ -145,6 +182,7 @@ apptainer exec --nv \
 
 This is convenient for iteration, but less reproducible. The mounted checkout
 must have a freshly built `pufferlib/_C*.so` matching the container environment.
+For final experiments, rebuild and pull a baked image tagged with the git commit.
 
 ## Notes
 
