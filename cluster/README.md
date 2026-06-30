@@ -180,6 +180,40 @@ WANDB_GROUP=quad_meshing_dev_sweep \
 sbatch --gres=gpu:4 cluster/slurm/dev_sweep_quad_meshing.run
 ```
 
+For a coordinated Protein sweep across multiple two-GPU nodes, use the
+distributed sweep worker. Put `SWEEP_DIR` on a shared filesystem such as
+`/scratch` for active runs or `/work` for longer retention. Do not use
+`/tmp/${SLURM_JOB_ID}` because it is local to one node.
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif \
+SOURCE_DIR=$PWD \
+SWEEP_DIR=/scratch/$USER/puffer_sweeps/quad_holiday_001 \
+WANDB_GROUP=quad_holiday_001 \
+PUFFER_ARGS="--dist-sweep-max-worker-trials 4" \
+sbatch --array=0-31%8 cluster/slurm/dev_dist_sweep_quad_meshing.run
+```
+
+Each array task requests one GPU and repeatedly reserves trials from the shared
+`state.json` under `SWEEP_DIR`. Slurm can place two one-GPU workers on each
+two-GPU node. `%8` caps concurrent workers; start with a modest value so Protein
+gets observations before too many future trials are reserved. Increase it once
+the sweep is running smoothly.
+
+Useful files in `SWEEP_DIR`:
+
+```text
+state.json      # shared sweep state: running/completed/failed trials
+checkpoints/    # checkpoints from completed non-sweep uploads are suppressed
+logs/           # per-run JSON logs
+wandb/          # W&B local files
+cache/triton/   # Triton JIT cache
+```
+
+If a worker dies while a trial is running, the trial remains in `running` until
+`--dist-sweep-stale-seconds` expires. The default is 48 hours. Set a larger value
+if your jobs can legitimately run longer.
+
 Equivalent raw Apptainer command:
 
 ```bash

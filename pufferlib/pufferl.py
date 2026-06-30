@@ -12,6 +12,9 @@ import ast
 import time
 import argparse
 import configparser
+import shutil
+import socket
+import uuid
 from collections import defaultdict
 import multiprocessing as mp
 from copy import deepcopy
@@ -336,6 +339,277 @@ def train(env_name, args=None, gpus=None, **kwargs):
             ctx.Process(target=_train, args=(env_name, worker_args),
                 kwargs=kwargs).start()
 
+def _jsonable(obj):
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items() if k != 'nccl_id'}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+def _acquire_sweep_lock(lock_dir, stale_seconds=600, sleep_seconds=1):
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            with open(os.path.join(lock_dir, 'owner.json'), 'w') as f:
+                json.dump({
+                    'host': socket.gethostname(),
+                    'pid': os.getpid(),
+                    'time': time.time(),
+                }, f)
+            return
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(lock_dir)
+                if age > stale_seconds:
+                    shutil.rmtree(lock_dir)
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(sleep_seconds)
+
+def _release_sweep_lock(lock_dir):
+    shutil.rmtree(lock_dir, ignore_errors=True)
+
+def _load_dist_sweep_state(path, env_name, max_runs):
+    if not os.path.exists(path):
+        return {
+            'version': 1,
+            'env_name': env_name,
+            'created_at': time.time(),
+            'next_trial_id': 0,
+            'max_runs': max_runs,
+            'running': {},
+            'completed': [],
+            'failed': [],
+        }
+
+    with open(path) as f:
+        state = json.load(f)
+    if state.get('env_name') != env_name:
+        raise ValueError(f'Sweep state is for {state.get("env_name")}, not {env_name}')
+    state.setdefault('running', {})
+    state.setdefault('completed', [])
+    state.setdefault('failed', [])
+    state.setdefault('next_trial_id', 0)
+    state['max_runs'] = max_runs
+    return state
+
+def _save_dist_sweep_state(path, state):
+    tmp = f'{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}'
+    with open(tmp, 'w') as f:
+        json.dump(_jsonable(state), f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+def _make_sweep_obj(args):
+    sweep_config = deepcopy(args['sweep'])
+    method = sweep_config.pop('method')
+    import pufferlib.sweep
+    try:
+        sweep_cls = getattr(pufferlib.sweep, method)
+    except AttributeError:
+        raise ValueError(f'Invalid sweep method {method}. See pufferlib.sweep')
+    return sweep_cls(sweep_config)
+
+def _replay_dist_sweep_observations(sweep_obj, state):
+    for trial in state.get('completed', []):
+        trial_args = trial['args']
+        for obs in trial.get('observations', []):
+            obs_args = deepcopy(trial_args)
+            obs_args['train']['total_timesteps'] = obs['timesteps']
+            sweep_obj.observe(obs_args, obs['score'], obs['cost'], is_failure=False)
+
+    for trial in state.get('failed', []):
+        if 'args' in trial:
+            sweep_obj.observe(trial['args'], 0, 0, is_failure=True)
+
+    # Suggestions are generated from a fresh Protein object each time. Preserve
+    # the global suggestion count so Sobol/random warmup advances across workers.
+    sweep_obj.suggestion_idx = max(sweep_obj.suggestion_idx, state.get('next_trial_id', 0) - 1)
+
+def _cleanup_stale_dist_trials(state, stale_seconds):
+    if stale_seconds <= 0:
+        return
+    now = time.time()
+    for trial_id, trial in list(state.get('running', {}).items()):
+        if now - trial.get('started_at', now) <= stale_seconds:
+            continue
+        trial = dict(trial)
+        trial['failed_at'] = now
+        trial['reason'] = 'stale_running_trial'
+        state['failed'].append(trial)
+        del state['running'][trial_id]
+
+def _existing_dist_inputs(state):
+    inputs = []
+    for trial in state.get('completed', []):
+        if 'input' in trial:
+            inputs.append(np.array(trial['input'], dtype=np.float64))
+    for trial in state.get('running', {}).values():
+        if 'input' in trial:
+            inputs.append(np.array(trial['input'], dtype=np.float64))
+    return inputs
+
+def _is_duplicate_dist_input(candidate, existing, threshold=1e-6):
+    if not existing:
+        return False
+    return min(np.linalg.norm(candidate - other) for other in existing) < threshold
+
+def _reserve_dist_trial(env_name, args, worker_id):
+    sweep_dir = args['sweep_dir']
+    state_path = os.path.join(sweep_dir, 'state.json')
+    lock_dir = os.path.join(sweep_dir, 'lock')
+    max_runs = args['sweep']['max_runs']
+
+    _acquire_sweep_lock(lock_dir)
+    try:
+        state = _load_dist_sweep_state(state_path, env_name, max_runs)
+        _cleanup_stale_dist_trials(state, args['dist_sweep_stale_seconds'])
+        if state['next_trial_id'] >= max_runs:
+            _save_dist_sweep_state(state_path, state)
+            return None, None
+
+        sweep_args = deepcopy(args)
+        sweep_args['sweep']['use_gpu'] = False
+        sweep_obj = _make_sweep_obj(sweep_args)
+        _replay_dist_sweep_observations(sweep_obj, state)
+
+        existing = _existing_dist_inputs(state)
+        trial_args = None
+        trial_input = None
+        trial_id = state['next_trial_id']
+        for attempt in range(32):
+            candidate = deepcopy(args)
+            candidate['sweep']['use_gpu'] = False
+            if trial_id > 0 or attempt > 0:
+                sweep_obj.suggest(candidate)
+            try:
+                validate_config(candidate)
+            except (AssertionError, ValueError) as e:
+                state['failed'].append({
+                    'trial_id': f'invalid_{trial_id}_{attempt}',
+                    'args': _jsonable(candidate),
+                    'reason': str(e),
+                    'failed_at': time.time(),
+                    'worker': worker_id,
+                })
+                sweep_obj.observe(candidate, 0, 0, is_failure=True)
+                continue
+
+            candidate_input = sweep_obj.hyperparameters.from_dict(candidate)
+            if _is_duplicate_dist_input(candidate_input, existing) and attempt < 31:
+                continue
+            trial_args = candidate
+            trial_input = candidate_input
+            break
+
+        if trial_args is None:
+            _save_dist_sweep_state(state_path, state)
+            return None, None
+
+        trial_key = f'{trial_id:06d}'
+        state['next_trial_id'] = trial_id + 1
+        state['running'][trial_key] = {
+            'trial_id': trial_key,
+            'args': _jsonable(trial_args),
+            'input': trial_input.tolist(),
+            'worker': worker_id,
+            'started_at': time.time(),
+        }
+        _save_dist_sweep_state(state_path, state)
+        return trial_key, trial_args
+    finally:
+        _release_sweep_lock(lock_dir)
+
+def _record_dist_trial(env_name, args, trial_id, trial_args, result):
+    sweep_dir = args['sweep_dir']
+    state_path = os.path.join(sweep_dir, 'state.json')
+    lock_dir = os.path.join(sweep_dir, 'lock')
+    max_runs = args['sweep']['max_runs']
+
+    _acquire_sweep_lock(lock_dir)
+    try:
+        state = _load_dist_sweep_state(state_path, env_name, max_runs)
+        running = state.get('running', {}).pop(trial_id, None)
+        _, scores, costs, timesteps = result
+        if not scores:
+            failed = running or {'trial_id': trial_id, 'args': _jsonable(trial_args)}
+            failed['failed_at'] = time.time()
+            failed['reason'] = 'training_failed_or_no_score'
+            state['failed'].append(failed)
+        else:
+            observations = [
+                {'score': float(s), 'cost': float(c), 'timesteps': int(t)}
+                for s, c, t in zip(scores, costs, timesteps)
+            ]
+            completed = running or {'trial_id': trial_id}
+            completed['args'] = _jsonable(trial_args)
+            completed['observations'] = observations
+            completed['finished_at'] = time.time()
+            state['completed'].append(completed)
+        _save_dist_sweep_state(state_path, state)
+    finally:
+        _release_sweep_lock(lock_dir)
+
+def distributed_sweep(env_name, args=None):
+    '''Shared-filesystem, lock-based distributed sweep worker.'''
+    args = args or load_config(env_name)
+    if not args.get('sweep_dir'):
+        raise ValueError('distsweep requires --sweep-dir /shared/path')
+
+    args['sweep_dir'] = os.path.abspath(args['sweep_dir'])
+    os.makedirs(args['sweep_dir'], exist_ok=True)
+    args['checkpoint_dir'] = os.path.join(args['sweep_dir'], 'checkpoints')
+    args['log_dir'] = os.path.join(args['sweep_dir'], 'logs')
+    os.makedirs(args['checkpoint_dir'], exist_ok=True)
+    os.makedirs(args['log_dir'], exist_ok=True)
+
+    worker_id = os.environ.get('SLURM_ARRAY_TASK_ID')
+    worker_id = f'{socket.gethostname()}:{os.getpid()}:{worker_id or uuid.uuid4().hex[:8]}'
+    max_worker_trials = args.get('dist_sweep_max_worker_trials', 1)
+    completed_here = 0
+
+    while max_worker_trials <= 0 or completed_here < max_worker_trials:
+        trial_id, trial_args = _reserve_dist_trial(env_name, args, worker_id)
+        if trial_id is None:
+            print('No distributed sweep trials left to reserve')
+            return
+
+        print(f'Reserved distributed sweep trial {trial_id}')
+        trial_args = deepcopy(trial_args)
+        trial_args['rank'] = 0
+        trial_args['world_size'] = 1
+        trial_args['gpu_id'] = 0
+        trial_args['nccl_id'] = b''
+        trial_args['train']['gpus'] = 1
+        trial_args['checkpoint_dir'] = args['checkpoint_dir']
+        trial_args['log_dir'] = args['log_dir']
+        trial_args['tag'] = f'dist_{trial_id}' if trial_args.get('tag') is None else f'{trial_args["tag"]},dist_{trial_id}'
+
+        sweep_snapshot = deepcopy(trial_args)
+        sweep_snapshot['sweep']['use_gpu'] = False
+        sweep_obj = _make_sweep_obj(sweep_snapshot)
+        state = _load_dist_sweep_state(os.path.join(args['sweep_dir'], 'state.json'), env_name, args['sweep']['max_runs'])
+        _replay_dist_sweep_observations(sweep_obj, state)
+
+        result_queue = mp.get_context('spawn').Queue()
+        try:
+            _train(env_name, trial_args, sweep_obj=sweep_obj, result_queue=result_queue, verbose=True)
+            result = result_queue.get(timeout=5)
+        except Exception as e:
+            print(f'WARNING: distributed sweep trial {trial_id} failed: {e}')
+            result = (0, None, None, None)
+
+        _record_dist_trial(env_name, args, trial_id, trial_args, result)
+        completed_here += 1
+        time.sleep(args.get('dist_sweep_sleep', 0))
+
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
@@ -440,6 +714,14 @@ def load_config(env_name):
     parser.add_argument('--wandb-group', type=str, default='debug')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
+    parser.add_argument('--sweep-dir', type=str, default=None,
+        help='Shared directory for lock-based distributed sweeps')
+    parser.add_argument('--dist-sweep-stale-seconds', type=int, default=48*3600,
+        help='Mark running distributed sweep trials stale after this many seconds. <=0 disables cleanup')
+    parser.add_argument('--dist-sweep-max-worker-trials', type=int, default=1,
+        help='Number of distributed sweep trials this worker should run. <=0 runs until no trials remain')
+    parser.add_argument('--dist-sweep-sleep', type=float, default=0.0,
+        help='Seconds to sleep between distributed sweep trials')
     parser.add_argument('--save-frames', type=int, default=0)
     parser.add_argument('--gif-path', type=str, default='eval.gif')
     parser.add_argument('--fps', type=float, default=15)
@@ -496,7 +778,7 @@ def load_config(env_name):
     return dict(args)
 
 def main():
-    err = 'Usage: puffer [train, eval, sweep, paretosweep] [env_name] [optional args]. --help for more info'
+    err = 'Usage: puffer [train, eval, sweep, paretosweep, distsweep] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
         raise ValueError(err)
 
@@ -508,6 +790,8 @@ def main():
         train(env_name=env_name, args=args)
     elif 'eval' in mode:
         eval(env_name=env_name, args=args)
+    elif mode == 'distsweep':
+        distributed_sweep(env_name=env_name, args=args)
     elif 'sweep' in mode:
         sweep(env_name=env_name, args=args, pareto='pareto' in mode)
     else:

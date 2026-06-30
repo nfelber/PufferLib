@@ -1,0 +1,46 @@
+#!/bin/bash -l
+
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --partition=gpu
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+#SBATCH --job-name=puffer-quad-dist-sweep
+#SBATCH --output=slurm-%x-%A_%a.out
+
+set -euo pipefail
+
+IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_cu121.sif}
+SOURCE_DIR=${SOURCE_DIR:-$PWD}
+SWEEP_DIR=${SWEEP_DIR:?Set SWEEP_DIR to a shared path, e.g. /scratch/$USER/puffer_sweeps/quad_meshing}
+WANDB_GROUP=${WANDB_GROUP:-quad_meshing_dist_sweep}
+BUILD_BACKEND=${BUILD_BACKEND:-0}
+PUFFER_ARGS=${PUFFER_ARGS:-}
+
+mkdir -p "$SWEEP_DIR" "$SWEEP_DIR/wandb" "$SWEEP_DIR/cache" "$SWEEP_DIR/cache/triton"
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export APPTAINERENV_WANDB_DIR=/sweep/wandb
+export APPTAINERENV_WANDB_CACHE_DIR=/sweep/cache/wandb
+export APPTAINERENV_XDG_CACHE_HOME=/sweep/cache
+export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+export APPTAINERENV_CC=/usr/bin/gcc
+export APPTAINERENV_CXX=/usr/bin/g++
+export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include
+export APPTAINERENV_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+export APPTAINERENV_TRITON_CACHE_DIR=/sweep/cache/triton
+export SINGULARITYENV_CC=/usr/bin/gcc
+export SINGULARITYENV_CXX=/usr/bin/g++
+export SINGULARITYENV_CUDAHOSTCXX=/usr/bin/g++
+export SINGULARITYENV_CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include
+export SINGULARITYENV_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+export SINGULARITYENV_TRITON_CACHE_DIR=/sweep/cache/triton
+
+srun apptainer exec --nv \
+    --bind "$SOURCE_DIR:/workspace/PufferLib" \
+    --bind "$SWEEP_DIR:/sweep" \
+    "$IMAGE" \
+    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR=/sweep/cache/triton && cd /workspace/PufferLib && if [ '$BUILD_BACKEND' = '1' ]; then NVCC_ARCH=sm_70 bash build.sh quad_meshing --float; fi && puffer distsweep quad_meshing --slowly --wandb --wandb-group '$WANDB_GROUP' --sweep-dir /sweep $PUFFER_ARGS"
