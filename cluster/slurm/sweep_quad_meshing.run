@@ -1,0 +1,33 @@
+#!/bin/bash -l
+
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --partition=gpu
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+#SBATCH --job-name=puffer-quad-sweep
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+
+IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_latest.sif}
+WANDB_GROUP=${WANDB_GROUP:-quad_meshing_sweep}
+WORKDIR=${WORKDIR:-$PWD}
+OUTPUT_DIR=${OUTPUT_DIR:-$WORKDIR/cluster_runs}
+GPUS=${GPUS:-${SLURM_GPUS_ON_NODE:-1}}
+PUFFER_ARGS=${PUFFER_ARGS:-}
+
+mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/checkpoints" "$OUTPUT_DIR/logs" "$OUTPUT_DIR/wandb" "$OUTPUT_DIR/cache"
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export APPTAINERENV_WANDB_DIR=/outputs/wandb
+export APPTAINERENV_WANDB_CACHE_DIR=/outputs/cache/wandb
+export APPTAINERENV_XDG_CACHE_HOME=/outputs/cache
+export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+
+srun apptainer exec --nv \
+    --bind "$OUTPUT_DIR:/outputs" \
+    "$IMAGE" \
+    bash -lc "cd /workspace/PufferLib && puffer sweep quad_meshing --slowly --wandb --wandb-group '$WANDB_GROUP' --sweep.gpus '$GPUS' --checkpoint-dir /outputs/checkpoints --log-dir /outputs/logs $PUFFER_ARGS"

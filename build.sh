@@ -99,6 +99,14 @@ RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
 INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
 LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
+EXTRA_CFLAGS_ARR=()
+EXTRA_LDFLAGS_ARR=()
+if [ -n "$EXTRA_CFLAGS" ]; then
+    read -r -a EXTRA_CFLAGS_ARR <<< "$EXTRA_CFLAGS"
+fi
+if [ -n "$EXTRA_LDFLAGS" ]; then
+    read -r -a EXTRA_LDFLAGS_ARR <<< "$EXTRA_LDFLAGS"
+fi
 
 if [ "$ENV" = "constellation" ]; then
     SRC_DIR="constellation"
@@ -141,7 +149,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "$SRC_DIR/$ENV.c" $EXTRA_SRC -o "$OUTPUT_NAME"
         "${LINK_ARCHIVES[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        "$EXTRA_LDFLAGS"
+        "${EXTRA_LDFLAGS_ARR[@]}"
         -lm -lpthread -fopenmp
         -DPLATFORM_DESKTOP
     )
@@ -241,7 +249,7 @@ if [ ! -f "$BINDING_SRC" ]; then
 fi
 
 echo "Compiling static library for $ENV..."
-${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
+${CC:-clang} -c "${CLANG_OPT[@]}" "${EXTRA_CFLAGS_ARR[@]}" \
     -I. -Isrc -I$SRC_DIR -Ivendor \
     -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
@@ -277,7 +285,7 @@ if [ -z "$MODE" ]; then
 
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o "$STATIC_LIB" "$RAYLIB_A" "$EXTRA_LDFLAGS"
+        build/bindings.o "$STATIC_LIB" "$RAYLIB_A" "${EXTRA_LDFLAGS_ARR[@]}"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
@@ -302,7 +310,7 @@ elif [ "$MODE" = "cpu" ]; then
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A" "${EXTRA_LDFLAGS_ARR[@]}"
         -lm -lpthread $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"

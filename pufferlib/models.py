@@ -1673,37 +1673,181 @@ class PerceiverSelfAttentionBlock(nn.Module):
         return x + self.mlp(self.norm_mlp(x))
 
 
-class SourceEdgePerceiverEncoder(nn.Module):
+@dataclass
+class FrontierState:
+    graph: CSRGraph
+    node_features: torch.Tensor       # [N, node_dim]
+    edge_features: torch.Tensor       # [E, edge_dim]
+    context_features: torch.Tensor    # [B, context_dim] or empty
+
+
+class FrontierInitStage(nn.Module):
     def __init__(
         self,
-        source_hidden_size,
+        node_hidden_size,
+        edge_hidden_size,
         pos_bands,
+        n_neighbors=3,
+        node_position=True,
+        node_ring=False,
+        edge_midpoint=True,
+        edge_length=True,
+        edge_direction=True,
+        edge_flags=True,
+        eps=1e-8,
+    ):
+        super().__init__()
+        self.node_hidden_size = node_hidden_size
+        self.edge_hidden_size = edge_hidden_size
+        self.n_neighbors = n_neighbors
+        self.node_position = node_position
+        self.node_ring = node_ring
+        self.edge_midpoint = edge_midpoint
+        self.edge_length = edge_length
+        self.edge_direction = edge_direction
+        self.edge_flags = edge_flags
+        self.eps = eps
+        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+
+        node_in_dim = 0
+        if node_position:
+            node_in_dim += self.pos_encoder.out_dim
+        if node_ring:
+            node_in_dim += 2 + 2 * n_neighbors * 3
+
+        edge_in_dim = 0
+        if edge_midpoint:
+            edge_in_dim += self.pos_encoder.out_dim
+        if edge_length:
+            edge_in_dim += 1
+        if edge_direction:
+            edge_in_dim += 2
+        if edge_flags:
+            edge_in_dim += 2
+
+        self.node_proj = layer_init(nn.Linear(node_in_dim, node_hidden_size)) if node_in_dim > 0 else None
+        self.edge_proj = layer_init(nn.Linear(edge_in_dim, edge_hidden_size)) if edge_in_dim > 0 else None
+        self.node_initial = nn.Parameter(torch.zeros(node_hidden_size))
+        self.edge_initial = nn.Parameter(torch.zeros(edge_hidden_size))
+
+    @staticmethod
+    def _canonical_direction(delta, length, eps):
+        direction = delta / length.clamp_min(eps)
+        flip = (direction[:, 1] < 0) | ((direction[:, 1] == 0) & (direction[:, 0] < 0))
+        return torch.where(flip.unsqueeze(-1), -direction, direction)
+
+    def _node_features(self, graph):
+        parts = []
+        if self.node_position:
+            parts.append(self.pos_encoder(graph.vertices))
+        if self.node_ring:
+            with nvtx_range("compute_ring_source_features"):
+                parts.append(compute_ring_source_features(graph, self.n_neighbors))
+        if not parts:
+            return self.node_initial.unsqueeze(0).expand(graph.vertices.size(0), -1)
+        return self.node_proj(torch.cat(parts, dim=-1))
+
+    def _edge_features(self, graph):
+        src = graph.edges[0]
+        dst = graph.edges[1]
+        parts = []
+        p0 = graph.vertices[src]
+        p1 = graph.vertices[dst]
+        delta = p1 - p0
+        length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+
+        if self.edge_midpoint:
+            parts.append(self.pos_encoder(0.5 * (p0 + p1)))
+        if self.edge_length:
+            parts.append(length)
+        if self.edge_direction:
+            parts.append(self._canonical_direction(delta, length, self.eps))
+        if self.edge_flags:
+            parts.append(graph.edge_features.to(dtype=graph.vertices.dtype))
+
+        if not parts:
+            return self.edge_initial.unsqueeze(0).expand(graph.edges.size(1), -1)
+        return self.edge_proj(torch.cat(parts, dim=-1))
+
+    def forward(self, state):
+        graph = state.graph
+        return FrontierState(
+            graph=graph,
+            node_features=self._node_features(graph),
+            edge_features=self._edge_features(graph),
+            context_features=graph.vertices.new_empty(0, 0),
+        )
+
+
+class SE2FrontierStage(nn.Module):
+    def __init__(self, node_hidden_size, edge_hidden_size, num_layers=2):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("frontier_se2_layers must be at least 1.")
+        self.layers = nn.ModuleList([
+            SE2AngleMessagePassing(
+                node_dim=node_hidden_size,
+                out_dim=node_hidden_size,
+                msg_dim=node_hidden_size,
+                edge_cont_dim=edge_hidden_size,
+                hidden_dim=node_hidden_size,
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, state):
+        h = state.node_features
+        for layer in self.layers:
+            with nvtx_range("se2_frontier_message_passing"):
+                h = layer(
+                    h,
+                    state.graph.vertices,
+                    state.graph.edges,
+                    state.graph.edge_ptr,
+                    edge_cont=state.edge_features,
+                )
+        return FrontierState(state.graph, h, state.edge_features, state.context_features)
+
+
+class FrontierPerceiverStage(nn.Module):
+    def __init__(
+        self,
+        node_hidden_size,
+        edge_hidden_size,
+        context_hidden_size,
         d_model=None,
         num_latents=32,
         num_layers=2,
         num_heads=4,
         mlp_ratio=4,
         dropout=0.0,
-        eps=1e-8,
+        decode_node=True,
+        decode_edge=False,
+        update_context=True,
     ):
         super().__init__()
-        d_model = source_hidden_size if d_model is None else d_model
+        d_model = context_hidden_size if d_model is None else d_model
         if num_latents < 1:
-            raise ValueError("perceiver_num_latents must be at least 1.")
+            raise ValueError("frontier_perceiver_num_latents must be at least 1.")
         if num_layers < 1:
-            raise ValueError("perceiver_layers must be at least 1.")
+            raise ValueError("frontier_perceiver_layers must be at least 1.")
         if d_model % num_heads != 0:
-            raise ValueError("perceiver_d_model must be divisible by perceiver_heads.")
+            raise ValueError("frontier_perceiver_d_model must be divisible by frontier_perceiver_heads.")
 
-        self.source_hidden_size = source_hidden_size
+        self.node_hidden_size = node_hidden_size
+        self.edge_hidden_size = edge_hidden_size
+        self.context_hidden_size = context_hidden_size
         self.d_model = d_model
-        self.eps = eps
-        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+        self.decode_node = decode_node
+        self.decode_edge = decode_edge
+        self.update_context = update_context
 
-        edge_in_dim = self.pos_encoder.out_dim + 3  # midpoint PE + length + canonical direction
-        self.edge_proj = layer_init(nn.Linear(edge_in_dim, d_model))
-        self.query_proj = layer_init(nn.Linear(self.pos_encoder.out_dim, d_model))
-        self.out_proj = layer_init(nn.Linear(d_model, source_hidden_size))
+        self.edge_input_proj = layer_init(nn.Linear(edge_hidden_size, d_model))
+        self.node_query_proj = layer_init(nn.Linear(node_hidden_size, d_model))
+        self.edge_query_proj = layer_init(nn.Linear(edge_hidden_size, d_model))
+        self.node_out_proj = layer_init(nn.Linear(d_model, node_hidden_size))
+        self.edge_out_proj = layer_init(nn.Linear(d_model, edge_hidden_size))
+        self.context_proj = layer_init(nn.Linear(d_model, context_hidden_size))
 
         self.latents = nn.Parameter(torch.empty(num_latents, d_model))
         self.null_edge = nn.Parameter(torch.zeros(d_model))
@@ -1720,12 +1864,6 @@ class SourceEdgePerceiverEncoder(nn.Module):
     @staticmethod
     def _batch_index_from_offsets(indices, offsets):
         return torch.searchsorted(offsets[1:], indices, right=True)
-
-    @staticmethod
-    def _canonical_direction(delta, length, eps):
-        direction = delta / length.clamp_min(eps)
-        flip = (direction[:, 1] < 0) | ((direction[:, 1] == 0) & (direction[:, 0] < 0))
-        return torch.where(flip.unsqueeze(-1), -direction, direction)
 
     @staticmethod
     def _pad_by_batch(values, batch_idx, counts, fill_value=0.0, add_null=False, null_value=None):
@@ -1757,32 +1895,32 @@ class SourceEdgePerceiverEncoder(nn.Module):
         mask[batch_idx, pos] = False
         return out, mask
 
-    def _edge_tokens(self, graph):
+    def _undirected_edge_tokens(self, state):
+        graph = state.graph
         src = graph.edges[0]
         dst = graph.edges[1]
         keep = src < dst
-        src = src[keep]
-        dst = dst[keep]
+        edge_src = src[keep]
+        if edge_src.numel() == 0:
+            return state.edge_features.new_empty(0, self.d_model), edge_src
+        return self.edge_input_proj(state.edge_features[keep]), edge_src
 
-        if src.numel() == 0:
-            return graph.vertices.new_empty(0, self.d_model), src
+    def _decode_packed(self, queries, query_batch, counts, latents, out_proj):
+        padded_queries, _ = self._pad_by_batch(queries, query_batch, counts)
+        decoded = self.query_cross_attn(padded_queries, latents)
+        offsets = torch.empty(counts.numel() + 1, dtype=torch.long, device=queries.device)
+        offsets[0] = 0
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        pos = torch.arange(queries.size(0), device=queries.device) - offsets[query_batch]
+        return out_proj(decoded[query_batch, pos])
 
-        p0 = graph.vertices[src]
-        p1 = graph.vertices[dst]
-        delta = p1 - p0
-        length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
-        direction = self._canonical_direction(delta, length, self.eps)
-        midpoint = 0.5 * (p0 + p1)
-        encoded_midpoint = self.pos_encoder(midpoint)
-        edge_features = torch.cat([encoded_midpoint, length, direction], dim=-1)
-        return self.edge_proj(edge_features), src
-
-    def forward(self, graph):
+    def forward(self, state):
+        graph = state.graph
         B = graph.batch_offsets.numel() - 1
-        if graph.vertices.numel() == 0:
-            return graph.vertices.new_empty(0, self.source_hidden_size)
+        if B == 0:
+            return state
 
-        edge_tokens, edge_src = self._edge_tokens(graph)
+        edge_tokens, edge_src = self._undirected_edge_tokens(state)
         vertex_counts = graph.batch_offsets[1:] - graph.batch_offsets[:-1]
 
         if edge_src.numel() == 0:
@@ -1805,19 +1943,30 @@ class SourceEdgePerceiverEncoder(nn.Module):
         for block in self.blocks:
             latents = block(latents)
 
-        vertex_batch = torch.repeat_interleave(
+        node_features = state.node_features
+        edge_features = state.edge_features
+        context_features = state.context_features
+        if self.update_context:
+            context_features = self.context_proj(latents.mean(dim=1))
+
+        node_batch = torch.repeat_interleave(
             torch.arange(B, device=graph.vertices.device), vertex_counts
         )
-        vertex_queries = self.query_proj(self.pos_encoder(graph.vertices))
-        padded_queries, _ = self._pad_by_batch(vertex_queries, vertex_batch, vertex_counts)
-        decoded = self.query_cross_attn(padded_queries, latents)
+        if self.decode_node and state.node_features.numel() > 0:
+            node_queries = self.node_query_proj(state.node_features)
+            node_features = self._decode_packed(
+                node_queries, node_batch, vertex_counts, latents, self.node_out_proj
+            )
 
-        offsets = torch.empty(B + 1, dtype=torch.long, device=graph.vertices.device)
-        offsets[0] = 0
-        offsets[1:] = torch.cumsum(vertex_counts, dim=0)
-        pos = torch.arange(graph.vertices.size(0), device=graph.vertices.device) - offsets[vertex_batch]
-        decoded = decoded[vertex_batch, pos]
-        return self.out_proj(decoded)
+        if self.decode_edge and state.edge_features.numel() > 0:
+            edge_batch = self._batch_index_from_offsets(graph.edges[0], graph.batch_offsets)
+            edge_counts = torch.bincount(edge_batch, minlength=B)
+            edge_queries = self.edge_query_proj(state.edge_features)
+            edge_features = self._decode_packed(
+                edge_queries, edge_batch, edge_counts, latents, self.edge_out_proj
+            )
+
+        return FrontierState(graph, node_features, edge_features, context_features)
 
 
 @triton.jit
@@ -2250,9 +2399,9 @@ def distance_to_graph_edges(
 @dataclass
 class QuadMeshEncoding:
     substep: torch.Tensor                    # [B] substep per agent
-    h_source0: torch.Tensor                  # [total_nodes0, source_hidden_size], source vertex hidden states (substep 0)
-    h_source1: torch.Tensor                  # [total_nodes1, source_hidden_size], source vertex hidden states (substep 1)
-    h_source0_pooled: torch.Tensor           # [B0, source_hidden_size], mean-pooled source hidden states (substep 0)
+    h_source0: torch.Tensor                  # [total_nodes0, frontier_node_hidden_size], source vertex hidden states (substep 0)
+    h_source1: torch.Tensor                  # [total_nodes1, frontier_node_hidden_size], source vertex hidden states (substep 1)
+    h_source0_context: torch.Tensor          # [B0, frontier_context_hidden_size], per-agent source context for substep 0 critic
     h_source0_batch_offset: torch.Tensor     # [B0 + 1] h_source offsets per agent (substep 0)
     h_source1_batch_offset: torch.Tensor     # [B1 + 1] h_source offsets per agent (substep 1)
     source_idx: torch.Tensor                 # [B1] source index (substep 1)
@@ -2266,12 +2415,12 @@ class QuadMeshingBoundaryEncoder(nn.Module):
     Boundary-aware encoder for quad_meshing in boundary mode.
 
     Args:
-        source_hidden_size: Dimension of hidden source embeddings
+        frontier_node_hidden_size: Dimension of per-frontier-vertex embeddings
+        frontier_edge_hidden_size: Dimension of per-frontier-edge embeddings
+        frontier_context_hidden_size: Dimension of per-observation frontier context embeddings
         target_hidden_size: Dimension of hidden target embeddings
         pos_bands: Number of Fourier frequency bands
-        n_neighbors: Number of boundary neighbors to embed in each direction
-        source_encoder_type: "ring" for handcrafted ring features, "se2" for SE(2) angle message passing,
-            or "perceiver" for Perceiver-style edge-token source encoding
+        frontier_pipeline: Ordered list of frontier stages, e.g. ["init", "perceiver", "se2"]
     """
 
     def __init__(
@@ -2280,18 +2429,29 @@ class QuadMeshingBoundaryEncoder(nn.Module):
             max_frontier=1024,
             max_degree=24,
             max_candidates=1024,
-            source_hidden_size=128,
+            frontier_node_hidden_size=128,
+            frontier_edge_hidden_size=128,
+            frontier_context_hidden_size=128,
             target_hidden_size=128,
             pos_bands=6,
             n_neighbors=3,
-            source_encoder_type="ring",
-            se2_source_layers=2,
-            perceiver_num_latents=32,
-            perceiver_layers=2,
-            perceiver_heads=4,
-            perceiver_mlp_ratio=4,
-            perceiver_dropout=0.0,
-            perceiver_d_model=None,
+            frontier_pipeline=("init",),
+            frontier_init_node_position=True,
+            frontier_init_node_ring=False,
+            frontier_init_edge_midpoint=True,
+            frontier_init_edge_length=True,
+            frontier_init_edge_direction=True,
+            frontier_init_edge_flags=True,
+            frontier_se2_layers=2,
+            frontier_perceiver_num_latents=32,
+            frontier_perceiver_layers=2,
+            frontier_perceiver_heads=4,
+            frontier_perceiver_mlp_ratio=4,
+            frontier_perceiver_dropout=0.0,
+            frontier_perceiver_d_model=None,
+            frontier_perceiver_decode_node=True,
+            frontier_perceiver_decode_edge=False,
+            frontier_perceiver_update_context=True,
             **kwargs
     ):
         super().__init__()
@@ -2300,76 +2460,77 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         self.max_degree = max_degree
         self.max_candidates = max_candidates
 
-        self.source_hidden_size = source_hidden_size
+        self.frontier_node_hidden_size = frontier_node_hidden_size
+        self.frontier_edge_hidden_size = frontier_edge_hidden_size
+        self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
         self.n_neighbors = n_neighbors
-        self.source_encoder_type = source_encoder_type
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
-        if source_encoder_type == "ring":
-            # Use same embedding for source selection and source observation
-            self.source_encoder = layer_init(nn.Linear(
-                in_features=2 + 2 * n_neighbors * 3,  # cos_sin(2) + 2 * n_neighbors * (cos_sin(2) + edge_length(1))
-                out_features=source_hidden_size,
-            ))
-        elif source_encoder_type == "se2":
-            if se2_source_layers < 1:
-                raise ValueError("se2_source_layers must be at least 1.")
-            self.source_initial = nn.Parameter(torch.zeros(source_hidden_size))
-            self.source_message_passing = nn.ModuleList([
-                SE2AngleMessagePassing(
-                    node_dim=source_hidden_size,
-                    out_dim=source_hidden_size,
-                    msg_dim=source_hidden_size,
-                    edge_cont_dim=3,
-                    hidden_dim=source_hidden_size,
-                )
-                for _ in range(se2_source_layers)
-            ])
-        elif source_encoder_type == "perceiver":
-            self.source_perceiver = SourceEdgePerceiverEncoder(
-                source_hidden_size=source_hidden_size,
-                pos_bands=pos_bands,
-                d_model=perceiver_d_model,
-                num_latents=perceiver_num_latents,
-                num_layers=perceiver_layers,
-                num_heads=perceiver_heads,
-                mlp_ratio=perceiver_mlp_ratio,
-                dropout=perceiver_dropout,
-            )
-        else:
-            raise ValueError("source_encoder_type must be 'ring', 'se2', or 'perceiver'.")
+        if isinstance(frontier_pipeline, str):
+            frontier_pipeline = [stage.strip() for stage in frontier_pipeline.split(",") if stage.strip()]
+        self.frontier_pipeline_names = tuple(frontier_pipeline)
+        if not self.frontier_pipeline_names:
+            raise ValueError("frontier_pipeline must contain at least one stage.")
+        if self.frontier_pipeline_names[0] != "init":
+            raise ValueError("frontier_pipeline must start with 'init'.")
+
+        stages = []
+        for stage in self.frontier_pipeline_names:
+            if stage == "init":
+                stages.append(FrontierInitStage(
+                    node_hidden_size=frontier_node_hidden_size,
+                    edge_hidden_size=frontier_edge_hidden_size,
+                    pos_bands=pos_bands,
+                    n_neighbors=n_neighbors,
+                    node_position=frontier_init_node_position,
+                    node_ring=frontier_init_node_ring,
+                    edge_midpoint=frontier_init_edge_midpoint,
+                    edge_length=frontier_init_edge_length,
+                    edge_direction=frontier_init_edge_direction,
+                    edge_flags=frontier_init_edge_flags,
+                ))
+            elif stage == "perceiver":
+                stages.append(FrontierPerceiverStage(
+                    node_hidden_size=frontier_node_hidden_size,
+                    edge_hidden_size=frontier_edge_hidden_size,
+                    context_hidden_size=frontier_context_hidden_size,
+                    d_model=frontier_perceiver_d_model,
+                    num_latents=frontier_perceiver_num_latents,
+                    num_layers=frontier_perceiver_layers,
+                    num_heads=frontier_perceiver_heads,
+                    mlp_ratio=frontier_perceiver_mlp_ratio,
+                    dropout=frontier_perceiver_dropout,
+                    decode_node=frontier_perceiver_decode_node,
+                    decode_edge=frontier_perceiver_decode_edge,
+                    update_context=frontier_perceiver_update_context,
+                ))
+            elif stage == "se2":
+                stages.append(SE2FrontierStage(
+                    node_hidden_size=frontier_node_hidden_size,
+                    edge_hidden_size=frontier_edge_hidden_size,
+                    num_layers=frontier_se2_layers,
+                ))
+            else:
+                raise ValueError(f"Unknown frontier stage: {stage!r}.")
+        self.frontier_pipeline = nn.ModuleList(stages)
 
         self.target_encoder = layer_init(nn.Linear(
             in_features=self.pos_encoder.out_dim + 2,  # (4*bands+2) + dist(1) + is_boundary(1)
             out_features=target_hidden_size,
         ))
 
-    def _compute_se2_edge_cont(self, graph: CSRGraph):
-        src = graph.edges[0]
-        dst = graph.edges[1]
-        lengths = torch.linalg.vector_norm(graph.vertices[dst] - graph.vertices[src], dim=-1, keepdim=True)
-        flags = graph.edge_features.to(dtype=graph.vertices.dtype)
-        return torch.cat([lengths, flags], dim=-1)
-
     def _encode_sources(self, graph: CSRGraph):
-        if self.source_encoder_type == "ring":
-            with nvtx_range("compute_ring_source_features"):
-                source_features = compute_ring_source_features(graph, self.n_neighbors)
-            with nvtx_range("source_encoder"):
-                return self.source_encoder(source_features)
-
-        if self.source_encoder_type == "perceiver":
-            with nvtx_range("source_edge_perceiver_encoder"):
-                return self.source_perceiver(graph)
-
-        with nvtx_range("compute_se2_edge_cont"):
-            edge_cont = self._compute_se2_edge_cont(graph)
-        h = self.source_initial.unsqueeze(0).expand(graph.vertices.size(0), -1)
-        for layer in self.source_message_passing:
-            with nvtx_range("se2_source_message_passing"):
-                h = layer(h, graph.vertices, graph.edges, graph.edge_ptr, edge_cont=edge_cont)
-        return h
+        state = FrontierState(
+            graph=graph,
+            node_features=graph.vertices.new_empty(0, self.frontier_node_hidden_size),
+            edge_features=graph.vertices.new_empty(0, self.frontier_edge_hidden_size),
+            context_features=graph.vertices.new_empty(0, self.frontier_context_hidden_size),
+        )
+        for name, stage in zip(self.frontier_pipeline_names, self.frontier_pipeline):
+            with nvtx_range(f"frontier_stage_{name}"):
+                state = stage(state)
+        return state.node_features, state.context_features
 
 
     def forward(self, obs) -> QuadMeshEncoding:
@@ -2407,10 +2568,11 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            h_source0 = self._encode_sources(graph)
+            h_source0, h_source0_context = self._encode_sources(graph)
             h_source0_batch_offset = graph.batch_offsets
         else:
-            h_source0 = torch.empty(0, self.source_hidden_size, device=device)
+            h_source0 = torch.empty(0, self.frontier_node_hidden_size, device=device)
+            h_source0_context = torch.empty(0, self.frontier_context_hidden_size, device=device)
             h_source0_batch_offset = torch.zeros(1, device=device)
 
 
@@ -2429,7 +2591,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            h_source1 = self._encode_sources(graph)
+            h_source1, _ = self._encode_sources(graph)
             h_source1_batch_offset = graph.batch_offsets
 
             source_idx = targets.source_idx
@@ -2472,10 +2634,10 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                 h_target = self.target_encoder(target_features)
             h_target_batch_offset = targets.target_batch_offsets
         else:
-            h_source1 = torch.empty(0, self.source_hidden_size, device=device)
+            h_source1 = torch.empty(0, self.frontier_node_hidden_size, device=device)
             h_source1_batch_offset = torch.zeros(1, device=device)
             source_idx = torch.empty(0, device=device)
-            h_target_source = torch.empty(0, self.source_hidden_size, device=device)
+            h_target_source = torch.empty(0, self.frontier_node_hidden_size, device=device)
             h_target = torch.empty(0, self.target_encoder.out_features, device=device)
             h_target_batch_offset = torch.zeros(1, device=device)
 
@@ -2483,7 +2645,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
             substep=substep,
             h_source0=h_source0,
             h_source1=h_source1,
-            h_source0_pooled=torch.empty(0, self.source_hidden_size, device=device),
+            h_source0_context=h_source0_context,
             h_source0_batch_offset=h_source0_batch_offset,
             h_source1_batch_offset=h_source1_batch_offset,
             source_idx=source_idx,
@@ -2501,19 +2663,50 @@ class QuadMeshingBoundaryNetwork(nn.Module):
     produce per-target scores and a per-agent value estimate.
 
     Args:
-        source_hidden_size: Dimension of hidden source embeddings
+        frontier_node_hidden_size: Dimension of per-frontier-vertex embeddings
+        frontier_context_hidden_size: Dimension of per-observation frontier context embeddings
         target_hidden_size: Dimension of hidden target embeddings
         num_layers: Number of MLP layers
     """
 
-    def __init__(self, source_hidden_size, target_hidden_size, num_layers=2, **kwargs):
+    def __init__(
+        self,
+        frontier_node_hidden_size,
+        target_hidden_size,
+        frontier_context_hidden_size=None,
+        num_layers=2,
+        **kwargs,
+    ):
         super().__init__()
-        self.source_hidden_size = source_hidden_size
+        if frontier_context_hidden_size is None:
+            frontier_context_hidden_size = frontier_node_hidden_size
+        self.frontier_node_hidden_size = frontier_node_hidden_size
+        self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
 
-        self.source_mlp = _MLP(source_hidden_size, source_hidden_size, source_hidden_size, num_layers, final_activation=True)
+        self.source_mlp = _MLP(
+            frontier_node_hidden_size,
+            frontier_node_hidden_size,
+            frontier_node_hidden_size,
+            num_layers,
+            final_activation=True,
+        )
+        self.source_pool_context_mlp = _MLP(
+            frontier_node_hidden_size,
+            frontier_context_hidden_size,
+            frontier_context_hidden_size,
+            num_layers,
+            final_activation=True,
+        )
+        self.source_context_mlp = _MLP(
+            frontier_context_hidden_size,
+            frontier_context_hidden_size,
+            frontier_context_hidden_size,
+            num_layers,
+            final_activation=True,
+        )
 
-        pair_hidden_size = source_hidden_size + target_hidden_size
+        pair_hidden_size = frontier_node_hidden_size + target_hidden_size
         self.target_mlp = _MLP(pair_hidden_size, pair_hidden_size, pair_hidden_size, num_layers, final_activation=True)
 
 
@@ -2542,14 +2735,19 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         """
         h_source0 = encoded.h_source0
         h_source1 = encoded.h_source1
+        h_source0_context = encoded.h_source0_context
         h_target_source = encoded.h_target_source
         h_target = encoded.h_target
 
         encoded.h_source0 = self.source_mlp(h_source0)
-        encoded.h_source0_pooled = self._mean_pool_by_offsets(
-            encoded.h_source0,
-            encoded.h_source0_batch_offset,
-        )
+        if h_source0_context.numel() == 0:
+            pooled = self._mean_pool_by_offsets(
+                encoded.h_source0,
+                encoded.h_source0_batch_offset,
+            )
+            encoded.h_source0_context = self.source_pool_context_mlp(pooled)
+        else:
+            encoded.h_source0_context = self.source_context_mlp(h_source0_context)
         encoded.h_source1 = self.source_mlp(h_source1)
         encoded.h_target_source = self.source_mlp(h_target_source)
         encoded.h_target = self.target_mlp(torch.cat([h_target_source, h_target], dim=-1))
@@ -2570,23 +2768,34 @@ class QuadMeshingBoundaryDecoder(nn.Module):
 
     Args:
         nvec: Number of action dimensions (always [2] for source/target)
-        source_hidden_size: Dimension of hidden source embeddings
+        frontier_node_hidden_size: Dimension of per-frontier-vertex embeddings
+        frontier_context_hidden_size: Dimension of per-observation frontier context embeddings
         target_hidden_size: Dimension of hidden target embeddings
     """
-    def __init__(self, act_sizes, source_hidden_size, target_hidden_size, **kwargs):
+    def __init__(
+        self,
+        act_sizes,
+        frontier_node_hidden_size,
+        target_hidden_size,
+        frontier_context_hidden_size=None,
+        **kwargs,
+    ):
         super().__init__()
         assert len(act_sizes) == 1, "QuadMeshingBoundaryDecoder expects nvec=[1]"
+        if frontier_context_hidden_size is None:
+            frontier_context_hidden_size = frontier_node_hidden_size
 
-        self.source_hidden_size = source_hidden_size
+        self.frontier_node_hidden_size = frontier_node_hidden_size
+        self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
 
-        self.source_head = layer_init(nn.Linear(source_hidden_size, 1), 0.01)
+        self.source_head = layer_init(nn.Linear(frontier_node_hidden_size, 1), 0.01)
 
-        pair_hidden_size = source_hidden_size + target_hidden_size
+        pair_hidden_size = frontier_node_hidden_size + target_hidden_size
         self.target_head = layer_init(nn.Linear(pair_hidden_size, 1), 0.01)
 
-        self.source_value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
-        self.target_value_head = layer_init(nn.Linear(source_hidden_size, 1), 1)
+        self.source_value_head = layer_init(nn.Linear(frontier_context_hidden_size, 1), 1)
+        self.target_value_head = layer_init(nn.Linear(frontier_node_hidden_size, 1), 1)
 
 
     def forward(self, encoded: QuadMeshEncoding):
@@ -2602,7 +2811,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
         substep = encoded.substep
         h_source0 = encoded.h_source0
         h_source1 = encoded.h_source1
-        h_source0_pooled = encoded.h_source0_pooled
+        h_source0_context = encoded.h_source0_context
         h_source0_batch_offset = encoded.h_source0_batch_offset
         h_source1_batch_offset = encoded.h_source1_batch_offset
         source_idx = encoded.source_idx
@@ -2635,7 +2844,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
             idx = h_source0_batch_offset[:-1, None] + cols
             logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
 
-            values[substep == 0] = self.source_value_head(h_source0_pooled)
+            values[substep == 0] = self.source_value_head(h_source0_context)
 
         # SUBSTEP 1
         if B1 > 0:
@@ -2653,7 +2862,7 @@ class QuadMeshingBoundaryDecoder(nn.Module):
             no_valid = targets_per_batch == 0                        # [B1]
             logits[target_rows[no_valid], 0] = 1.0
 
-            h_source_per_batch = h_source1[h_source1_batch_offset[:-1] + source_idx] # [B, source_hidden_size]
+            h_source_per_batch = h_source1[h_source1_batch_offset[:-1] + source_idx] # [B, frontier_node_hidden_size]
             values[substep == 1] = self.target_value_head(h_source_per_batch)
 
         return logits, values

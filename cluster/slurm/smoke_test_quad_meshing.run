@@ -1,0 +1,36 @@
+#!/bin/bash -l
+
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=gpu
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:20:00
+#SBATCH --job-name=puffer-quad-smoke
+#SBATCH --output=slurm-%x-%j.out
+
+set -euo pipefail
+
+IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_latest.sif}
+WORKDIR=${WORKDIR:-$PWD}
+OUTPUT_DIR=${OUTPUT_DIR:-$WORKDIR/cluster_runs/smoke}
+
+mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/checkpoints" "$OUTPUT_DIR/logs" "$OUTPUT_DIR/cache"
+
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export APPTAINERENV_XDG_CACHE_HOME=/outputs/cache
+export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+
+srun apptainer exec --nv \
+    --bind "$OUTPUT_DIR:/outputs" \
+    "$IMAGE" \
+    bash -lc "cd /workspace/PufferLib && python3 - <<'PY'
+import torch
+import pufferlib._C as C
+print('torch', torch.__version__)
+print('cuda_available', torch.cuda.is_available())
+print('cuda_device_count', torch.cuda.device_count())
+print('compiled_env', getattr(C, 'env_name', None))
+PY
+puffer train quad_meshing --slowly --train.total-timesteps 16384 --eval-episodes 1 --checkpoint-dir /outputs/checkpoints --log-dir /outputs/logs"
