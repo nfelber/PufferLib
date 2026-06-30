@@ -904,7 +904,7 @@ def _cand_decode_counts_kernel(
     valid_count = tl.sum(validity.to(tl.int64), axis=0)
 
     vertex_batch_offset = tl.load(vertex_batch_offsets + b)
-    tl.store(node_validity + vertex_batch_offset + i, validity, mask=i < frontier_size)
+    tl.store(node_validity + vertex_batch_offset + i, validity, mask=valid_i)
 
     tl.store(source_idx + b, src.to(tl.int64))
     tl.store(candidate_count + b, cand_count.to(tl.int64))
@@ -944,7 +944,7 @@ def _cand_scatter_existing_targets_kernel(
 
     valid_i = i < frontier_size
     global_i = vertex_begin + i
-    validity = tl.load(node_validity + global_i, mask=valid_i, other=0)
+    validity = tl.load(node_validity + global_i, mask=valid_i, other=0) != 0
     rank = tl.cumsum(validity.to(tl.int64), axis=0) - 1
 
     target_begin = tl.load(target_batch_offsets + b)
