@@ -28,6 +28,7 @@ export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
 export APPTAINERENV_CC=/usr/bin/gcc
 export APPTAINERENV_CXX=/usr/bin/g++
 export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
 export APPTAINERENV_TRITON_CACHE_DIR=/outputs/cache/triton
 
 srun apptainer exec --nv \

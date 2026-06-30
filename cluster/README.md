@@ -192,3 +192,6 @@ For final experiments, rebuild and pull a baked image tagged with the git commit
 - The Slurm scripts use `--gres=gpu:N`, matching the cluster examples.
 - The scripts pin `CC`, `CXX`, and `CUDAHOSTCXX` inside the container so host
   Spack compiler paths do not leak into Triton or CUDA JIT compilation.
+- The scripts set `LIBRARY_PATH=/usr/local/cuda/lib64/stubs` inside the
+  container so Triton can link JIT helper modules against `-lcuda`; runtime CUDA
+  calls still use the host driver libraries exposed by `apptainer --nv`.
