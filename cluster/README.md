@@ -190,3 +190,5 @@ For final experiments, rebuild and pull a baked image tagged with the git commit
 - `NVCC_ARCH=sm_70` targets V100 GPUs.
 - Checkpoints, JSON logs, W&B files, and caches are written under `OUTPUT_DIR`.
 - The Slurm scripts use `--gres=gpu:N`, matching the cluster examples.
+- The scripts pin `CC`, `CXX`, and `CUDAHOSTCXX` inside the container so host
+  Spack compiler paths do not leak into Triton or CUDA JIT compilation.

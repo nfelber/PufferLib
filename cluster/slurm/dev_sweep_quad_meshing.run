@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_cu121.sif}
+IMAGE=${IMAGE:-$HOME/docker-images/pufferlib_quad_meshing_latest.sif}
 SOURCE_DIR=${SOURCE_DIR:-$PWD}
 OUTPUT_DIR=${OUTPUT_DIR:-$SOURCE_DIR/cluster_runs/dev}
 WANDB_GROUP=${WANDB_GROUP:-quad_meshing_dev_sweep}
@@ -27,6 +27,10 @@ export APPTAINERENV_WANDB_DIR=/outputs/wandb
 export APPTAINERENV_WANDB_CACHE_DIR=/outputs/cache/wandb
 export APPTAINERENV_XDG_CACHE_HOME=/outputs/cache
 export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+export APPTAINERENV_CC=/usr/bin/gcc
+export APPTAINERENV_CXX=/usr/bin/g++
+export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_TRITON_CACHE_DIR=/outputs/cache/triton
 
 srun apptainer exec --nv \
     --bind "$SOURCE_DIR:/workspace/PufferLib" \

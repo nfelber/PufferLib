@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_latest.sif}
+IMAGE=${IMAGE:-$HOME/docker-images/pufferlib_quad_meshing_latest.sif}
 WORKDIR=${WORKDIR:-$PWD}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORKDIR/cluster_runs/smoke}
 
@@ -21,6 +21,10 @@ mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/checkpoints" "$OUTPUT_DIR/logs" "$OUTPUT_DIR
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export APPTAINERENV_XDG_CACHE_HOME=/outputs/cache
 export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+export APPTAINERENV_CC=/usr/bin/gcc
+export APPTAINERENV_CXX=/usr/bin/g++
+export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_TRITON_CACHE_DIR=/outputs/cache/triton
 
 srun apptainer exec --nv \
     --bind "$OUTPUT_DIR:/outputs" \

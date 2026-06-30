@@ -6,13 +6,13 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=normal
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=1:00:00
 #SBATCH --job-name=puffer-quad-train
 #SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_latest.sif}
+IMAGE=${IMAGE:-$HOME/docker-images/pufferlib_quad_meshing_latest.sif}
 WANDB_GROUP=${WANDB_GROUP:-quad_meshing_train}
 WORKDIR=${WORKDIR:-$PWD}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORKDIR/cluster_runs}
@@ -25,6 +25,10 @@ export APPTAINERENV_WANDB_DIR=/outputs/wandb
 export APPTAINERENV_WANDB_CACHE_DIR=/outputs/cache/wandb
 export APPTAINERENV_XDG_CACHE_HOME=/outputs/cache
 export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
+export APPTAINERENV_CC=/usr/bin/gcc
+export APPTAINERENV_CXX=/usr/bin/g++
+export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_TRITON_CACHE_DIR=/outputs/cache/triton
 
 srun apptainer exec --nv \
     --bind "$OUTPUT_DIR:/outputs" \
