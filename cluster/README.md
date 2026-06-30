@@ -51,6 +51,15 @@ IMAGE=$HOME/myimages/pufferlib_quad_meshing_latest.sif sbatch cluster/slurm/smok
 Check the Slurm output file. It should print PyTorch/CUDA information,
 `compiled_env quad_meshing`, and complete a tiny training run.
 
+If Triton/CUDA JIT compilation fails, run the diagnostic job:
+
+```bash
+IMAGE=$HOME/myimages/pufferlib_quad_meshing_cu121.sif sbatch cluster/slurm/diagnose_cuda_jit.run
+```
+
+This prints the effective compiler, CUDA library paths, `libcuda` visibility,
+manual `gcc -lcuda` link tests, and a minimal Triton kernel compile.
+
 ## 4. Train One Agent
 
 ```bash
