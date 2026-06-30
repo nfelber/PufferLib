@@ -28,15 +28,17 @@ export APPTAINERENV_OMP_NUM_THREADS="$OMP_NUM_THREADS"
 export APPTAINERENV_CC=/usr/bin/gcc
 export APPTAINERENV_CXX=/usr/bin/g++
 export APPTAINERENV_CUDAHOSTCXX=/usr/bin/g++
+export APPTAINERENV_CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include
 export APPTAINERENV_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
 export APPTAINERENV_TRITON_CACHE_DIR=/outputs/cache/triton
 export SINGULARITYENV_CC=/usr/bin/gcc
 export SINGULARITYENV_CXX=/usr/bin/g++
 export SINGULARITYENV_CUDAHOSTCXX=/usr/bin/g++
+export SINGULARITYENV_CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include
 export SINGULARITYENV_LIBRARY_PATH=/usr/local/cuda/lib64/stubs
 export SINGULARITYENV_TRITON_CACHE_DIR=/outputs/cache/triton
 
 srun apptainer exec --nv \
     --bind "$OUTPUT_DIR:/outputs" \
     "$IMAGE" \
-    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR=/outputs/cache/triton && cd /workspace/PufferLib && puffer train quad_meshing --slowly --wandb --wandb-group '$WANDB_GROUP' --checkpoint-dir /outputs/checkpoints --log-dir /outputs/logs $PUFFER_ARGS"
+    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR=/outputs/cache/triton && cd /workspace/PufferLib && puffer train quad_meshing --slowly --wandb --wandb-group '$WANDB_GROUP' --checkpoint-dir /outputs/checkpoints --log-dir /outputs/logs $PUFFER_ARGS"

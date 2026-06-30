@@ -204,3 +204,6 @@ For final experiments, rebuild and pull a baked image tagged with the git commit
 - The scripts set `LIBRARY_PATH=/usr/local/cuda/lib64/stubs` inside the
   container so Triton can link JIT helper modules against `-lcuda`; runtime CUDA
   calls still use the host driver libraries exposed by `apptainer --nv`.
+- The scripts set `CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include` to work
+  around clusters where Apptainer/GCC does not find GCC's internal headers such
+  as `stddef.h` during Triton JIT compilation.
