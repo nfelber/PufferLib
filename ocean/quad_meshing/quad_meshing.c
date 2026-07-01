@@ -7,9 +7,9 @@
 
 int main() {
     QuadMeshingEnv env = {0};
-    env.episode_max_length = 2048;
+    env.episode_max_length_ratio = 1.5;
     static const char* boundary_paths[] = {
-      // "resources/quad_meshing/boundaries/square.json"
+      "resources/quad_meshing/boundaries/square.json",
       "resources/quad_meshing/boundaries/dolphin.json"
       // "resources/quad_meshing/boundaries/rat-18.json",
       // "resources/quad_meshing/boundaries/cup-13.json",
@@ -24,15 +24,12 @@ int main() {
     };
     env.boundary_paths = boundary_paths;
     env.boundary_count = (int)(sizeof(boundary_paths) / sizeof(boundary_paths[0]));
-    env.boundary_mode = true;
-    env.candidate_rings = 12;
+    env.boundary_mode = false;
+    env.candidate_rings = 10;
     env.candidate_angles = 64;
-    // env.candidate_radius_min = 0.15;
-    // env.candidate_radius_max = 0.20;
-    // env.target_quad_area = 0.015625;
-    env.candidate_radius_min = 0.025;
-    env.candidate_radius_max = 0.07;
-    env.target_quad_area = 0.0009;
+    env.target_edge_length_ratio = 1.0;
+    env.candidate_radius_min_ratio = 0.5;
+    env.candidate_radius_max_ratio = 2.0;
     env.reward_invalid = -0.1;
     env.reward_incomplete = -1.0;
     env.render_width = 1200;
@@ -48,7 +45,7 @@ int main() {
     unsigned int rng = 42;
     double key_repeat_cd = 0.01;
 
-    const int max_frontier = 1024;
+    env.max_frontier = 1024;
     env.max_degree = 16;
     env.grid_res = 32;
     env.grid_cell_size = 1.0 / (float)env.grid_res;
@@ -56,7 +53,7 @@ int main() {
     env.intersection_tol = 1e-3;
 
     quad_meshing_init(&env);
-    env.observations = (unsigned char*)calloc(1 + 4 + max_frontier * (8 + 3 * env.max_degree + 1) + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
+    env.observations = (unsigned char*)calloc(1 + 4 + 4 + env.max_frontier * (8 + 3 * env.max_degree + 1) + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
     env.actions = (float*)calloc(2, sizeof(int));
     env.rewards = (float*)calloc(1, sizeof(float));
     env.terminals = (float*)calloc(1, sizeof(unsigned char));

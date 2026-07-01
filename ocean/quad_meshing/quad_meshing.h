@@ -24,11 +24,18 @@ typedef struct {
     float score; // Recommended unnormalized single real number perf metric
     float episode_return; // Recommended metric: sum of agent rewards over episode
     float episode_length; // Recommended metric: number of steps of agent episode
+    float episode_length_ratio; // normalized episode length
     float n; // Required as the last field
 } Log;
 
 typedef struct {
+    int episode_max_length;
+    float candidate_radius_min;
+    float candidate_radius_max;
+    float target_edge_length;
+    float target_quad_area;
     float starting_boundary_area;
+    float starting_boundary_edge_length;
     IntArray valid_boundary_idx;
     IntArray valid_candidate_idx;
     Vec2Array candidates_local;
@@ -52,17 +59,18 @@ typedef struct {
     int source_frontier_idx;
 
     // Env settings
-    int episode_max_length;
+    float episode_max_length_ratio;
     int candidate_rings;
     int candidate_angles;
-    float candidate_radius_min;
-    float candidate_radius_max;
-    float target_quad_area;
+    float candidate_radius_min_ratio;
+    float candidate_radius_max_ratio;
+    float target_edge_length_ratio;
     const char** boundary_paths; // Non-owning
     int boundary_count;
     bool boundary_mode;
 
     // Perf
+    int max_frontier;
     int max_degree;
     unsigned int grid_res;
     float grid_cell_size;
@@ -99,11 +107,12 @@ typedef struct {
 static void init_candidates(QuadMeshingEnv* env) {
     int rings = env->candidate_rings;
     int angles = env->candidate_angles;
+    Vec2Array_resize(&env->cache.candidates_local, 0);
     Vec2Array_reserve(&env->cache.candidates_local, rings*angles);
     for (int r = 0; r < rings; r++) {
         float frac = rings > 1 ? r / (float)(rings-1) : 0.5;
-        float radius = env->candidate_radius_min +
-            frac * (env->candidate_radius_max - env->candidate_radius_min);
+        float radius = env->cache.candidate_radius_min +
+            frac * (env->cache.candidate_radius_max - env->cache.candidate_radius_min);
         for (int a = 0; a < angles; a++) {
             float theta = (2.0f * PI * a) / angles;
             float rr = radius;
@@ -123,14 +132,14 @@ void quad_meshing_init(QuadMeshingEnv* env)
     Vec2Array_init(&env->cache.candidates_local);
     IntArray_init(&env->cache.valid_boundary_idx);
     IntArray_init(&env->cache.valid_candidate_idx);
-    init_candidates(env);
     env->ui_pending_source = -1;
 }
 
 void add_log(QuadMeshingEnv* env) {
-    env->log.perf += env->episode_return * env->target_quad_area / env->cache.starting_boundary_area;
+    env->log.perf += env->episode_return * env->cache.target_quad_area / env->cache.starting_boundary_area;
     env->log.score += env->episode_return;
     env->log.episode_length += env->episode_length;
+    env->log.episode_length_ratio += (float)env->episode_length / env->cache.episode_max_length;
     env->log.episode_return += env->episode_return;
     env->log.n++;
 }
@@ -208,6 +217,23 @@ static void load_boundary(QuadMeshingEnv* env) {
 
     // Cache area
     env->cache.starting_boundary_area = polygon_area(env->boundary_poly.data, env->boundary_poly.size);
+
+    float perimeter = 0.0f;
+    for (int i = 0; i < env->boundary_poly.size; ++i) {
+        Vec2 a = env->boundary_poly.data[i];
+        Vec2 b = env->boundary_poly.data[(i + 1) % env->boundary_poly.size];
+        perimeter += norm2(sub2(b, a));
+    }
+    env->cache.starting_boundary_edge_length = perimeter / env->boundary_poly.size;
+    env->cache.target_edge_length = env->cache.starting_boundary_edge_length * env->target_edge_length_ratio;
+    env->cache.target_quad_area = env->cache.target_edge_length * env->cache.target_edge_length;
+    env->cache.candidate_radius_min = env->cache.target_edge_length * env->candidate_radius_min_ratio;
+    env->cache.candidate_radius_max = env->cache.target_edge_length * env->candidate_radius_max_ratio;
+    float n_quads = env->cache.starting_boundary_area / env->cache.target_quad_area;
+    float ideal_episode_length = env->boundary_mode ? n_quads : 2 * n_quads - 0.5 * env->boundary_poly.size;
+    env->cache.episode_max_length = (int)ceilf(ideal_episode_length * env->episode_max_length_ratio);
+    env->cache.episode_max_length = env->cache.episode_max_length < 1 ? 1 : env->cache.episode_max_length;
+    init_candidates(env);
 }
 
 typedef struct {
@@ -219,6 +245,11 @@ static void serialize_obs_substep(SerialObsBuffer* obs, uint8_t substep) {
     serialize_u8(&obs->sb, substep);
 }
 
+static void serialize_obs_target_edge_length(SerialObsBuffer* obs, float target_edge_length) {
+    obs->sb.pos = sizeof(uint8_t);
+    serialize_float(&obs->sb, target_edge_length);
+}
+
 uint8_t deserialize_obs_substep(SerialObsBuffer* obs) {
     obs->sb.pos = 0;
     return deserialize_u8(&obs->sb);
@@ -226,7 +257,7 @@ uint8_t deserialize_obs_substep(SerialObsBuffer* obs) {
 
 static void serialize_obs_frontier(SerialObsBuffer* obs, const QuadMesh* mesh) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float);
 
     // Frontier size
     serialize_u16(sb, mesh->frontier.size);
@@ -283,7 +314,7 @@ static void serialize_obs_frontier(SerialObsBuffer* obs, const QuadMesh* mesh) {
 
 void deserialize_obs_frontier(SerialObsBuffer* obs, QuadMesh* mesh) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float);
 
     // Frontier size
     uint16_t frontier_size = deserialize_u16(sb);
@@ -329,18 +360,18 @@ static size_t obs_frontier_bytes(const QuadMesh* mesh) {
 }
 
 static void serialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
-    obs->sb.pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh);
     serialize_u16(&obs->sb, source);
 }
 
 uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
-    obs->sb.pos = sizeof(uint8_t) + obs_frontier_bytes(mesh);
+    obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh);
     return deserialize_u16(&obs->sb);
 }
 
 static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_boundary_idx, 0);
@@ -366,7 +397,7 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
 
 void deserialize_obs_validity_mask(SerialObsBuffer* obs, QuadMesh* mesh, BoolArray* mask) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
 
     // Frontier validity mask
     BoolArray_reserve(mask, mesh->frontier.size);
@@ -381,7 +412,7 @@ static size_t obs_validity_bytes(QuadMesh* mesh) {
 
 static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_candidate_idx, 0);
@@ -407,7 +438,7 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
 
 void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Array* candidates) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + obs_frontier_bytes(mesh) + sizeof(uint16_t) + obs_validity_bytes(mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t) + obs_validity_bytes(mesh);
 
     int valid_count = deserialize_u16(sb);
 
@@ -434,6 +465,7 @@ static void compute_observations(QuadMeshingEnv* env) {
     // Substep
     BENCH_START(obs_substep, "quad_meshing.obs_substep");
     serialize_obs_substep(&obs, substep);
+    serialize_obs_target_edge_length(&obs, env->cache.target_edge_length);
     BENCH_END(obs_substep);
 
     // Assume substep 0 obs remains valid for substep 1
@@ -523,7 +555,7 @@ float compute_quad_quality(QuadMeshingEnv* env, const Vec2* quad) {
     // Density quality
     const float A = polygon_area(quad, 4);
 
-    return (1.0 - fabs(A / env->target_quad_area - 1.0)) * eq;
+    return (1.0 - fabs(A / env->cache.target_quad_area - 1.0)) * eq;
 }
 
 /** Resets the environment state and observation buffers. */
@@ -613,7 +645,7 @@ void c_step(QuadMeshingEnv* env) {
     if (!valid) {
         BENCH_START(invalid_path, "quad_meshing.invalid_path");
         // Check episode termination
-        if (env->episode_length >= env->episode_max_length) {
+        if (env->episode_length >= env->cache.episode_max_length) {
             env->rewards[0] = env->reward_incomplete;
             env->episode_return += env->reward_incomplete;
             env->terminals[0] = 1;
@@ -710,7 +742,7 @@ void c_step(QuadMeshingEnv* env) {
     BENCH_END(saturation_check);
 
     // Check episode termination
-    if ((env->mesh.frontier.size == 0) || (env->episode_length >= env->episode_max_length) || mesh_saturated) {
+    if ((env->mesh.frontier.size == 0) || (env->mesh.frontier.size > env->max_frontier) || (env->episode_length >= env->cache.episode_max_length) || mesh_saturated) {
         BENCH_START(terminal_reset, "quad_meshing.terminal_reset");
         env->rewards[0] = env->reward_incomplete;
         env->episode_return += env->reward_incomplete;
@@ -767,7 +799,7 @@ void c_render(QuadMeshingEnv* env) {
 
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
-    DrawText(TextFormat("step: %d | return: %f", env->episode_length, env->episode_return), 20, 20, 20, RAYWHITE);
+    DrawText(TextFormat("step: %d / %d | return: %f", env->episode_length, env->cache.episode_max_length, env->episode_return), 20, 20, 20, RAYWHITE);
     BeginMode2D(env->camera);
 
     for (int i = 0; i < env->boundary_poly.size; ++i) {

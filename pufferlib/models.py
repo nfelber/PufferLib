@@ -635,6 +635,7 @@ class CSRGraph:
     edges: torch.Tensor          # [2, E] edge indices
     edge_features: torch.Tensor  # [E, f] edge features
     edge_ptr: torch.Tensor       # [N + 1] CSR pointer for outgoing edges
+    target_edge_length: torch.Tensor  # [B] per-batch target edge length
 
 
 @dataclass
@@ -665,6 +666,7 @@ def _gf_decode_frontier_sizes_kernel(
     obs,                    # uint8*, [B_full, obs_size]
     valid_batch_idx,        # int64*, [B]
     frontier_size_out,      # int64*, [B]
+    target_edge_length_out, # float32*, [B]
     OBS_SIZE: tl.constexpr,
     B: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -675,12 +677,20 @@ def _gf_decode_frontier_sizes_kernel(
     physical_b = tl.load(valid_batch_idx + off, mask=mask, other=0)
     row = physical_b * OBS_SIZE
 
-    # frontier_size at byte offsets 1..2, little-endian u16
-    f_lo = tl.load(obs + row + 1, mask=mask, other=0).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2, mask=mask, other=0).to(tl.uint32)
+    target_edge_length_u32 = (
+        tl.load(obs + row + 1, mask=mask, other=0).to(tl.uint32)
+        | (tl.load(obs + row + 2, mask=mask, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + row + 3, mask=mask, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + row + 4, mask=mask, other=0).to(tl.uint32) << 24)
+    )
+
+    # frontier_size at byte offsets 5..6, little-endian u16
+    f_lo = tl.load(obs + row + 5, mask=mask, other=0).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6, mask=mask, other=0).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
     tl.store(frontier_size_out + off, frontier_size.to(tl.int64), mask=mask)
+    tl.store(target_edge_length_out + off, target_edge_length_u32.to(tl.float32, bitcast=True), mask=mask)
 
 
 @triton.jit
@@ -700,9 +710,9 @@ def _gf_decode_vertices_kernel(
     physical_b = tl.load(valid_batch_idx + b)
     row = physical_b * OBS_SIZE
 
-    # frontier_size at byte offsets 1..2, little-endian u16
-    f_lo = tl.load(obs + row + 1).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    # frontier_size at byte offsets 5..6, little-endian u16
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
     valid = i < frontier_size
@@ -710,8 +720,8 @@ def _gf_decode_vertices_kernel(
     vertex_batch_offset = tl.load(vertex_batch_offsets + b)
     global_i = vertex_batch_offset + i
 
-    # Vertices start at byte offset 5, each vertex is two little-endian f32s.
-    base = row + 5 + i * 8
+    # Vertices start at byte offset 9, each vertex is two little-endian f32s.
+    base = row + 9 + i * 8
 
     x_u32 = (
         tl.load(obs + base + 0, mask=valid, other=0).to(tl.uint32)
@@ -760,8 +770,8 @@ def _gf_count_neighbors_kernel(
     physical_b = tl.load(valid_batch_idx + b)
     row = physical_b * OBS_SIZE
 
-    f_lo = tl.load(obs + row + 1).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
     valid_vertex = i < frontier_size
@@ -771,7 +781,7 @@ def _gf_count_neighbors_kernel(
     vertex_batch_offset = tl.load(vertex_batch_offsets + b)
     global_i = vertex_batch_offset + i
 
-    neighbor_base = row + 5 + frontier_size * 8
+    neighbor_base = row + 9 + frontier_size * 8
     nb = neighbor_base + (i * D + d) * 2
 
     mask = valid_i_cap & valid_vertex & valid_d
@@ -840,8 +850,8 @@ def _gf_scatter_edges_kernel(
     physical_b = tl.load(valid_batch_idx + b)
     row = physical_b * OBS_SIZE
 
-    f_lo = tl.load(obs + row + 1).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
     valid_i_cap = i < F_CAP
@@ -853,7 +863,7 @@ def _gf_scatter_edges_kernel(
     # Shape [BLOCK_N]
     global_src_vec = vertex_batch_offset + ii
 
-    neighbor_base = row + 5 + frontier_size * 8
+    neighbor_base = row + 9 + frontier_size * 8
     face_base = neighbor_base + frontier_size * D * 2
 
     nb = neighbor_base + (i * D + d) * 2
@@ -925,11 +935,11 @@ def _cand_decode_counts_kernel(
     physical_b = tl.load(valid_batch_idx + b)
     row = physical_b * OBS_SIZE
 
-    f_lo = tl.load(obs + row + 1).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
-    neighbor_start = row + 5 + frontier_size * 8
+    neighbor_start = row + 9 + frontier_size * 8
     source_idx_pos = neighbor_start + frontier_size * D * 3
     validity_start = source_idx_pos + 2
     candidates_start = validity_start + frontier_size
@@ -1025,11 +1035,11 @@ def _cand_scatter_new_targets_kernel(
     physical_b = tl.load(valid_batch_idx + b)
     row = physical_b * OBS_SIZE
 
-    f_lo = tl.load(obs + row + 1).to(tl.uint32)
-    f_hi = tl.load(obs + row + 2).to(tl.uint32)
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
-    neighbor_start = row + 5 + frontier_size * 8
+    neighbor_start = row + 9 + frontier_size * 8
     source_idx_pos = neighbor_start + frontier_size * D * 3
     validity_start = source_idx_pos + 2
     candidates_start = validity_start + frontier_size
@@ -1159,6 +1169,12 @@ class CUDAGraphObservationDeserializer:
             self.frontier_size = torch.empty(
                 (self.B,),
                 dtype=torch.long,
+                device=self.device,
+            )
+
+            self.target_edge_length = torch.empty(
+                (self.B,),
+                dtype=torch.float32,
                 device=self.device,
             )
 
@@ -1314,6 +1330,7 @@ class CUDAGraphObservationDeserializer:
             self.obs_static,
             self.valid_batch_idx_static,
             self.frontier_size,
+            self.target_edge_length,
             OBS_SIZE=self.obs_size,
             B=self.B,
             BLOCK_B=self.BLOCK_B,
@@ -1517,6 +1534,7 @@ class CUDAGraphObservationDeserializer:
                 edges=self.edges_flat.view(2, self.E_CAP),
                 edge_features=self.edge_features_flat.view(self.E_CAP, 2),
                 edge_ptr=self.edge_ptr,
+                target_edge_length=self.target_edge_length,
             )
             if self.decode_candidates:
                 return graph, self._candidate_targets()
@@ -1537,6 +1555,7 @@ class CUDAGraphObservationDeserializer:
             edges=self.edges_flat[: 2 * E].view(2, E),
             edge_features=self.edge_features_flat[: 2 * E].view(E, 2),
             edge_ptr=self.edge_ptr[: N + 1],
+            target_edge_length=self.target_edge_length,
         )
 
         if self.decode_candidates:
@@ -1735,6 +1754,9 @@ class FrontierInitStage(nn.Module):
         node_ring_n_neighbors=3,
         edge_midpoint=True,
         edge_length=True,
+        edge_target_length=True,
+        edge_target_log_length=True,
+        edge_relative_length=True,
         edge_direction=True,
         edge_flags=True,
         eps=1e-8,
@@ -1747,6 +1769,9 @@ class FrontierInitStage(nn.Module):
         self.node_ring_n_neighbors = node_ring_n_neighbors
         self.edge_midpoint = edge_midpoint
         self.edge_length = edge_length
+        self.edge_target_length = edge_target_length
+        self.edge_target_log_length = edge_target_log_length
+        self.edge_relative_length = edge_relative_length
         self.edge_direction = edge_direction
         self.edge_flags = edge_flags
         self.eps = eps
@@ -1762,6 +1787,12 @@ class FrontierInitStage(nn.Module):
         if edge_midpoint:
             edge_in_dim += self.pos_encoder.out_dim
         if edge_length:
+            edge_in_dim += 1
+        if edge_target_length:
+            edge_in_dim += 1
+        if edge_target_log_length:
+            edge_in_dim += 1
+        if edge_relative_length:
             edge_in_dim += 1
         if edge_direction:
             edge_in_dim += 2
@@ -1798,11 +1829,20 @@ class FrontierInitStage(nn.Module):
         p1 = graph.vertices[dst]
         delta = p1 - p0
         length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+        edge_batch = torch.searchsorted(graph.batch_offsets[1:], src, right=True)
+        target_length = graph.target_edge_length[edge_batch].unsqueeze(-1).to(dtype=graph.vertices.dtype)
+        target_length_safe = target_length.clamp_min(self.eps)
 
         if self.edge_midpoint:
             parts.append(self.pos_encoder(0.5 * (p0 + p1)))
         if self.edge_length:
             parts.append(length)
+        if self.edge_target_length:
+            parts.append(target_length)
+        if self.edge_target_log_length:
+            parts.append(torch.log(target_length_safe))
+        if self.edge_relative_length:
+            parts.append((length - target_length) / (length + target_length + self.eps))
         if self.edge_direction:
             parts.append(self._canonical_direction(delta, length, self.eps))
         if self.edge_flags:
@@ -2032,18 +2072,32 @@ class TargetInitStage(nn.Module):
         pos_bands,
         include_ring_frame_pos=True,
         include_distance=True,
+        include_target_length=True,
+        include_target_log_length=True,
+        include_relative_distance=True,
         include_boundary_flag=True,
+        eps=1e-8,
     ):
         super().__init__()
         self.include_ring_frame_pos = include_ring_frame_pos
         self.include_distance = include_distance
+        self.include_target_length = include_target_length
+        self.include_target_log_length = include_target_log_length
+        self.include_relative_distance = include_relative_distance
         self.include_boundary_flag = include_boundary_flag
+        self.eps = eps
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
         in_dim = 0
         if include_ring_frame_pos:
             in_dim += self.pos_encoder.out_dim
         if include_distance:
+            in_dim += 1
+        if include_target_length:
+            in_dim += 1
+        if include_target_log_length:
+            in_dim += 1
+        if include_relative_distance:
             in_dim += 1
         if include_boundary_flag:
             in_dim += 1
@@ -2056,6 +2110,9 @@ class TargetInitStage(nn.Module):
         targets = state.targets
         Q = targets.target_positions.size(0)
         parts = []
+        target_length = graph.target_edge_length[targets.target_batches].unsqueeze(-1).to(dtype=targets.target_positions.dtype)
+        target_length_safe = target_length.clamp_min(self.eps)
+        distances = None
 
         if self.include_ring_frame_pos:
             source_global = graph.batch_offsets[:-1] + targets.source_idx
@@ -2079,6 +2136,25 @@ class TargetInitStage(nn.Module):
                     block_e=64,
                 )
             parts.append(distances.unsqueeze(-1))
+
+        if self.include_target_length:
+            parts.append(target_length)
+
+        if self.include_target_log_length:
+            parts.append(torch.log(target_length_safe))
+
+        if self.include_relative_distance:
+            if distances is None:
+                with nvtx_range("target_distances"):
+                    distances = distance_to_graph_edges(
+                        graph,
+                        targets.target_positions,
+                        targets.target_batch_offsets,
+                        block_q=16,
+                        block_e=64,
+                    )
+            distance_features = distances.unsqueeze(-1)
+            parts.append((distance_features - target_length) / (distance_features + target_length + self.eps))
 
         if self.include_boundary_flag:
             boundary_mask = targets.target_idx >= 0
@@ -2653,6 +2729,9 @@ class QuadMeshingEncoder(nn.Module):
             frontier_init_node_ring_n_neighbors=3,
             frontier_init_edge_midpoint=False,
             frontier_init_edge_length=True,
+            frontier_init_edge_target_length=True,
+            frontier_init_edge_target_log_length=True,
+            frontier_init_edge_relative_length=True,
             frontier_init_edge_direction=False,
             frontier_init_edge_flags=True,
             frontier_se2_layers=2,
@@ -2668,6 +2747,9 @@ class QuadMeshingEncoder(nn.Module):
             target_pipeline=("init", "se2"),
             target_init_ring_frame_pos=False,
             target_init_distance=True,
+            target_init_target_length=True,
+            target_init_target_log_length=True,
+            target_init_relative_distance=True,
             target_init_boundary_flag=True,
             **kwargs
     ):
@@ -2704,6 +2786,9 @@ class QuadMeshingEncoder(nn.Module):
                     node_ring=frontier_init_node_ring,
                     edge_midpoint=frontier_init_edge_midpoint,
                     edge_length=frontier_init_edge_length,
+                    edge_target_length=frontier_init_edge_target_length,
+                    edge_target_log_length=frontier_init_edge_target_log_length,
+                    edge_relative_length=frontier_init_edge_relative_length,
                     edge_direction=frontier_init_edge_direction,
                     edge_flags=frontier_init_edge_flags,
                 ))
@@ -2748,6 +2833,9 @@ class QuadMeshingEncoder(nn.Module):
                     pos_bands=pos_bands,
                     include_ring_frame_pos=target_init_ring_frame_pos,
                     include_distance=target_init_distance,
+                    include_target_length=target_init_target_length,
+                    include_target_log_length=target_init_target_log_length,
+                    include_relative_distance=target_init_relative_distance,
                     include_boundary_flag=target_init_boundary_flag,
                 ))
             elif stage == "se2":
@@ -2832,7 +2920,7 @@ class QuadMeshingEncoder(nn.Module):
         else:
             h_source0 = torch.empty(0, self.frontier_node_hidden_size, device=device)
             h_source0_context = torch.empty(0, self.frontier_context_hidden_size, device=device)
-            h_source0_batch_offset = torch.zeros(1, device=device)
+            h_source0_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
 
 
         # SUBSTEP 1
@@ -2860,10 +2948,10 @@ class QuadMeshingEncoder(nn.Module):
             h_target_batch_offset = targets.target_batch_offsets
         else:
             h_source1 = torch.empty(0, self.frontier_node_hidden_size, device=device)
-            h_source1_batch_offset = torch.zeros(1, device=device)
+            h_source1_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
             source_idx = torch.empty(0, device=device)
             h_target = torch.empty(0, self.target_hidden_size, device=device)
-            h_target_batch_offset = torch.zeros(1, device=device)
+            h_target_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
 
         return QuadMeshEncoding(
             substep=substep,
