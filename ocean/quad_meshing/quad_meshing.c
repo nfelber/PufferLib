@@ -33,7 +33,8 @@ int main() {
     env.candidate_radius_min = 0.025;
     env.candidate_radius_max = 0.07;
     env.target_quad_area = 0.0009;
-    env.reward_invalid = -0.1f;
+    env.reward_invalid = -0.1;
+    env.reward_incomplete = -1.0;
     env.render_width = 1200;
     env.render_height = 900;
     env.render_target_fps = 144;
@@ -146,7 +147,7 @@ int main() {
                     float d = sqrd_norm2(sub2(mouse_world, p));
                     if (d < best) {
                         best = d;
-                        best_idx = vidx;
+                        best_idx = i;
                     }
                 }
                 if (best_idx >= 0 && best <= pick_radius*pick_radius) {

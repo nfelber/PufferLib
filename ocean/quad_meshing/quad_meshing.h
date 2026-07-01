@@ -77,6 +77,7 @@ typedef struct {
 
     // Reward settings
     float reward_invalid;
+    float reward_incomplete;
 
     // Rendering
     int render_target_fps;
@@ -276,6 +277,8 @@ static void serialize_obs_frontier(SerialObsBuffer* obs, const QuadMesh* mesh) {
     for (int i=0; i<face_incidence_buf.size; ++i) {
         serialize_u8(sb, face_incidence_buf.data[i]);
     }
+
+    ByteArray_free(&face_incidence_buf);
 }
 
 void deserialize_obs_frontier(SerialObsBuffer* obs, QuadMesh* mesh) {
@@ -422,7 +425,7 @@ static void compute_observations(QuadMeshingEnv* env) {
 
     int source_slot = env->source_frontier_idx;
     unsigned char substep = source_slot == -1 ? 0 : 1;
-    int source = env->mesh.frontier.data[source_slot];
+    QM_ASSERT(source_slot == -1 || (source_slot >= 0 && source_slot < env->mesh.frontier.size));
 
     SerialObsBuffer obs = {
         .sb = env->observations,
@@ -439,6 +442,7 @@ static void compute_observations(QuadMeshingEnv* env) {
         serialize_obs_frontier(&obs, &env->mesh);
         BENCH_END(obs_frontier);
     } else {
+        int source = env->mesh.frontier.data[source_slot];
         BENCH_START(obs_source, "quad_meshing.obs_source");
         serialize_obs_source(&obs, &env->mesh, (uint16_t)source_slot);
         BENCH_END(obs_source);
@@ -467,7 +471,7 @@ float compute_vertex_frontier_quality(QuadMeshingEnv* env, int vidx) {
         const Vec2 np = env->mesh.vertices.data[nvidx].pos;
         const Vec2 eivec = sub2(np, vp);
 
-        float angle = FLT_MAX;
+        float angle = 2.0f * M_PI;
         for (int j=0; j<v->degree; ++j) {
             if (i==j) continue;
 
@@ -562,6 +566,9 @@ void c_step(QuadMeshingEnv* env) {
     if (env->source_frontier_idx == -1) {
         BENCH_START(source_substep_obs, "quad_meshing.source_substep_obs");
         env->source_frontier_idx = (int)env->actions[0];
+        if (!(env->source_frontier_idx >= 0 && env->source_frontier_idx < env->mesh.frontier.size)) {
+            printf("source: %d, frontier_size: %zu\n", env->source_frontier_idx, env->mesh.frontier.size);
+        }
         QM_ASSERT(env->source_frontier_idx >= 0 && env->source_frontier_idx < env->mesh.frontier.size);
         compute_observations(env);
         BENCH_END(source_substep_obs);
@@ -605,15 +612,16 @@ void c_step(QuadMeshingEnv* env) {
 
     if (!valid) {
         BENCH_START(invalid_path, "quad_meshing.invalid_path");
-        env->rewards[0] += env->reward_invalid;
-        env->episode_return += env->reward_invalid;
-
         // Check episode termination
         if (env->episode_length >= env->episode_max_length) {
+            env->rewards[0] = env->reward_incomplete;
+            env->episode_return += env->reward_incomplete;
             env->terminals[0] = 1;
             add_log(env);
             c_reset(env);
         } else {
+            env->rewards[0] = env->reward_invalid;
+            env->episode_return += env->reward_invalid;
             compute_observations(env); // Reset to substep 0
         }
         BENCH_END(invalid_path);
@@ -641,7 +649,7 @@ void c_step(QuadMeshingEnv* env) {
             ),
             compute_vertex_frontier_quality(env, target_vertex)
         );
-        env->rewards[0] += 0.5 * compute_quad_quality(env, face) * vfq;
+        env->rewards[0] = 0.5 * compute_quad_quality(env, face) * vfq;
         BENCH_END(boundary_face_path);
     } else {
         BENCH_START(add_edge, "quad_meshing.add_edge");
@@ -690,24 +698,22 @@ void c_step(QuadMeshingEnv* env) {
         QM_ASSERT(new_face_count <= 2);
     }
 
-    env->episode_return += env->rewards[0];
-
     // In boundary mode, mesh saturation breaks ring frontier constraint
     bool mesh_saturated = false;
-    if (env->boundary_mode) {
-        BENCH_START(saturation_check, "quad_meshing.saturation_check");
-        for (int i=0; i<env->mesh.vertices.size; ++i) {
-            if (env->mesh.vertices.data[i].degree >= env->mesh.max_degree) {
-                mesh_saturated = true;
-                break;
-            }
+    BENCH_START(saturation_check, "quad_meshing.saturation_check");
+    for (int i=0; i<env->mesh.vertices.size; ++i) {
+        if (env->mesh.vertices.data[i].degree >= env->mesh.max_degree) {
+            mesh_saturated = true;
+            break;
         }
-        BENCH_END(saturation_check);
     }
+    BENCH_END(saturation_check);
 
     // Check episode termination
     if ((env->mesh.frontier.size == 0) || (env->episode_length >= env->episode_max_length) || mesh_saturated) {
         BENCH_START(terminal_reset, "quad_meshing.terminal_reset");
+        env->rewards[0] = env->reward_incomplete;
+        env->episode_return += env->reward_incomplete;
         env->terminals[0] = 1;
         add_log(env);
         c_reset(env);
@@ -716,6 +722,8 @@ void c_step(QuadMeshingEnv* env) {
         BENCH_MAYBE_PRINT(total, "quad_meshing c_step");
         return;
     }
+
+    env->episode_return += env->rewards[0];
 
     BENCH_START(final_observations, "quad_meshing.final_observations");
     compute_observations(env);

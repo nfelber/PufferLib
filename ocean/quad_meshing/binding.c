@@ -55,6 +55,7 @@ void my_init(Env* env, Dict* kwargs) {
 
     env->boundary_mode = dict_get(kwargs, "boundary_mode")->value > 0.5;
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
+    env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
 
     env->render_target_fps = (int)dict_get(kwargs, "render_target_fps")->value;
     env->render_width = (int)dict_get(kwargs, "render_width")->value;

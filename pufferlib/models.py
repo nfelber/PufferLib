@@ -375,6 +375,84 @@ class _MLP(nn.Module):
         return self.net(x)
 
 
+@dataclass
+class SE2TripletTopology:
+    edge_ij: torch.Tensor       # [T] directed edge i -> j for each valid triplet
+    edge_jk: torch.Tensor       # [T] directed edge j -> k for each valid triplet
+    i: torch.Tensor             # [T] source node indices
+    j: torch.Tensor             # [T] center node indices
+    k: torch.Tensor             # [T] neighbor node indices
+    edge_msg_denom: torch.Tensor  # [E] max(out_degree(dst(edge)) - 1, 1)
+    receiver: torch.Tensor      # [E] message receiver node for each directed edge
+    node_denom: torch.Tensor    # [N] max(out_degree(node), 1)
+    num_edges: int
+    num_nodes: int
+
+
+@torch.no_grad()
+def compute_se2_triplet_topology(edge_index, edge_ptr, num_nodes):
+    if edge_ptr is None:
+        raise ValueError("edge_ptr must be provided and must match source-sorted edge_index.")
+    if edge_ptr.numel() != num_nodes + 1:
+        raise ValueError("edge_ptr must have shape [num_nodes + 1].")
+
+    device = edge_index.device
+    src = edge_index[0]
+    dst = edge_index[1]
+    num_edges = src.numel()
+
+    out_deg = edge_ptr[1:] - edge_ptr[:-1]
+    center = dst
+    counts = out_deg[center]
+
+    total_pairs = int(counts.sum().item())
+    if total_pairs == 0:
+        empty = torch.empty(0, device=device, dtype=torch.long)
+        edge_ij = empty
+        edge_jk = empty
+        i = empty
+        j = empty
+        k = empty
+    else:
+        # For every edge i -> j, enumerate outgoing edges j -> k.
+        edge_ij = torch.repeat_interleave(
+            torch.arange(num_edges, device=device),
+            counts,
+        )
+        repeated_centers = torch.repeat_interleave(center, counts)
+        pair_start = torch.repeat_interleave(
+            torch.cumsum(counts, dim=0) - counts,
+            counts,
+        )
+        local_offset = torch.arange(total_pairs, device=device) - pair_start
+        edge_jk = edge_ptr[repeated_centers] + local_offset
+
+        i = src[edge_ij]
+        j = dst[edge_ij]
+        k = dst[edge_jk]
+
+        # Remove immediate backtracking triplets where k == i.
+        mask = k != i
+        edge_ij = edge_ij[mask]
+        edge_jk = edge_jk[mask]
+        i = i[mask]
+        j = j[mask]
+        k = k[mask]
+
+    return SE2TripletTopology(
+        edge_ij=edge_ij,
+        edge_jk=edge_jk,
+        i=i,
+        j=j,
+        k=k,
+        edge_msg_denom=(out_deg[dst] - 1).clamp_min(1),
+        receiver=dst,
+        node_denom=out_deg.clamp_min(1),
+        num_edges=int(num_edges),
+        num_nodes=int(num_nodes),
+    )
+
+
 class SE2AngleMessagePassing(nn.Module):
     """
     Implements:
@@ -410,6 +488,7 @@ class SE2AngleMessagePassing(nn.Module):
         self.edge_cat_cardinalities = edge_cat_cardinalities or []
         self.edge_cat_emb_dim = edge_cat_emb_dim
         self.eps = eps
+        self.msg_dim = msg_dim
 
         self.edge_cat_embeddings = nn.ModuleList([
             nn.Embedding(cardinality, edge_cat_emb_dim)
@@ -452,7 +531,7 @@ class SE2AngleMessagePassing(nn.Module):
 
         return torch.cat(parts, dim=-1)
 
-    def forward(self, h, x, edge_index, edge_ptr, edge_cont=None, edge_cat=None):
+    def forward(self, h, x, edge_index, edge_ptr, edge_cont=None, edge_cat=None, topology=None):
         """
         Args:
             h:          [N, node_dim]
@@ -461,6 +540,7 @@ class SE2AngleMessagePassing(nn.Module):
             edge_ptr:   [N + 1] CSR pointers for outgoing edges. Must match edge_index source order.
             edge_cont:  [E, edge_cont_dim], optional continuous edge features
             edge_cat:   [E, num_edge_cat_features], optional categorical features
+            topology:   Optional precomputed SE2TripletTopology for this graph
 
         Returns:
             h_out:      [N, out_dim]
@@ -469,60 +549,24 @@ class SE2AngleMessagePassing(nn.Module):
         device = h.device
         num_nodes = h.size(0)
 
-        src = edge_index[0]  # i
-        dst = edge_index[1]  # j
-        num_edges = src.numel()
+        num_edges = edge_index.size(1)
 
         edge_feat = self.encode_edges(edge_cont, edge_cat)
 
-        if edge_ptr is None:
-            raise ValueError("edge_ptr must be provided and must match source-sorted edge_index.")
-        if edge_ptr.numel() != num_nodes + 1:
-            raise ValueError("edge_ptr must have shape [num_nodes + 1].")
-        out_deg = edge_ptr[1:] - edge_ptr[:-1]
-        ptr = edge_ptr
+        if topology is None:
+            topology = compute_se2_triplet_topology(edge_index, edge_ptr, num_nodes)
+        elif topology.num_edges != num_edges or topology.num_nodes != num_nodes:
+            raise ValueError("topology does not match edge_index or node count.")
 
-        # For every edge i -> j, enumerate outgoing edges j -> k.
-        center = dst
-        counts = out_deg[center]  # |N_j|
-
-        total_pairs = counts.sum().item()
-        if total_pairs == 0:
-            agg = torch.zeros(num_nodes, self.phi_m.net[-1].out_features, device=device)
-            return self.phi_h(torch.cat([h, agg], dim=-1))
-
-        edge_ij = torch.repeat_interleave(
-            torch.arange(num_edges, device=device),
-            counts,
-        )
-
-        repeated_centers = torch.repeat_interleave(center, counts)
-
-        pair_start = torch.repeat_interleave(
-            torch.cumsum(counts, dim=0) - counts,
-            counts,
-        )
-        local_offset = torch.arange(total_pairs, device=device) - pair_start
-
-        edge_jk_sorted_pos = ptr[repeated_centers] + local_offset
-        edge_jk = edge_jk_sorted_pos
-
-        # Remove k == i.
-        i = src[edge_ij]
-        j = dst[edge_ij]
-        k = dst[edge_jk]
-
-        mask = k != i
-
-        edge_ij = edge_ij[mask]
-        edge_jk = edge_jk[mask]
-        i = i[mask]
-        j = j[mask]
-        k = k[mask]
-
-        if edge_ij.numel() == 0:
-            msg = torch.zeros(num_edges, self.phi_m.net[-1].out_features, device=device)
+        if topology.edge_ij.numel() == 0:
+            msg = torch.zeros(num_edges, self.msg_dim, device=device, dtype=h.dtype)
         else:
+            edge_ij = topology.edge_ij
+            edge_jk = topology.edge_jk
+            i = topology.i
+            j = topology.j
+            k = topology.k
+
             xi, xj, xk = x[i], x[j], x[k]
 
             # angle ijk, centered at j
@@ -565,21 +609,20 @@ class SE2AngleMessagePassing(nn.Module):
             msg.index_add_(0, edge_ij, triplet_msg)
 
             # Divide by |N_j| - 1.
-            denom = (out_deg[dst] - 1).clamp_min(1).to(msg.dtype).unsqueeze(-1)
+            denom = topology.edge_msg_denom.to(msg.dtype).unsqueeze(-1)
             msg = msg / denom
 
         # m_ij is a message from node i to node j, so node j receives it here.
-        receiver = dst
         agg = torch.zeros(
             num_nodes,
             msg.size(-1),
             device=device,
             dtype=msg.dtype,
         )
-        agg.index_add_(0, receiver, msg)
+        agg.index_add_(0, topology.receiver, msg)
 
         # Divide by |N_i|.
-        node_denom = out_deg.clamp_min(1).to(agg.dtype).unsqueeze(-1)
+        node_denom = topology.node_denom.to(agg.dtype).unsqueeze(-1)
         agg = agg / node_denom
 
         return self.phi_h(torch.cat([h, agg], dim=-1))
@@ -1687,9 +1730,9 @@ class FrontierInitStage(nn.Module):
         node_hidden_size,
         edge_hidden_size,
         pos_bands,
-        n_neighbors=3,
         node_position=True,
         node_ring=False,
+        node_ring_n_neighbors=3,
         edge_midpoint=True,
         edge_length=True,
         edge_direction=True,
@@ -1699,9 +1742,9 @@ class FrontierInitStage(nn.Module):
         super().__init__()
         self.node_hidden_size = node_hidden_size
         self.edge_hidden_size = edge_hidden_size
-        self.n_neighbors = n_neighbors
         self.node_position = node_position
         self.node_ring = node_ring
+        self.node_ring_n_neighbors = node_ring_n_neighbors
         self.edge_midpoint = edge_midpoint
         self.edge_length = edge_length
         self.edge_direction = edge_direction
@@ -1713,7 +1756,7 @@ class FrontierInitStage(nn.Module):
         if node_position:
             node_in_dim += self.pos_encoder.out_dim
         if node_ring:
-            node_in_dim += 2 + 2 * n_neighbors * 3
+            node_in_dim += 2 + 2 * node_ring_n_neighbors * 3
 
         edge_in_dim = 0
         if edge_midpoint:
@@ -1742,7 +1785,7 @@ class FrontierInitStage(nn.Module):
             parts.append(self.pos_encoder(graph.vertices))
         if self.node_ring:
             with nvtx_range("compute_ring_source_features"):
-                parts.append(compute_ring_source_features(graph, self.n_neighbors))
+                parts.append(compute_ring_source_features(graph, self.node_ring_n_neighbors))
         if not parts:
             return self.node_initial.unsqueeze(0).expand(graph.vertices.size(0), -1)
         return self.node_proj(torch.cat(parts, dim=-1))
@@ -1797,6 +1840,12 @@ class SE2FrontierStage(nn.Module):
 
     def forward(self, state):
         h = state.node_features
+        with nvtx_range("se2_frontier_triplet_topology"):
+            topology = compute_se2_triplet_topology(
+                state.graph.edges,
+                state.graph.edge_ptr,
+                state.graph.vertices.size(0),
+            )
         for layer in self.layers:
             with nvtx_range("se2_frontier_message_passing"):
                 h = layer(
@@ -1805,6 +1854,7 @@ class SE2FrontierStage(nn.Module):
                     state.graph.edges,
                     state.graph.edge_ptr,
                     edge_cont=state.edge_features,
+                    topology=topology,
                 )
         return FrontierState(state.graph, h, state.edge_features, state.context_features)
 
@@ -2573,9 +2623,9 @@ class QuadMeshEncoding:
     h_target_batch_offset: torch.Tensor      # [B1 + 1] h_target offsets per agent
 
 
-class QuadMeshingBoundaryEncoder(nn.Module):
+class QuadMeshingEncoder(nn.Module):
     """
-    Boundary-aware encoder for quad_meshing in boundary mode.
+    Encoder for quad_meshing in boundary mode.
 
     Args:
         frontier_node_hidden_size: Dimension of per-frontier-vertex embeddings
@@ -2597,10 +2647,10 @@ class QuadMeshingBoundaryEncoder(nn.Module):
             frontier_context_hidden_size=128,
             target_hidden_size=128,
             pos_bands=6,
-            n_neighbors=3,
             frontier_pipeline=("init", "se2"),
             frontier_init_node_position=False,
             frontier_init_node_ring=False,
+            frontier_init_node_ring_n_neighbors=3,
             frontier_init_edge_midpoint=False,
             frontier_init_edge_length=True,
             frontier_init_edge_direction=False,
@@ -2631,7 +2681,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         self.frontier_edge_hidden_size = frontier_edge_hidden_size
         self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
-        self.n_neighbors = n_neighbors
+        self.frontier_init_node_ring_n_neighbors = frontier_init_node_ring_n_neighbors
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
         if isinstance(frontier_pipeline, str):
@@ -2649,7 +2699,7 @@ class QuadMeshingBoundaryEncoder(nn.Module):
                     node_hidden_size=frontier_node_hidden_size,
                     edge_hidden_size=frontier_edge_hidden_size,
                     pos_bands=pos_bands,
-                    n_neighbors=n_neighbors,
+                    node_ring_n_neighbors=frontier_init_node_ring_n_neighbors,
                     node_position=frontier_init_node_position,
                     node_ring=frontier_init_node_ring,
                     edge_midpoint=frontier_init_edge_midpoint,
@@ -2828,9 +2878,9 @@ class QuadMeshingBoundaryEncoder(nn.Module):
         )
 
 
-class QuadMeshingBoundaryNetwork(nn.Module):
+class QuadMeshingNetwork(nn.Module):
     """
-    Network for boundary-aware quad_meshing policy.
+    Network for quad_meshing policy.
 
     Processes the encoded representations from QuadMeshingBoundaryEncoder to
     produce per-target scores and a per-agent value estimate.
@@ -2839,7 +2889,7 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         frontier_node_hidden_size: Dimension of per-frontier-vertex embeddings
         frontier_context_hidden_size: Dimension of per-observation frontier context embeddings
         target_hidden_size: Dimension of hidden target embeddings
-        num_layers: Number of MLP layers
+        network_layers: Number of MLP layers
     """
 
     def __init__(
@@ -2847,7 +2897,7 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         frontier_node_hidden_size,
         target_hidden_size,
         frontier_context_hidden_size=None,
-        num_layers=2,
+        network_layers=2,
         **kwargs,
     ):
         super().__init__()
@@ -2861,21 +2911,21 @@ class QuadMeshingBoundaryNetwork(nn.Module):
             frontier_node_hidden_size,
             frontier_node_hidden_size,
             frontier_node_hidden_size,
-            num_layers,
+            network_layers,
             final_activation=True,
         )
         self.source_pool_context_mlp = _MLP(
             frontier_node_hidden_size,
             frontier_context_hidden_size,
             frontier_context_hidden_size,
-            num_layers,
+            network_layers,
             final_activation=True,
         )
         self.source_context_mlp = _MLP(
             frontier_context_hidden_size,
             frontier_context_hidden_size,
             frontier_context_hidden_size,
-            num_layers,
+            network_layers,
             final_activation=True,
         )
 
@@ -2883,7 +2933,7 @@ class QuadMeshingBoundaryNetwork(nn.Module):
             target_hidden_size,
             target_hidden_size,
             target_hidden_size,
-            num_layers,
+            network_layers,
             final_activation=True,
         )
 
@@ -2938,9 +2988,9 @@ class QuadMeshingBoundaryNetwork(nn.Module):
         return ()
 
 
-class QuadMeshingBoundaryDecoder(nn.Module):
+class QuadMeshingDecoder(nn.Module):
     """
-    Decoder for boundary-aware quad_meshing policy.
+    Decoder for quad_meshing policy.
 
     Args:
         nvec: Number of action dimensions (always [2] for source/target)
@@ -3039,5 +3089,15 @@ class QuadMeshingBoundaryDecoder(nn.Module):
 
             h_source_per_batch = h_source1[h_source1_batch_offset[:-1] + source_idx] # [B, frontier_node_hidden_size]
             values[substep == 1] = self.target_value_head(h_source_per_batch)
+
+        if torch.isnan(logits).any() or torch.isnan(values).any():
+            nan_logits = torch.isnan(logits).any(dim=1)
+            nan_values = torch.isnan(values).squeeze(-1)
+            rows = torch.nonzero(nan_logits | nan_values, as_tuple=False).flatten()
+            row_list = rows[:16].detach().cpu().tolist()
+            raise RuntimeError(
+                "QuadMeshingDecoder produced NaNs "
+                f"in rows={row_list}"
+            )
 
         return logits, values

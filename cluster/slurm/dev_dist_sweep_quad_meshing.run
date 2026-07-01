@@ -6,13 +6,13 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=normal
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
+#SBATCH --time=1:00:00
 #SBATCH --job-name=puffer-quad-dist-sweep
 #SBATCH --output=slurm-%x-%A_%a.out
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-$HOME/myimages/pufferlib_quad_meshing_cu121.sif}
+IMAGE=${IMAGE:-$HOME/docker-images/pufferlib_quad_meshing_latest.sif}
 SOURCE_DIR=${SOURCE_DIR:-$PWD}
 SWEEP_DIR=${SWEEP_DIR:?Set SWEEP_DIR to a shared path, e.g. /scratch/$USER/puffer_sweeps/quad_meshing}
 WANDB_GROUP=${WANDB_GROUP:-quad_meshing_dist_sweep}
