@@ -16,6 +16,8 @@ typedef struct {
     unsigned char degree;
     unsigned char open_edges;
     int frontier_index;
+    float frontier_quality;
+    bool frontier_quality_dirty;
 } MeshVertex;
 
 DEFINE_VECTOR(MeshVertex, MeshVertexArray)
@@ -179,7 +181,14 @@ static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2
 /** Adds a vertex and returns its index. */
 int mesh_add_vertex(QuadMesh* mesh, Vec2 p) {
     int idx = mesh->vertices.size;
-    MeshVertexArray_push(&mesh->vertices, (MeshVertex){.pos = p, .degree = 0, .open_edges = 0, .frontier_index = -1});
+    MeshVertexArray_push(&mesh->vertices, (MeshVertex){
+        .pos = p,
+        .degree = 0,
+        .open_edges = 0,
+        .frontier_index = -1,
+        .frontier_quality = 0.0f,
+        .frontier_quality_dirty = true,
+    });
     // Push is smart about memory reallocation
     for (int i=0; i<mesh->max_degree; ++i) {
         IntArray_push(&mesh->neighbors, -1);
@@ -244,6 +253,8 @@ int mesh_add_edge(QuadMesh* mesh, int a, int b) {
     size_t bnidx = mesh_neighbor_idx(mesh, b, bdeg);
     mesh->neighbors.data[bnidx] = a;
     mesh->neighbor_edges.data[bnidx] = idx;
+    mesh->vertices.data[a].frontier_quality_dirty = true;
+    mesh->vertices.data[b].frontier_quality_dirty = true;
 
     // Update frontier
     mesh_update_frontier_vertex(mesh, a);
@@ -387,6 +398,7 @@ bool mesh_register_face(QuadMesh* mesh, const int* verts, int n) {
             mesh->vertices.data[e->b].open_edges -= 1;
         }
     }
+    for (int i = 0; i < n; ++i) mesh->vertices.data[verts[i]].frontier_quality_dirty = true;
     
     // Local frontier update
     for (int i = 0; i < n; ++i) mesh_update_frontier_vertex(mesh, verts[i]);
@@ -439,7 +451,7 @@ const char* mesh_valid_reason_str(MeshValidReason r) {
     }
 }
 
-/** Exports the mesh to an OBJ file (vertices + edges as lines). */
+/** Exports the mesh to an OBJ file (vertices + used edges as lines). */
 void mesh_dump_obj(const QuadMesh* mesh, const char* filename) {
     FILE* f = fopen(filename, "w");
     QM_ASSERT(f != NULL);
@@ -450,8 +462,8 @@ void mesh_dump_obj(const QuadMesh* mesh, const char* filename) {
     }
     for (int i = 0; i < mesh->edges.size; i++) {
         MeshEdge* e = &mesh->edges.data[i];
-        fprintf(f, "l %d %d\n", e->a, e->b);
+        if (e->face_count == 0) continue;
+        fprintf(f, "l %d %d\n", e->a + 1, e->b + 1);
     }
     fclose(f);
 }
-

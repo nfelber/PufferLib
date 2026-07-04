@@ -39,6 +39,26 @@
 
 #include "vecenv.h"
 
+static void load_boundary_paths_from_folder(Env* env, Dict* kwargs) {
+    DictItem* folder_item = dict_get_unsafe(kwargs, "boundary_folder");
+    QM_ASSERT(folder_item != NULL && folder_item->ptr != NULL);
+    const char* folder = (const char*)folder_item->ptr;
+
+    DictItem* names_item = dict_get_unsafe(kwargs, "boundary_names");
+    if (names_item != NULL && names_item->value > 0) {
+        const char** names = (const char**)names_item->ptr;
+        int count = (int)names_item->value;
+        const char** paths = (const char**)calloc(count, sizeof(const char*));
+        QM_ASSERT(paths != NULL);
+        for (int i = 0; i < count; ++i) paths[i] = path_join(folder, names[i]);
+        env->boundary_paths = paths;
+        env->boundary_count = count;
+        return;
+    }
+
+    env->boundary_paths = list_files_with_suffix(folder, ".json", &env->boundary_count);
+}
+
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
 
@@ -49,15 +69,24 @@ void my_init(Env* env, Dict* kwargs) {
     env->candidate_radius_max_ratio = (float)dict_get(kwargs, "candidate_radius_max_ratio")->value;
     env->target_edge_length_ratio = (float)dict_get(kwargs, "target_edge_length_ratio")->value;
 
-    DictItem* boundary_item = dict_get_unsafe(kwargs, "boundary_paths");
-    QM_ASSERT(boundary_item != NULL);
-    env->boundary_paths = (const char**)boundary_item->ptr;
-    env->boundary_count = (int)boundary_item->value;
+    load_boundary_paths_from_folder(env, kwargs);
     QM_ASSERT(env->boundary_count > 0);
 
     env->boundary_mode = dict_get(kwargs, "boundary_mode")->value > 0.5;
+    env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
+    DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
+    QM_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
+    env->export_obj_path = (const char*)export_obj_path_item->ptr;
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
+    env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;
+    env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
+    env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;
+    env->frontier_quality_weight = (float)dict_get(kwargs, "frontier_quality_weight")->value;
+    env->frontier_size_pressure_weight = (float)dict_get(kwargs, "frontier_size_pressure_weight")->value;
+    env->degree_pressure_weight = (float)dict_get(kwargs, "degree_pressure_weight")->value;
+    env->safe_frontier_size_ratio = (float)dict_get(kwargs, "safe_frontier_size_ratio")->value;
+    env->safe_degree_ratio = (float)dict_get(kwargs, "safe_degree_ratio")->value;
 
     env->render_target_fps = (int)dict_get(kwargs, "render_target_fps")->value;
     env->render_width = (int)dict_get(kwargs, "render_width")->value;
@@ -86,5 +115,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "episode_length_ratio", log->episode_length_ratio);
+    dict_set(out, "num_quads", log->num_quads);
+    dict_set(out, "num_quads_ratio", log->num_quads_ratio);
     dict_set(out, "n", log->n);
 }

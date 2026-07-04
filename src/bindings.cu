@@ -244,6 +244,14 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
         if (py::isinstance<py::float_>(h) || py::isinstance<py::int_>(h) || py::isinstance<py::bool_>(h)) {
             dict_set(c_dict, key, h.cast<double>());
         }
+        // Python str -> char* pointer
+        else if (py::isinstance<py::str>(h)) {
+            py::str s = h.cast<py::str>();
+            c_dict->items[c_dict->size].key = key;
+            c_dict->items[c_dict->size].ptr = (void*)strdup(PyUnicode_AsUTF8(s.ptr()));
+            c_dict->items[c_dict->size].value = 1.0;
+            c_dict->size++;
+        }
         // Python list → char** pointer + count
         else if (py::isinstance<py::list>(h)) {
             py::list py_list = h.cast<py::list>();
@@ -258,7 +266,7 @@ Dict* py_dict_to_c_dict(py::dict py_dict) {
             c_dict->items[c_dict->size].value = (double)count;
             c_dict->size++;
         }
-        // Anything else (str, None, etc.) → silently skip
+        // Anything else (None, etc.) → silently skip
     }
     return c_dict;
 }

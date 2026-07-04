@@ -211,31 +211,6 @@ class PuffeRL:
         P = Profile
         prof.mark(0)
         for t in range(horizon):
-            # Environment substeps (if present)
-            # for substep in range(self._vec.num_substeps):
-            #     o_device = torch.as_tensor(self.vec_obs, device=device)
-            #
-            #     prof.mark(1)
-            #     with torch.no_grad():
-            #         logits, _, state = self.policy.forward_eval(o_device, self.state, substep)
-            #         action, logprob, _ = sample_logits(logits)
-            #     prof.mark(2)
-            #     prof.elapsed(P.EVAL_GPU, 1, 2)
-            #
-            #     actions_flat = (action if action.dim() > 1 else action.unsqueeze(-1)).to(dtype=torch.float32).contiguous()
-            #     if self.gpu:
-            #         actions_flat = actions_flat.cuda()
-            #         self._vec.gpu_substep(actions_flat.data_ptr(), substep)
-            #         torch.cuda.synchronize()
-            #     else:
-            #         self._vec.cpu_substep(actions_flat.data_ptr(), substep)
-            #     prof.mark(3)
-            #     # prof.elapsed(P.EVAL_ENV_SUBSTEP, 2, 3)
-            #     prof.elapsed(P.EVAL_ENV, 2, 3)
-            #
-            #     with torch.no_grad():
-            #         self.logprobs[t] += logprob
-
             o_device = torch.as_tensor(self.vec_obs, device=device)
 
             prof.mark(1)
@@ -325,19 +300,6 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
 
-            # newlogprob = torch.zeros_like(mb_logprobs, device=device)
-            # entropy = torch.zeros(config['minibatch_size'], device=device)
-            # for substep in range(self._vec.num_substeps + 1):
-            #     prof.mark(1)
-            #     logits, newvalue = self.policy(mb_obs, substep)
-            #     masked_mb_actions = torch.zeros_like(mb_actions, device=device)
-            #     masked_mb_actions[:, :, :substep+1] = mb_actions[:, :, :substep+1] # Assumes each substep maps to exactly one action component
-            #     _, subaction_logprob, subaction_entropy = sample_logits(logits, action=masked_mb_actions)
-            #     prof.mark(2)
-            #     prof.elapsed(P.TRAIN_FORWARD, 1, 2)
-            #
-            #     newlogprob += subaction_logprob.reshape(mb_logprobs.shape)
-            #     entropy += subaction_entropy
             prof.mark(1)
             logits, newvalue = self.policy(mb_obs)
             _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
@@ -396,6 +358,302 @@ class PuffeRL:
 
         self.losses = losses
         self.epoch += 1
+
+
+    # def train(self):
+    #     prof = self.profile
+    #     losses = defaultdict(float)
+    #     config = self.config
+    #     device = self.device
+    #
+    #     clip_coef = config['clip_coef']
+    #     vf_clip = config['vf_clip_coef']
+    #
+    #     # Learning-rate annealing
+    #     learning_rate = config['learning_rate']
+    #     if config['anneal_lr'] and self.epoch > 0:
+    #         lr_ratio = self.epoch / self.total_epochs
+    #         lr_min = config['learning_rate'] * config['min_lr_ratio']
+    #         learning_rate = lr_min + 0.5 * (config['learning_rate'] - lr_min) * (
+    #             1 + np.cos(np.pi * lr_ratio)
+    #         )
+    #
+    #     for group in self.optimizer.param_groups:
+    #         group['lr'] = learning_rate
+    #
+    #     # Transpose from [horizon, agents] to [agents, horizon]
+    #     obs = self.observations.transpose(0, 1).contiguous()
+    #     act = self.actions.transpose(0, 1).contiguous()
+    #     old_values = self.values.T.contiguous().detach()
+    #     old_logprobs = self.logprobs.T.contiguous().detach()
+    #     rewards = self.rewards.T.contiguous().clamp(-1, 1).detach()
+    #     terminals = self.terminals.T.contiguous().detach()
+    #
+    #     # DEBUG
+    #     # def compute_adv(values, rewards, terminals, config, device):
+    #     #     advantages = torch.zeros_like(values, device=device)
+    #     #     importance = torch.ones_like(values, device=device)
+    #     #
+    #     #     return compute_puff_advantage(
+    #     #         values,
+    #     #         rewards,
+    #     #         terminals,
+    #     #         importance,
+    #     #         advantages,
+    #     #         config['gamma'],
+    #     #         config['gae_lambda'],
+    #     #         1.0,
+    #     #         1.0,
+    #     #     )
+    #     #
+    #     #
+    #     # with torch.no_grad():
+    #     #     obs = self.observations.transpose(0, 1).contiguous()
+    #     #     values = self.values.T.contiguous().detach()
+    #     #     rewards = self.rewards.T.contiguous().clamp(-1, 1).detach()
+    #     #     terminals = self.terminals.T.contiguous().detach()
+    #     #
+    #     #     valid_mask = torch.ones_like(values, dtype=torch.bool)
+    #     #     valid_mask[:, -1] = False
+    #     #
+    #     #     c = 0.01
+    #     #
+    #     #     zeros_v = torch.zeros_like(values)
+    #     #     zeros_r = torch.zeros_like(rewards)
+    #     #
+    #     #     A_unscaled = compute_adv(values, rewards, terminals, config, device)
+    #     #     A_scaled_reward_same_values = compute_adv(values, c * rewards, terminals, config, device)
+    #     #     A_both_scaled = compute_adv(c * values, c * rewards, terminals, config, device)
+    #     #     A_expected = c * A_unscaled
+    #     #
+    #     #     A_reward_only = compute_adv(zeros_v, rewards, terminals, config, device)
+    #     #     A_value_only = compute_adv(values, zeros_r, terminals, config, device)
+    #     #
+    #     #     def flat(x):
+    #     #         return x[valid_mask].flatten()
+    #     #
+    #     #     def rms(x):
+    #     #         x = flat(x)
+    #     #         return torch.sqrt(torch.mean(x * x)).item()
+    #     #
+    #     #     def mean_std(x):
+    #     #         x = flat(x)
+    #     #         return x.mean().item(), x.std(unbiased=False).item()
+    #     #
+    #     #     def max_abs_err(a, b):
+    #     #         return (flat(a) - flat(b)).abs().max().item()
+    #     #
+    #     #     def cosine(a, b):
+    #     #         a = flat(a)
+    #     #         b = flat(b)
+    #     #         return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    #     #
+    #     #     print("RMS A_unscaled:", rms(A_unscaled))
+    #     #     print("RMS A_scaled_reward_same_values:", rms(A_scaled_reward_same_values))
+    #     #     print("RMS A_both_scaled:", rms(A_both_scaled))
+    #     #     print("RMS A_expected:", rms(A_expected))
+    #     #
+    #     #     print("RMS reward-only:", rms(A_reward_only))
+    #     #     print("RMS value-only:", rms(A_value_only))
+    #     #     print("RMS 0.01 * reward-only:", rms(c * A_reward_only))
+    #     #
+    #     #     print("max |A_both_scaled - 0.01*A_unscaled|:",
+    #     #           max_abs_err(A_both_scaled, A_expected))
+    #     #
+    #     #     print("cosine A_unscaled vs A_scaled_reward_same_values:",
+    #     #           cosine(A_unscaled, A_scaled_reward_same_values))
+    #     #
+    #     #     print("cosine 0.01*A_reward_only vs A_value_only:",
+    #     #           cosine(c * A_reward_only, A_value_only))
+    #     #
+    #     #     print("mean/std A_unscaled:", mean_std(A_unscaled))
+    #     #     print("mean/std A_scaled_reward_same_values:",
+    #     #           mean_std(A_scaled_reward_same_values))
+    #     # import sys
+    #     # sys.exit()
+    #     # END DEBUG
+    #
+    #     # ---------------------------------------------------------------------
+    #     # Compute fixed GAE advantages and fixed returns ONCE.
+    #     #
+    #     # Your rollout convention stores reward[t] before action[t], so the
+    #     # advantage kernel's use of rewards[t + 1] is preserved.
+    #     #
+    #     # The final timestep has no known next reward inside this rollout, so the
+    #     # kernel leaves advantages[:, -1] effectively unusable. We mask it out.
+    #     # ---------------------------------------------------------------------
+    #     P = Profile
+    #     prof.mark(0)
+    #
+    #     with torch.no_grad():
+    #         advantages = torch.zeros_like(old_values, device=device)
+    #         importance = torch.ones_like(old_values, device=device)
+    #
+    #         advantages = compute_puff_advantage(
+    #             old_values,
+    #             # torch.zeros_like(old_values),
+    #             rewards,
+    #             terminals,
+    #             importance,
+    #             advantages,
+    #             config['gamma'],
+    #             config['gae_lambda'],
+    #             1.0,   # rho_clip disabled because importance = 1
+    #             1.0,   # c_clip disabled because importance = 1
+    #         )
+    #
+    #         returns = advantages + old_values
+    #
+    #         # Valid PPO transitions. Last timestep has no following reward in this
+    #         # rollout convention, so exclude it from losses and advantage norm.
+    #         valid_mask = torch.ones_like(advantages, dtype=torch.bool, device=device)
+    #         valid_mask[:, -1] = False
+    #
+    #         # Normalize advantages globally over valid transitions only.
+    #         valid_adv = advantages[valid_mask]
+    #         adv_mean = valid_adv.mean()
+    #         adv_std = valid_adv.std(unbiased=False)
+    #
+    #         norm_advantages = torch.zeros_like(advantages, device=device)
+    #         norm_advantages[valid_mask] = (
+    #             (advantages[valid_mask] - adv_mean) / (adv_std + 1e-8)
+    #         )
+    #
+    #     total_agents = old_values.shape[0]
+    #     horizon = old_values.shape[1]
+    #
+    #     # Keep compatibility with the existing class if minibatch_segments exists.
+    #     # Usually minibatch_segments = minibatch_size // horizon.
+    #     segments_per_minibatch = getattr(
+    #         self,
+    #         'minibatch_segments',
+    #         max(1, config['minibatch_size'] // horizon),
+    #     )
+    #
+    #     n_epochs = int(config.get('n_epochs', config.get('replay_ratio', 1)))
+    #
+    #     update_count = 0
+    #
+    #     for _ in range(n_epochs):
+    #         permutation = torch.randperm(total_agents, device=device)
+    #
+    #         for start in range(0, total_agents, segments_per_minibatch):
+    #             idx = permutation[start:start + segments_per_minibatch]
+    #
+    #             torch.index_select(obs, 0, idx, out=self.mb_observations)
+    #             mb_obs = self.mb_observations
+    #             mb_actions = act[idx]
+    #             mb_old_logprobs = old_logprobs[idx]
+    #             mb_old_values = old_values[idx]
+    #             mb_returns = returns[idx]
+    #             mb_advantages = norm_advantages[idx]
+    #             mb_valid_mask = valid_mask[idx]
+    #
+    #             prof.mark(1)
+    #             logits, newvalue = self.policy(mb_obs)
+    #             _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+    #             prof.mark(2)
+    #             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
+    #
+    #             newlogprob = newlogprob.reshape(mb_old_logprobs.shape)
+    #             newvalue = newvalue.view(mb_returns.shape)
+    #
+    #             if entropy.shape != mb_old_logprobs.shape:
+    #                 entropy = entropy.reshape(mb_old_logprobs.shape)
+    #
+    #             logratio = newlogprob - mb_old_logprobs
+    #             ratio = logratio.exp()
+    #
+    #             mask = mb_valid_mask.float()
+    #             denom = mask.sum().clamp_min(1.0)
+    #
+    #             def masked_mean(x):
+    #                 return (x * mask).sum() / denom
+    #
+    #             with torch.no_grad():
+    #                 old_approx_kl = masked_mean(-logratio)
+    #                 approx_kl = masked_mean((ratio - 1.0) - logratio)
+    #                 clipfrac = masked_mean(
+    #                     ((ratio - 1.0).abs() > clip_coef).float()
+    #                 )
+    #
+    #             # PPO clipped policy loss
+    #             pg_loss1 = -mb_advantages * ratio
+    #             pg_loss2 = -mb_advantages * torch.clamp(
+    #                 ratio,
+    #                 1.0 - clip_coef,
+    #                 1.0 + clip_coef,
+    #             )
+    #             pg_loss = masked_mean(torch.max(pg_loss1, pg_loss2))
+    #
+    #             # PPO clipped value loss.
+    #             # IMPORTANT: clipping is relative to frozen rollout-time values.
+    #             v_clipped = mb_old_values + torch.clamp(
+    #                 newvalue - mb_old_values,
+    #                 -vf_clip,
+    #                 vf_clip,
+    #             )
+    #             v_loss_unclipped = (newvalue - mb_returns) ** 2
+    #             v_loss_clipped = (v_clipped - mb_returns) ** 2
+    #             v_loss = 0.5 * masked_mean(
+    #                 torch.max(v_loss_unclipped, v_loss_clipped)
+    #             )
+    #
+    #             entropy_loss = masked_mean(entropy)
+    #
+    #             loss = (
+    #                 pg_loss
+    #                 + config['vf_coef'] * v_loss
+    #                 - config['ent_coef'] * entropy_loss
+    #             )
+    #
+    #             self.optimizer.zero_grad()
+    #             loss.backward()
+    #             torch.nn.utils.clip_grad_norm_(
+    #                 self.policy.parameters(),
+    #                 config['max_grad_norm'],
+    #             )
+    #             self.optimizer.step()
+    #
+    #             losses['policy_loss'] += pg_loss.detach()
+    #             losses['value_loss'] += v_loss.detach()
+    #             losses['entropy'] += entropy_loss.detach()
+    #             losses['old_approx_kl'] += old_approx_kl.detach()
+    #             losses['approx_kl'] += approx_kl.detach()
+    #             losses['clipfrac'] += clipfrac.detach()
+    #             losses['importance'] += masked_mean(ratio).detach()
+    #
+    #             update_count += 1
+    #
+    #     prof.mark(1)
+    #     prof.elapsed(P.TRAIN, 0, 1)
+    #
+    #     if update_count > 0:
+    #         losses = {k: (v.item() / update_count) for k, v in losses.items()}
+    #     else:
+    #         losses = {k: 0.0 for k in losses}
+    #
+    #     # Explained variance against fixed returns.
+    #     with torch.no_grad():
+    #         y_true = returns[valid_mask]
+    #         y_pred = old_values[valid_mask]
+    #
+    #         var_y = y_true.var(unbiased=False)
+    #         if var_y == 0:
+    #             explained_var = torch.nan
+    #         else:
+    #             explained_var = 1.0 - (
+    #                 (y_true - y_pred).var(unbiased=False) / var_y
+    #             )
+    #
+    #         losses['explained_variance'] = (
+    #             explained_var.item()
+    #             if torch.isfinite(explained_var)
+    #             else float('nan')
+    #         )
+    #
+    #     self.losses = losses
+    #     self.epoch += 1
 
     def log(self):
         P = Profile

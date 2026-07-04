@@ -25,6 +25,8 @@ int main() {
     env.boundary_paths = boundary_paths;
     env.boundary_count = (int)(sizeof(boundary_paths) / sizeof(boundary_paths[0]));
     env.boundary_mode = false;
+    env.export_obj = false;
+    env.export_obj_path = "quad_meshing.obj";
     env.candidate_rings = 10;
     env.candidate_angles = 64;
     env.target_edge_length_ratio = 1.0;
@@ -32,6 +34,14 @@ int main() {
     env.candidate_radius_max_ratio = 2.0;
     env.reward_invalid = -0.1;
     env.reward_incomplete = -1.0;
+    env.base_quad_reward = 0.0;
+    env.potential_beta = 0.5;
+    env.potential_gamma = 0.997;
+    env.frontier_quality_weight = 1.0;
+    env.frontier_size_pressure_weight = 1.0;
+    env.degree_pressure_weight = 1.0;
+    env.safe_frontier_size_ratio = 0.9;
+    env.safe_degree_ratio = 0.7;
     env.render_width = 1200;
     env.render_height = 900;
     env.render_target_fps = 144;
@@ -45,8 +55,8 @@ int main() {
     unsigned int rng = 42;
     double key_repeat_cd = 0.01;
 
-    env.max_frontier = 1024;
-    env.max_degree = 16;
+    env.max_frontier = 256;
+    env.max_degree = 8;
     env.grid_res = 32;
     env.grid_cell_size = 1.0 / (float)env.grid_res;
     env.grid_cell_cap = 8;

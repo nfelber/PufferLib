@@ -1758,7 +1758,7 @@ class FrontierInitStage(nn.Module):
         edge_target_log_length=True,
         edge_relative_length=True,
         edge_direction=True,
-        edge_flags=True,
+        edge_face_incidence=True,
         eps=1e-8,
     ):
         super().__init__()
@@ -1773,7 +1773,7 @@ class FrontierInitStage(nn.Module):
         self.edge_target_log_length = edge_target_log_length
         self.edge_relative_length = edge_relative_length
         self.edge_direction = edge_direction
-        self.edge_flags = edge_flags
+        self.edge_face_incidence = edge_face_incidence
         self.eps = eps
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
@@ -1796,7 +1796,7 @@ class FrontierInitStage(nn.Module):
             edge_in_dim += 1
         if edge_direction:
             edge_in_dim += 2
-        if edge_flags:
+        if edge_face_incidence:
             edge_in_dim += 2
 
         self.node_proj = layer_init(nn.Linear(node_in_dim, node_hidden_size)) if node_in_dim > 0 else None
@@ -1845,7 +1845,7 @@ class FrontierInitStage(nn.Module):
             parts.append((length - target_length) / (length + target_length + self.eps))
         if self.edge_direction:
             parts.append(self._canonical_direction(delta, length, self.eps))
-        if self.edge_flags:
+        if self.edge_face_incidence:
             parts.append(graph.edge_features.to(dtype=graph.vertices.dtype))
 
         if not parts:
@@ -2733,7 +2733,7 @@ class QuadMeshingEncoder(nn.Module):
             frontier_init_edge_target_log_length=True,
             frontier_init_edge_relative_length=True,
             frontier_init_edge_direction=False,
-            frontier_init_edge_flags=True,
+            frontier_init_edge_face_incidence=True,
             frontier_se2_layers=2,
             frontier_perceiver_num_latents=32,
             frontier_perceiver_layers=2,
@@ -2790,7 +2790,7 @@ class QuadMeshingEncoder(nn.Module):
                     edge_target_log_length=frontier_init_edge_target_log_length,
                     edge_relative_length=frontier_init_edge_relative_length,
                     edge_direction=frontier_init_edge_direction,
-                    edge_flags=frontier_init_edge_flags,
+                    edge_face_incidence=frontier_init_edge_face_incidence,
                 ))
             elif stage == "perceiver":
                 stages.append(FrontierPerceiverStage(
