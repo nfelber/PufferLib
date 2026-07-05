@@ -154,14 +154,14 @@ void quad_meshing_init(QuadMeshingEnv* env)
 }
 
 void add_log(QuadMeshingEnv* env) {
-    // env->log.perf += env->episode_return * env->cache.target_quad_area / env->cache.starting_boundary_area;
-    env->log.perf += env->episode_return;
+    const float area_scale = env->cache.target_quad_area / env->cache.starting_boundary_area;
+    env->log.perf += env->episode_return * area_scale;
     env->log.score += env->episode_return;
     env->log.episode_length += env->episode_length;
     env->log.episode_length_ratio += (float)env->episode_length / env->cache.episode_max_length;
     env->log.episode_return += env->episode_return;
     env->log.num_quads += (float)env->num_quads;
-    env->log.num_quads_ratio += (float)env->num_quads * env->cache.target_quad_area / env->cache.starting_boundary_area;
+    env->log.num_quads_ratio += (float)env->num_quads * area_scale;
     env->log.n++;
 }
 

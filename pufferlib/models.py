@@ -25,13 +25,6 @@ class Policy(nn.Module):
         self.decoder = decoder
         self.network = network
 
-        # sig = inspect.signature(encoder.forward)
-        # self.accepts_substep = (
-        #     "substep" in sig.parameters
-        #     or any(p.kind == inspect.Parameter.VAR_KEYWORD
-        #            for p in sig.parameters.values())
-        # )
-
     def initial_state(self, batch_size, device):
         return self.network.initial_state(batch_size, device)
 
@@ -661,6 +654,7 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         self.chiral = chiral
         self.eps = eps
         self.out_dim = out_dim
+        self.scalar_residual = node_dim == out_dim
 
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
         phi_m_in = (
@@ -727,7 +721,8 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         agg_v = agg_v / denom[:, None, None]
 
         agg_v_norm = torch.linalg.vector_norm(agg_v, dim=-1)
-        h_out = self.phi_h(torch.cat([h, agg_s, agg_v_norm], dim=-1))
+        h_update = self.phi_h(torch.cat([h, agg_s, agg_v_norm], dim=-1))
+        h_out = h + h_update if self.scalar_residual else h_update
         gate = torch.tanh(self.vector_gate(h_out)).unsqueeze(-1)
         v_out = vectors + gate * agg_v
         return h_out, v_out
@@ -2462,6 +2457,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         num_heads=4,
         mlp_ratio=4,
         dropout=0.0,
+        residual_scale_init=0.0,
         eps=1e-8,
     ):
         super().__init__()
@@ -2476,6 +2472,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         self.vector_channels = vector_channels
         self.chiral = chiral
         self.eps = eps
+        self.global_residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
 
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
         frontier_token_dim = 2 * frontier_node_hidden_size + 1 + 2 * vector_scalar_dim
@@ -2585,7 +2582,8 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
 
         pos = torch.arange(Q, device=h_target.device) - targets.target_batch_offsets[targets.target_batches]
         decoded_targets = decoded[targets.target_batches, pos]
-        target_features = self.target_out(torch.cat([h_target, decoded_targets], dim=-1))
+        target_update = self.target_out(torch.cat([h_target, decoded_targets], dim=-1))
+        target_features = h_target + self.global_residual_scale * target_update
         return TargetState(targets, target_features)
 
 
@@ -3113,6 +3111,7 @@ class QuadMeshingEncoder(nn.Module):
             target_global_perceiver_heads=4,
             target_global_perceiver_mlp_ratio=4,
             target_global_perceiver_dropout=0.0,
+            target_global_perceiver_residual_scale_init=0.0,
             **kwargs
     ):
         super().__init__()
@@ -3233,6 +3232,7 @@ class QuadMeshingEncoder(nn.Module):
                     num_heads=target_global_perceiver_heads,
                     mlp_ratio=target_global_perceiver_mlp_ratio,
                     dropout=target_global_perceiver_dropout,
+                    residual_scale_init=target_global_perceiver_residual_scale_init,
                 ))
             elif stage == "source_condition":
                 target_stages.append(TargetSourceConditionStage(
@@ -3255,10 +3255,6 @@ class QuadMeshingEncoder(nn.Module):
             with nvtx_range(f"frontier_stage_{name}"):
                 state = stage(state)
         return state
-
-    def _encode_sources(self, graph: CSRGraph):
-        state = self._encode_frontier(graph)
-        return state.node_features, state.context_features
 
     def _encode_targets(self, targets: CandidateTargets, frontier_state: FrontierState):
         state = TargetState(
@@ -3306,7 +3302,9 @@ class QuadMeshingEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            h_source0, h_source0_context = self._encode_sources(graph)
+            frontier_state = self._encode_frontier(graph)
+            h_source0 = frontier_state.node_features
+            h_source0_context = frontier_state.context_features
             h_source0_batch_offset = graph.batch_offsets
         else:
             h_source0 = torch.empty(0, self.frontier_node_hidden_size, device=device)
@@ -3495,7 +3493,6 @@ class QuadMeshingDecoder(nn.Module):
         self.target_hidden_size = target_hidden_size
 
         self.source_head = layer_init(nn.Linear(frontier_node_hidden_size, 1), 0.01)
-
         self.target_head = layer_init(nn.Linear(target_hidden_size, 1), 0.01)
 
         self.source_value_head = layer_init(nn.Linear(frontier_context_hidden_size, 1), 1)
