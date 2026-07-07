@@ -39,24 +39,24 @@
 
 #include "vecenv.h"
 
-static void load_boundary_paths_from_folder(Env* env, Dict* kwargs) {
-    DictItem* folder_item = dict_get_unsafe(kwargs, "boundary_folder");
+static void load_shape_paths_from_folder(Env* env, Dict* kwargs) {
+    DictItem* folder_item = dict_get_unsafe(kwargs, "shape_folder");
     QM_ASSERT(folder_item != NULL && folder_item->ptr != NULL);
     const char* folder = (const char*)folder_item->ptr;
 
-    DictItem* names_item = dict_get_unsafe(kwargs, "boundary_names");
+    DictItem* names_item = dict_get_unsafe(kwargs, "shape_names");
     if (names_item != NULL && names_item->value > 0) {
         const char** names = (const char**)names_item->ptr;
         int count = (int)names_item->value;
         const char** paths = (const char**)calloc(count, sizeof(const char*));
         QM_ASSERT(paths != NULL);
         for (int i = 0; i < count; ++i) paths[i] = path_join(folder, names[i]);
-        env->boundary_paths = paths;
-        env->boundary_count = count;
+        env->shape_paths = paths;
+        env->shape_count = count;
         return;
     }
 
-    env->boundary_paths = list_files_with_suffix(folder, ".json", &env->boundary_count);
+    env->shape_paths = list_files_with_suffix(folder, ".qmshape", &env->shape_count);
 }
 
 void my_init(Env* env, Dict* kwargs) {
@@ -69,8 +69,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->candidate_radius_max_ratio = (float)dict_get(kwargs, "candidate_radius_max_ratio")->value;
     env->target_edge_length_ratio = (float)dict_get(kwargs, "target_edge_length_ratio")->value;
 
-    load_boundary_paths_from_folder(env, kwargs);
-    QM_ASSERT(env->boundary_count > 0);
+    load_shape_paths_from_folder(env, kwargs);
+    QM_ASSERT(env->shape_count > 0);
 
     env->boundary_mode = dict_get(kwargs, "boundary_mode")->value > 0.5;
     env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
@@ -93,6 +93,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->render_height = (int)dict_get(kwargs, "render_height")->value;
     env->render_show_frontier = dict_get(kwargs, "render_show_frontier")->value > 0.5;
     env->render_show_candidates = dict_get(kwargs, "render_show_candidates")->value > 0.5;
+    env->render_show_cross_field = dict_get(kwargs, "render_show_cross_field")->value > 0.5;
     env->render_line_thickness = (float)dict_get(kwargs, "render_line_thickness")->value;
     env->render_point_radius = (float)dict_get(kwargs, "render_point_radius")->value;
     env->render_candidate_radius = (float)dict_get(kwargs, "render_candidate_radius")->value;

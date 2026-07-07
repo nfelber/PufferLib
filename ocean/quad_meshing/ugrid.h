@@ -126,6 +126,30 @@ UGridCellIterator ugrid_point_query(const UGrid* grid, Vec2 p) {
     };
 }
 
+void ugrid_aabb_query(
+    const UGrid* grid,
+    float min_x,
+    float min_y,
+    float max_x,
+    float max_y,
+    UGridCellIteratorArray* it
+) {
+    int min_cell_x = (int)floorf(grid->inv_cell_size * min_x);
+    int min_cell_y = (int)floorf(grid->inv_cell_size * min_y);
+    int max_cell_x = (int)floorf(grid->inv_cell_size * max_x);
+    int max_cell_y = (int)floorf(grid->inv_cell_size * max_y);
+
+    for (int y = min_cell_y; y <= max_cell_y; ++y) {
+        for (int x = min_cell_x; x <= max_cell_x; ++x) {
+            UGridCellIteratorArray_push(it, (UGridCellIterator) {
+                .grid = grid,
+                .cell = ugrid_cell_idx(grid, x, y),
+                .i = 0,
+            });
+        }
+    }
+}
+
 void ugrid_segment_query_dda(const UGrid* grid, Vec2 from, Vec2 to, UGridCellIteratorArray* it) {
     const float eps_t = 1e-7f;
 
@@ -458,4 +482,3 @@ void ugrid_segment_query(
         }
     }
 }
-

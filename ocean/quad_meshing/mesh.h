@@ -18,6 +18,7 @@ typedef struct {
     int frontier_index;
     float frontier_quality;
     bool frontier_quality_dirty;
+    bool disabled;
 } MeshVertex;
 
 DEFINE_VECTOR(MeshVertex, MeshVertexArray)
@@ -27,6 +28,7 @@ typedef struct {
     int b;
     unsigned char face_count;
     bool face_orientation_cw;
+    bool disabled;
 } MeshEdge;
 
 DEFINE_VECTOR(MeshEdge, MeshEdgeArray)
@@ -120,8 +122,11 @@ static bool mesh_edge_face_orientation_from_vertex(const QuadMesh* mesh, int edg
 /** Returns edge index or -1 if missing. */
 int mesh_edge_index(const QuadMesh* mesh, int a, int b) {
     for (int i = 0; i < mesh->vertices.data[a].degree; i++) {
-        if (mesh->neighbors.data[mesh_neighbor_idx(mesh, a, i)] == b) {
-            return mesh->neighbor_edges.data[mesh_neighbor_idx(mesh, a, i)];
+        int nidx = mesh_neighbor_idx(mesh, a, i);
+        int eidx = mesh->neighbor_edges.data[nidx];
+        if (mesh->edges.data[eidx].disabled) continue;
+        if (mesh->neighbors.data[nidx] == b) {
+            return eidx;
         }
     }
     return -1;
@@ -136,10 +141,12 @@ static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2
         int nidx = mesh_neighbor_idx(mesh, source, i);
         int nvidx = mesh->neighbors.data[nidx];
         int eidx = mesh->neighbor_edges.data[nidx];
-        if (mesh->edges.data[eidx].face_count != 1) continue;
+        if (mesh->edges.data[eidx].disabled) continue;
         Vec2 np = mesh->vertices.data[nvidx].pos;
         Vec2 evec = sub2(np, source_pos);
         float ang = atan2f(cross2(evec, tvec), dot2(evec, tvec));
+        if (fabs(ang) < 1e-2) return MESH_VALID_WEDGE_BLOCKED;
+        if (mesh->edges.data[eidx].face_count != 1) continue;
         if (ang <= 0.0f) ang += 2.0f * M_PI;
         if (ang < best_angle) {
             best_angle = ang;
@@ -166,6 +173,7 @@ static MeshValidReason mesh_validate_edge(const QuadMesh* mesh, int source, Vec2
     for (int i=0; i<mesh->grid_it.size; ++i) {
         UGridCellIterator* it = &mesh->grid_it.data[i];
         for (int eidx; (eidx = ugrid_cell_it_next(it)) != -1;) {
+            if (mesh->edges.data[eidx].disabled) continue;
             int a = mesh->edges.data[eidx].a;
             int b = mesh->edges.data[eidx].b;
             if (a == source || b == source || a == target_idx || b == target_idx) continue;
@@ -188,6 +196,7 @@ int mesh_add_vertex(QuadMesh* mesh, Vec2 p) {
         .frontier_index = -1,
         .frontier_quality = 0.0f,
         .frontier_quality_dirty = true,
+        .disabled = false,
     });
     // Push is smart about memory reallocation
     for (int i=0; i<mesh->max_degree; ++i) {
@@ -199,6 +208,7 @@ int mesh_add_vertex(QuadMesh* mesh, Vec2 p) {
 
 /** Returns 1 if vertex has open edges and degree < max_degree. */
 int mesh_vertex_is_frontier(const QuadMesh* mesh, int v) {
+    if (mesh->vertices.data[v].disabled) return 0;
     return (mesh->vertices.data[v].open_edges > 0 && mesh->vertices.data[v].degree < mesh->max_degree) || mesh->vertices.data[v].degree == 0;
 }
 
@@ -240,7 +250,7 @@ int mesh_add_edge(QuadMesh* mesh, int a, int b) {
 
     // Add edge
     int idx = mesh->edges.size;
-    MeshEdgeArray_push(&mesh->edges, (MeshEdge){.a = a, .b = b, .face_count = 0, .face_orientation_cw = false});
+    MeshEdgeArray_push(&mesh->edges, (MeshEdge){.a = a, .b = b, .face_count = 0, .face_orientation_cw = false, .disabled = false});
     mesh->vertices.data[a].open_edges += 1;
     mesh->vertices.data[b].open_edges += 1;
     QM_ASSERT(mesh->vertices.data[a].degree < mesh->max_degree);
@@ -270,6 +280,106 @@ int mesh_add_edge(QuadMesh* mesh, int a, int b) {
     }
 
     return idx;
+}
+
+static void mesh_remove_neighbor_edge(QuadMesh* mesh, int v, int eidx) {
+    MeshVertex* vertex = &mesh->vertices.data[v];
+    for (int i = 0; i < vertex->degree; ++i) {
+        int nidx = mesh_neighbor_idx(mesh, v, i);
+        if (mesh->neighbor_edges.data[nidx] != eidx) continue;
+
+        int last = vertex->degree - 1;
+        int last_idx = mesh_neighbor_idx(mesh, v, last);
+        mesh->neighbors.data[nidx] = mesh->neighbors.data[last_idx];
+        mesh->neighbor_edges.data[nidx] = mesh->neighbor_edges.data[last_idx];
+        mesh->neighbors.data[last_idx] = -1;
+        mesh->neighbor_edges.data[last_idx] = -1;
+        vertex->degree--;
+        return;
+    }
+}
+
+void mesh_disable_edge(QuadMesh* mesh, int eidx) {
+    MeshEdge* e = &mesh->edges.data[eidx];
+    if (e->disabled) return;
+
+    int a = e->a;
+    int b = e->b;
+
+    if (e->face_count < 2) {
+        QM_ASSERT(mesh->vertices.data[a].open_edges > 0);
+        QM_ASSERT(mesh->vertices.data[b].open_edges > 0);
+        mesh->vertices.data[a].open_edges -= 1;
+        mesh->vertices.data[b].open_edges -= 1;
+    }
+
+    mesh_remove_neighbor_edge(mesh, a, eidx);
+    mesh_remove_neighbor_edge(mesh, b, eidx);
+    mesh->vertices.data[a].frontier_quality_dirty = true;
+    mesh->vertices.data[b].frontier_quality_dirty = true;
+    e->disabled = true;
+
+    if (mesh->vertices.data[a].degree == 0) mesh->vertices.data[a].disabled = true;
+    if (mesh->vertices.data[b].degree == 0) mesh->vertices.data[b].disabled = true;
+
+    mesh_update_frontier_vertex(mesh, a);
+    mesh_update_frontier_vertex(mesh, b);
+}
+
+static bool mesh_edge_is_face_boundary(const QuadMesh* mesh, int eidx, const int* verts, int n) {
+    MeshEdge e = mesh->edges.data[eidx];
+    for (int i = 0; i < n; ++i) {
+        int u = verts[i];
+        int v = verts[(i + 1) % n];
+        if ((e.a == u && e.b == v) || (e.a == v && e.b == u)) return true;
+    }
+    return false;
+}
+
+void mesh_disable_edges_inside_face(QuadMesh* mesh, const int* verts, int n) {
+    QM_ASSERT(n <= 4);
+
+    Vec2 face[4];
+    float min_x = INFINITY;
+    float min_y = INFINITY;
+    float max_x = -INFINITY;
+    float max_y = -INFINITY;
+    for (int i = 0; i < n; ++i) {
+        face[i] = mesh->vertices.data[verts[i]].pos;
+        min_x = fminf(min_x, face[i].x);
+        min_y = fminf(min_y, face[i].y);
+        max_x = fmaxf(max_x, face[i].x);
+        max_y = fmaxf(max_y, face[i].y);
+    }
+
+    UGridCellIteratorArray_resize(&mesh->grid_it, 0);
+    ugrid_aabb_query(&mesh->edge_grid, min_x, min_y, max_x, max_y, &mesh->grid_it);
+
+    BoolArray seen;
+    BoolArray_init(&seen);
+    BoolArray_resize(&seen, mesh->edges.size);
+    for (int i = 0; i < seen.size; ++i) seen.data[i] = false;
+
+    for (int i = 0; i < mesh->grid_it.size; ++i) {
+        UGridCellIterator* it = &mesh->grid_it.data[i];
+        for (int eidx; (eidx = ugrid_cell_it_next(it)) != -1;) {
+            if (seen.data[eidx]) continue;
+            seen.data[eidx] = true;
+
+            MeshEdge* e = &mesh->edges.data[eidx];
+            if (e->disabled) continue;
+            if (mesh_edge_is_face_boundary(mesh, eidx, verts, n)) continue;
+
+            Vec2 a = mesh->vertices.data[e->a].pos;
+            Vec2 b = mesh->vertices.data[e->b].pos;
+            Vec2 mid = scalmul2(add2(a, b), 0.5f);
+            if (point_in_polygon(mid, face, n, 0.0)) {
+                mesh_disable_edge(mesh, eidx);
+            }
+        }
+    }
+
+    BoolArray_free(&seen);
 }
 
 /** Maybe useful at some point **/
@@ -379,7 +489,7 @@ bool mesh_register_face(QuadMesh* mesh, const int* verts, int n) {
         int u = verts[i];
         int v = verts[(i + 1) % n];
         int eidx = mesh_edge_index(mesh, u, v);
-        QM_ASSERT(eidx >= 0);
+        if (eidx < 0) return false; // Edge was disabled
         MeshEdge* e = &mesh->edges.data[eidx];
         if (e->face_count == 2) return false;
         edges[i] = e;
@@ -462,7 +572,8 @@ void mesh_dump_obj(const QuadMesh* mesh, const char* filename) {
     }
     for (int i = 0; i < mesh->edges.size; i++) {
         MeshEdge* e = &mesh->edges.data[i];
-        if (e->face_count == 0) continue;
+        // if (e->disabled) continue;
+        // if (e->face_count == 0) continue;
         fprintf(f, "l %d %d\n", e->a + 1, e->b + 1);
     }
     fclose(f);

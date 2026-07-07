@@ -8,22 +8,11 @@
 int main() {
     QuadMeshingEnv env = {0};
     env.episode_max_length_ratio = 1.5;
-    static const char* boundary_paths[] = {
-      "resources/quad_meshing/boundaries/square.json",
-      "resources/quad_meshing/boundaries/dolphin.json"
-      // "resources/quad_meshing/boundaries/rat-18.json",
-      // "resources/quad_meshing/boundaries/cup-13.json",
-      // "resources/quad_meshing/boundaries/chopper-12.json",
-      // "resources/quad_meshing/boundaries/classic-8.json",
-      // "resources/quad_meshing/boundaries/dog-12.json",
-      // "resources/quad_meshing/boundaries/Bone-11.json",
-      // "resources/quad_meshing/boundaries/stef-19.json",
-      // "resources/quad_meshing/boundaries/bell-19.json",
-      // "resources/quad_meshing/boundaries/fork-18.json",
-      // "resources/quad_meshing/boundaries/pencil-11.json"
+    static const char* shape_paths[] = {
+      "resources/quad_meshing/shapes/dolphin.qmshape"
     };
-    env.boundary_paths = boundary_paths;
-    env.boundary_count = (int)(sizeof(boundary_paths) / sizeof(boundary_paths[0]));
+    env.shape_paths = shape_paths;
+    env.shape_count = (int)(sizeof(shape_paths) / sizeof(shape_paths[0]));
     env.boundary_mode = false;
     env.export_obj = false;
     env.export_obj_path = "quad_meshing.obj";
@@ -32,11 +21,11 @@ int main() {
     env.target_edge_length_ratio = 1.0;
     env.candidate_radius_min_ratio = 0.5;
     env.candidate_radius_max_ratio = 2.0;
-    env.reward_invalid = -0.1;
+    env.reward_invalid = -0.05;
     env.reward_incomplete = -1.0;
     env.base_quad_reward = 0.0;
-    env.potential_beta = 0.5;
-    env.potential_gamma = 0.997;
+    env.potential_beta = 0.05;
+    env.potential_gamma = 1.0;
     env.frontier_quality_weight = 1.0;
     env.frontier_size_pressure_weight = 1.0;
     env.degree_pressure_weight = 1.0;
@@ -47,6 +36,7 @@ int main() {
     env.render_target_fps = 144;
     env.render_show_frontier = true;
     env.render_show_candidates = true;
+    env.render_show_cross_field = false;
     env.render_line_thickness = 2.0f;
     env.render_point_radius = 4.0f;
     env.render_candidate_radius = 3.0f;

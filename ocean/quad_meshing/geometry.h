@@ -12,6 +12,12 @@ typedef struct {
 
 DEFINE_VECTOR(Vec2, Vec2Array);
 
+typedef struct {
+    Vec2 a;
+    Vec2 b;
+    Vec2 c;
+} Triangle2;
+
 static inline Vec2 add2(Vec2 a, Vec2 b) { 
     return (Vec2){a.x + b.x, a.y + b.y}; 
 }
@@ -97,6 +103,43 @@ float polygon_area(const Vec2* poly, int size) {;
 /** Returns 1 if polygon is CCW. */
 bool polygon_is_ccw(const Vec2* poly, int size) {
     return polygon_signed_area(poly, size) > 0.0f;
+}
+
+float triangle_area2(Triangle2 tri) {
+    return cross2(sub2(tri.b, tri.a), sub2(tri.c, tri.a));
+}
+
+bool point_in_triangle(Vec2 p, Triangle2 tri, float eps) {
+    Vec2 v0 = sub2(tri.b, tri.a);
+    Vec2 v1 = sub2(tri.c, tri.a);
+    Vec2 v2 = sub2(p, tri.a);
+    float den = cross2(v0, v1);
+    QM_ASSERT(fabsf(den) > 1e-12f);
+
+    float w1 = cross2(v2, v1) / den;
+    float w2 = cross2(v0, v2) / den;
+    float w0 = 1.0f - w1 - w2;
+
+    return w0 >= -eps && w1 >= -eps && w2 >= -eps;
+}
+
+float point_segment_dist_sq(Vec2 p, Vec2 a, Vec2 b);
+
+bool point_in_polygon(Vec2 p, const Vec2* poly, int size, float eps) {
+    bool inside = false;
+    for (int i = 0, j = size - 1; i < size; j = i++) {
+        Vec2 a = poly[i];
+        Vec2 b = poly[j];
+
+        if (point_segment_dist_sq(p, a, b) <= eps * eps) return true;
+
+        bool crosses = (a.y > p.y) != (b.y > p.y);
+        if (crosses) {
+            float x = (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x;
+            if (p.x < x + eps) inside = !inside;
+        }
+    }
+    return inside;
 }
 
 float polygonInteriorAngle(const Vec2* poly, int size, int i, bool isCCW) {
@@ -216,4 +259,3 @@ bool segments_intersect(Vec2 p1, Vec2 p2, Vec2 q1, Vec2 q2, float tol) {
            point_segment_dist_sq(q1, p1, p2) <= tol2 ||
            point_segment_dist_sq(q2, p1, p2) <= tol2;
 }
-

@@ -303,7 +303,8 @@ class QuadMeshingInspector:
         if compute_global_delta and substep == 1 and self.has_global_residual():
             _, (ablated_logits, _) = self._policy_outputs(ablate_global=True)
             ablated_scores = ablated_logits[agent_idx, :count]
-            global_delta = (logits[agent_idx, :count] - ablated_scores).detach().cpu()
+            # global_delta = (logits[agent_idx, :count] - ablated_scores).detach().cpu()
+            global_delta = ablated_scores.detach().cpu() # TODO: this is not global delta, just a quick test
             global_rank_delta = (action_ranks(logits[agent_idx, :count]) - action_ranks(ablated_scores)).detach().cpu()
 
         comparison_delta = None

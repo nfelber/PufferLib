@@ -3039,6 +3039,10 @@ def distance_to_graph_edges(
 
 @dataclass
 class QuadMeshEncoding:
+    # TODO: experimental
+    # rand: torch.Tensor
+    graph0: CSRGraph
+    graph1: CSRGraph
     substep: torch.Tensor                    # [B] substep per agent
     h_source0: torch.Tensor                  # [total_nodes0, frontier_node_hidden_size], source vertex hidden states (substep 0)
     h_source1: torch.Tensor                  # [total_nodes1, frontier_node_hidden_size], source vertex hidden states (substep 1)
@@ -3291,7 +3295,7 @@ class QuadMeshingEncoder(nn.Module):
         # SUBSTEP 0
         if B0 > 0:
             with nvtx_range("deserialize_observation (substep 0)"):
-                graph = deserialize_observation(
+                graph0 = deserialize_observation(
                     obs,
                     substep0_idx,
                     D=self.max_degree,
@@ -3302,11 +3306,12 @@ class QuadMeshingEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            frontier_state = self._encode_frontier(graph)
+            frontier_state = self._encode_frontier(graph0)
             h_source0 = frontier_state.node_features
             h_source0_context = frontier_state.context_features
-            h_source0_batch_offset = graph.batch_offsets
+            h_source0_batch_offset = graph0.batch_offsets
         else:
+            graph0=None
             h_source0 = torch.empty(0, self.frontier_node_hidden_size, device=device)
             h_source0_context = torch.empty(0, self.frontier_context_hidden_size, device=device)
             h_source0_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
@@ -3315,7 +3320,7 @@ class QuadMeshingEncoder(nn.Module):
         # SUBSTEP 1
         if B1 > 0:
             with nvtx_range("deserialize_observation (substep 1)"):
-                graph, targets = deserialize_observation(
+                graph1, targets = deserialize_observation(
                     obs,
                     substep1_idx,
                     D=self.max_degree,
@@ -3327,15 +3332,16 @@ class QuadMeshingEncoder(nn.Module):
                     use_cuda_graph=True,
                 )
 
-            frontier_state = self._encode_frontier(graph)
+            frontier_state = self._encode_frontier(graph1)
             h_source1 = frontier_state.node_features
-            h_source1_batch_offset = graph.batch_offsets
+            h_source1_batch_offset = graph1.batch_offsets
 
             source_idx = targets.source_idx
 
             h_target = self._encode_targets(targets, frontier_state)
             h_target_batch_offset = targets.target_batch_offsets
         else:
+            graph1=None
             h_source1 = torch.empty(0, self.frontier_node_hidden_size, device=device)
             h_source1_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
             source_idx = torch.empty(0, device=device)
@@ -3343,6 +3349,10 @@ class QuadMeshingEncoder(nn.Module):
             h_target_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
 
         return QuadMeshEncoding(
+            # TODO: experimental
+            # rand = (obs[:, -1].float() / 256)[substep == 0],
+            graph0=graph0,
+            graph1=graph1,
             substep=substep,
             h_source0=h_source0,
             h_source1=h_source1,
@@ -3536,6 +3546,16 @@ class QuadMeshingDecoder(nn.Module):
         # SUBSTEP 0
         if B0 > 0:
             packed_logits = self.source_head(h_source0).squeeze(1)
+
+            # TODO: experimental
+            # edge_batch_offset = encoded.graph0.edge_ptr[h_source0_batch_offset]
+            # edges_per_batch = edge_batch_offset[1:] - edge_batch_offset[:-1]
+            # random_edge_idx = edge_batch_offset[:-1] + torch.floor(encoded.rand * edges_per_batch).long()
+            # random_edges = encoded.graph0.edges[:, random_edge_idx] # [2, B0]
+            # random_sources = random_edges.reshape(2 * B0) # [2 * B0]
+            # mask = torch.zeros(packed_logits.size(0), dtype=torch.bool, device=device)
+            # mask[random_sources] = True
+            # packed_logits = packed_logits.masked_fill(~mask, -torch.inf)
 
             target_rows = (substep == 0).nonzero(as_tuple=True)[0] # [B0]
             target_rows_2d = target_rows[:, None].expand(B0, L)    # [B0, L]

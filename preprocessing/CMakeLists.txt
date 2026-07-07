@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(crossfield_precompute LANGUAGES CXX)
+project(shape_preprocess LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,20 +105,20 @@ endif()
 # Executable
 # -------------------------------------------------------------------------
 add_executable(
-    crossfield_precompute
+    shape_preprocess
     src/main.cpp
     ${cnpy_SOURCE_DIR}/cnpy.cpp
 )
 
 target_include_directories(
-    crossfield_precompute
+    shape_preprocess
     PRIVATE
         ${directional_SOURCE_DIR}/include
         ${cnpy_SOURCE_DIR}
 )
 
 target_link_libraries(
-    crossfield_precompute
+    shape_preprocess
     PRIVATE
         Eigen3::Eigen
         ${CROSSFIELD_ZLIB_TARGET}

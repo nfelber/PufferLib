@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cross_field.h"
 #include "geometry.h"
 #include "helpers.h"
 #include "mesh.h"
@@ -56,7 +57,8 @@ typedef struct {
 
     // Env state
     QuadMesh mesh;
-    Vec2Array boundary_poly;
+    QmShape shape;
+    CrossField cross_field;
     int episode_length;
     float episode_return;
     int source_frontier_idx;
@@ -69,8 +71,8 @@ typedef struct {
     float candidate_radius_min_ratio;
     float candidate_radius_max_ratio;
     float target_edge_length_ratio;
-    const char** boundary_paths; // Non-owning
-    int boundary_count;
+    const char** shape_paths;
+    int shape_count;
     bool boundary_mode;
     bool export_obj;
     const char* export_obj_path;
@@ -107,6 +109,7 @@ typedef struct {
     int render_height;
     bool render_show_frontier;
     bool render_show_candidates;
+    bool render_show_cross_field;
     float render_line_thickness;
     float render_point_radius;
     float render_candidate_radius;
@@ -146,7 +149,8 @@ static void init_candidates(QuadMeshingEnv* env) {
 void quad_meshing_init(QuadMeshingEnv* env)
 {
     mesh_init(&env->mesh, env->max_degree, env->grid_res, env->grid_cell_size, env->grid_cell_cap, env->intersection_tol);
-    Vec2Array_init(&env->boundary_poly);
+    qmshape_init(&env->shape);
+    cross_field_init(&env->cross_field, env->grid_res, env->grid_cell_size, env->grid_cell_cap);
     Vec2Array_init(&env->cache.candidates_local);
     IntArray_init(&env->cache.valid_boundary_idx);
     IntArray_init(&env->cache.valid_candidate_idx);
@@ -165,93 +169,30 @@ void add_log(QuadMeshingEnv* env) {
     env->log.n++;
 }
 
-static int parse_boundary_vertices(const char* json, Vec2Array* out) {
-    const char* key = "\"vertices\"";
-    const char* start = strstr(json, key);
-    QM_ASSERT(start != NULL);
-    start = strchr(start, '[');
-    QM_ASSERT(start != NULL);
+static void load_shape(QuadMeshingEnv* env) {
+    int choice = rand_range(&env->rng, env->shape_count);
+    const char* path = env->shape_paths[choice];
+    qmshape_load(&env->shape, path);
+    cross_field_build(&env->cross_field, &env->shape);
 
-    int depth = 0;
-    int value_count = 0;
-    double current[2] = {0.0, 0.0};
-    for (const char* p = start; *p != '\0'; ++p) {
-        if (*p == '[') {
-            depth++;
-            continue;
-        }
-        if (*p == ']') {
-            depth--;
-            if (depth == 0) break;
-            continue;
-        }
-        if (depth < 2) continue;
-        char* end = NULL;
-        double value = strtod(p, &end);
-        if (end != p) {
-            current[value_count % 2] = value;
-            value_count++;
-            p = end - 1;
-            if (value_count % 2 == 0) {
-                Vec2Array_push(out, (Vec2){(float)current[0], (float)current[1]});
-            }
-        }
-    }
-    QM_ASSERT(value_count % 2 == 0);
-    int points = value_count / 2;
-    return points;
-}
-
-static void normalize_boundary(Vec2Array* vertices) {
-    float min_x =  FLT_MAX;
-    float max_x = -FLT_MAX;
-    float min_y =  FLT_MAX;
-    float max_y = -FLT_MAX;
-
-    for (int i=0; i<vertices->size; ++i) {
-        Vec2 v = vertices->data[i];
-        min_x = fmin(min_x, v.x);
-        max_x = fmax(max_x, v.x);
-        min_y = fmin(min_y, v.y);
-        max_y = fmax(max_y, v.y);
-    }
-
-    float scale = 1 / fmax(max_x - min_x, max_y - min_y);
-
-    for (int i=0; i<vertices->size; ++i) {
-        Vec2 v = vertices->data[i];
-        vertices->data[i].x = (v.x - min_x) * scale;
-        vertices->data[i].y = (v.y - min_y) * scale;
-    }
-}
-
-static void load_boundary(QuadMeshingEnv* env) {
-    int choice = rand_range(&env->rng, env->boundary_count);
-    const char* path = env->boundary_paths[choice];
-    char* json = read_file_bytes(path, NULL);
-    Vec2Array_resize(&env->boundary_poly, 0);
-    parse_boundary_vertices(json, &env->boundary_poly);
-    free(json);
-
-    // Normalize in [0, 1] square
-    normalize_boundary(&env->boundary_poly);
+    const Vec2Array* boundary = &env->shape.boundary;
 
     // Cache area
-    env->cache.starting_boundary_area = polygon_area(env->boundary_poly.data, env->boundary_poly.size);
+    env->cache.starting_boundary_area = polygon_area(boundary->data, boundary->size);
 
     float perimeter = 0.0f;
-    for (int i = 0; i < env->boundary_poly.size; ++i) {
-        Vec2 a = env->boundary_poly.data[i];
-        Vec2 b = env->boundary_poly.data[(i + 1) % env->boundary_poly.size];
+    for (int i = 0; i < boundary->size; ++i) {
+        Vec2 a = boundary->data[i];
+        Vec2 b = boundary->data[(i + 1) % boundary->size];
         perimeter += norm2(sub2(b, a));
     }
-    env->cache.starting_boundary_edge_length = perimeter / env->boundary_poly.size;
+    env->cache.starting_boundary_edge_length = perimeter / boundary->size;
     env->cache.target_edge_length = env->cache.starting_boundary_edge_length * env->target_edge_length_ratio;
     env->cache.target_quad_area = env->cache.target_edge_length * env->cache.target_edge_length;
     env->cache.candidate_radius_min = env->cache.target_edge_length * env->candidate_radius_min_ratio;
     env->cache.candidate_radius_max = env->cache.target_edge_length * env->candidate_radius_max_ratio;
     float n_quads = env->cache.starting_boundary_area / env->cache.target_quad_area;
-    float ideal_episode_length = env->boundary_mode ? n_quads : 2 * n_quads - 0.5 * env->boundary_poly.size;
+    float ideal_episode_length = env->boundary_mode ? n_quads : 2 * n_quads - 0.5 * boundary->size;
     env->cache.episode_max_length = (int)ceilf(ideal_episode_length * env->episode_max_length_ratio);
     env->cache.episode_max_length = env->cache.episode_max_length < 1 ? 1 : env->cache.episode_max_length;
     init_candidates(env);
@@ -520,50 +461,58 @@ static float compute_edge_length_quality(float edge_length, float target_edge_le
 
 // Range: [0, 1]
 static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
-    float interior_angles_cost = 0;
+    float alignment_cost = 0;
     float edge_length_cost = 0;
     const MeshVertex* v = &env->mesh.vertices.data[vidx];
     const Vec2 vp = env->mesh.vertices.data[vidx].pos;
+    // const CrossFieldQuery field = cross_field_query(&env->cross_field, vp);
+    // TODO: remove
+    CrossField* cf = &env->cross_field;
+    CrossFieldQuery field;
+    QM_ASSERT(cf->loaded);
+    QM_ASSERT(cf->shape != NULL);
+
+    bool hit = false;
+    UGridCellIterator it = ugrid_point_query(&cf->grid, vp);
+    for (int face_idx; (face_idx = ugrid_cell_it_next(&it)) != -1;) {
+        QM_ASSERT(face_idx >= 0 && face_idx < cf->shape->cross_field_faces.size);
+        const QmShapeCrossFieldFace* face = &cf->shape->cross_field_faces.data[face_idx];
+        if (point_in_triangle(vp, face->tri, 1e-5f)) {
+            field = (CrossFieldQuery){face->u, face->v};
+            hit = true;
+            break;
+        }
+    }
+
+    if (!hit) {
+        fprintf(stderr, "cross_field_query miss at (%f, %f)\n", vp.x, vp.y);
+        mesh_dump_obj(&env->mesh, "debug_mesh_dump.obj");
+        QM_ASSERT(false);
+        field = (CrossFieldQuery){{0.0f, 0.0f}, {0.0f, 0.0f}};
+    }
+    // END
     for (int i=0; i<v->degree; ++i) {
         const int nidx = mesh_neighbor_idx(&env->mesh, vidx, i);
         const int eidx = env->mesh.neighbor_edges.data[nidx];
         const MeshEdge* ei = &env->mesh.edges.data[eidx];
+        if (ei->face_count >= 2) continue;
 
         const int nvidx = env->mesh.neighbors.data[nidx];
         const Vec2 np = env->mesh.vertices.data[nvidx].pos;
         const Vec2 eivec = sub2(np, vp);
+        const float edge_length = norm2(eivec);
 
-        edge_length_cost += 1.0 - compute_edge_length_quality(norm2(eivec), env->cache.target_edge_length);
+        edge_length_cost += 1.0f - compute_edge_length_quality(edge_length, env->cache.target_edge_length);
 
-        const bool cw_face = mesh_edge_face_orientation_from_vertex(&env->mesh, eidx, vidx);
-        if (ei->face_count == 2 || (ei->face_count == 1 && !cw_face)) continue;
-
-        float angle = 2.0f * M_PI;
-        for (int j=0; j<v->degree; ++j) {
-            if (i==j) continue;
-
-            const int nidx = mesh_neighbor_idx(&env->mesh, vidx, j);
-            const int eidx = env->mesh.neighbor_edges.data[nidx];
-            const MeshEdge* ej = &env->mesh.edges.data[eidx];
-
-            const bool cw_face = mesh_edge_face_orientation_from_vertex(&env->mesh, eidx, vidx);
-            if (ej->face_count == 2 || (ej->face_count == 1 && cw_face)) continue;
-
-            const int nvidx = env->mesh.neighbors.data[nidx];
-            const Vec2 np = env->mesh.vertices.data[nvidx].pos;
-            const Vec2 ejvec = sub2(np, vp);
-
-            float ang = atan2f(cross2(eivec, ejvec), dot2(eivec, ejvec));
-            if (ang <= 0.0f) ang += 2.0f * M_PI;
-            angle = fmin(angle, ang);
-        }
-
-        interior_angles_cost +=
-            fabs(0.75 * M_PI - fabs(1.25 * M_PI - fabs(angle - 1.25 * M_PI) - 0.75 * M_PI) - 0.5 * M_PI);
+        const Vec2 edir = scalmul2(eivec, 1.0f / edge_length);
+        const float du = dot2(edir, field.u);
+        const float dv = dot2(edir, field.v);
+        const float s = fmaxf(du * du, dv * dv);
+        alignment_cost += 4.0f * s * (1.0f - s);
     }
 
-    return 0.5 * interior_angles_cost / (0.5 * M_PI * (env->mesh.max_degree + 1))
-         + 0.5 * (edge_length_cost / env->mesh.max_degree);
+    return 0.5f * (alignment_cost / env->mesh.max_degree)
+         + 0.5f * (edge_length_cost / env->mesh.max_degree);
 }
 
 static float get_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
@@ -598,10 +547,10 @@ float compute_quad_quality(QuadMeshingEnv* env, const Vec2* quad) {
     // Density quality
     const float A = polygon_area(quad, 4);
 
-    return (1.0 - fabs(A / env->cache.target_quad_area - 1.0)) * eq;
-    // float aq = compute_area_quality(A, env->cache.target_quad_area);
+    // return (1.0 - fabs(A / env->cache.target_quad_area - 1.0)) * eq;
+    float aq = compute_area_quality(A, env->cache.target_quad_area);
 
-    // return eq * aq;
+    return eq * aq;
 }
 
 static float compute_pressure_ratio(float value, float safe_ratio, float max_value) {
@@ -639,9 +588,8 @@ static float compute_frontier_potential(QuadMeshingEnv* env) {
     for (int i = 0; i < env->mesh.frontier.size; ++i) {
         frontier_cost += get_vertex_frontier_cost(env, env->mesh.frontier.data[i]);
     }
-    // frontier_cost /= env->max_frontier;
 
-    return 1.0 - env->frontier_quality_weight * frontier_cost
+    return -env->frontier_quality_weight * frontier_cost
         - env->frontier_size_pressure_weight * compute_frontier_size_pressure(env)
         - env->degree_pressure_weight * compute_degree_pressure(env);
 }
@@ -659,18 +607,19 @@ void c_reset(QuadMeshingEnv* env) {
     env->num_quads = 0;
     env->source_frontier_idx = -1;
 
-    // Load new boundary
-    load_boundary(env);
+    // Load new preprocessed shape
+    load_shape(env);
 
     // Reset mesh & init new frontier
     mesh_reset(&env->mesh);
-    int boundary_ccw = polygon_is_ccw(env->boundary_poly.data, env->boundary_poly.size);
-    for (int i = 0; i < env->boundary_poly.size; ++i) {
-        mesh_add_vertex(&env->mesh, env->boundary_poly.data[i]);
+    const Vec2Array* boundary = &env->shape.boundary;
+    int boundary_ccw = polygon_is_ccw(boundary->data, boundary->size);
+    for (int i = 0; i < boundary->size; ++i) {
+        mesh_add_vertex(&env->mesh, boundary->data[i]);
     }
-    for (int i = 0; i < env->boundary_poly.size; ++i) {
+    for (int i = 0; i < boundary->size; ++i) {
         int a = i;
-        int b = (i + 1) % env->boundary_poly.size;
+        int b = (i + 1) % boundary->size;
         int eidx = mesh_add_edge(&env->mesh, a, b);
         mesh_set_boundary_edge_face(&env->mesh, eidx, a, b, boundary_ccw);
     }
@@ -767,10 +716,13 @@ void c_step(QuadMeshingEnv* env) {
         mesh_add_edge(&env->mesh, r, target_vertex);
 
         int verts[4] = {l, source, r, target_vertex};
-        mesh_register_face(&env->mesh, verts, 4);
-        Vec2 face[4];
-        for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
-        env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+        if (mesh_register_face(&env->mesh, verts, 4)) {
+            Vec2 face[4];
+            for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
+            env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+            ++env->num_quads;
+            mesh_disable_edges_inside_face(&env->mesh, verts, 4);
+        }
         BENCH_END(boundary_face_path);
     } else {
         BENCH_START(add_edge, "quad_meshing.add_edge");
@@ -792,6 +744,7 @@ void c_step(QuadMeshingEnv* env) {
                 env->rewards[0] += 0.5 * compute_quad_reward(env, face);
                 ++env->num_quads;
                 ++new_face_count;
+                mesh_disable_edges_inside_face(&env->mesh, verts, 4);
             };
         }
         BENCH_END(register_quads_reward);
@@ -806,6 +759,7 @@ void c_step(QuadMeshingEnv* env) {
                 // face[3] = face[2]; // Duplicate last vertex to make (degenerate) quad
                 // env->rewards[0] += compute_quad_quality(env, face);
                 ++new_face_count;
+                mesh_disable_edges_inside_face(&env->mesh, verts, 3);
             };
         }
         BENCH_END(register_tris_reward);
@@ -867,6 +821,7 @@ void c_render(QuadMeshingEnv* env) {
 
     if (IsKeyPressed(KEY_F)) env->render_show_frontier = !env->render_show_frontier;
     if (IsKeyPressed(KEY_C)) env->render_show_candidates = !env->render_show_candidates;
+    if (IsKeyPressed(KEY_X)) env->render_show_cross_field = !env->render_show_cross_field;
 
     float zoom_delta = GetMouseWheelMove();
     if (zoom_delta != 0.0f) {
@@ -891,16 +846,37 @@ void c_render(QuadMeshingEnv* env) {
     DrawText(TextFormat("step: %d / %d | return: %f", env->episode_length, env->cache.episode_max_length, env->episode_return), 20, 20, 20, RAYWHITE);
     BeginMode2D(env->camera);
 
-    for (int i = 0; i < env->boundary_poly.size; ++i) {
-        Vec2 a = env->boundary_poly.data[i];
-        Vec2 b = env->boundary_poly.data[(i + 1) % env->boundary_poly.size];
+    const Vec2Array* boundary = &env->shape.boundary;
+    for (int i = 0; i < boundary->size; ++i) {
+        Vec2 a = boundary->data[i];
+        Vec2 b = boundary->data[(i + 1) % boundary->size];
         Vector2 va = {a.x, -a.y};
         Vector2 vb = {b.x, -b.y};
         DrawLineEx(va, vb, line_thickness, (Color){60, 120, 120, 255});
     }
 
+    if (env->render_show_cross_field) {
+        float cross_radius = 0.35f * env->cache.target_edge_length;
+        float cross_thickness = 0.75f * line_thickness;
+        Color cross_color = (Color){120, 210, 255, 150};
+        for (int i = 0; i < env->shape.cross_field_faces.size; ++i) {
+            const QmShapeCrossFieldFace* face = &env->shape.cross_field_faces.data[i];
+            Vec2 center = scalmul2(add2(add2(face->tri.a, face->tri.b), face->tri.c), 1.0f / 3.0f);
+            Vec2 u = scalmul2(face->u, cross_radius);
+            Vec2 v = scalmul2(face->v, cross_radius);
+
+            Vector2 u0 = {center.x - u.x, -(center.y - u.y)};
+            Vector2 u1 = {center.x + u.x, -(center.y + u.y)};
+            Vector2 v0 = {center.x - v.x, -(center.y - v.y)};
+            Vector2 v1 = {center.x + v.x, -(center.y + v.y)};
+            DrawLineEx(u0, u1, cross_thickness, cross_color);
+            DrawLineEx(v0, v1, cross_thickness, cross_color);
+        }
+    }
+
     for (int i = 0; i < env->mesh.edges.size; ++i) {
         MeshEdge e = env->mesh.edges.data[i];
+        if (e.disabled) continue;
         Vec2 a = env->mesh.vertices.data[e.a].pos;
         Vec2 b = env->mesh.vertices.data[e.b].pos;
         Vector2 va = {a.x, -a.y};
@@ -914,6 +890,7 @@ void c_render(QuadMeshingEnv* env) {
     UGridCellIterator it = ugrid_point_query(&env->mesh.edge_grid, mouse_world);
     for (int eidx; (eidx = ugrid_cell_it_next(&it)) != -1;) {
         MeshEdge e = env->mesh.edges.data[eidx];
+        if (e.disabled) continue;
         Vec2 a = env->mesh.vertices.data[e.a].pos;
         Vec2 b = env->mesh.vertices.data[e.b].pos;
         Vector2 va = {a.x, -a.y};
@@ -926,6 +903,7 @@ void c_render(QuadMeshingEnv* env) {
     int source = env->ui_pending_source >= 0 ? env->mesh.frontier.data[env->ui_pending_source] : -1;
 
     for (int i = 0; i < env->mesh.vertices.size; ++i) {
+        if (env->mesh.vertices.data[i].disabled) continue;
         Vector2 p = {env->mesh.vertices.data[i].pos.x, -env->mesh.vertices.data[i].pos.y};
         Color c = (Color){240, 240, 240, 255};
         int fidx = env->mesh.vertices.data[i].frontier_index;
@@ -1005,7 +983,8 @@ void c_close(QuadMeshingEnv* env) {
         CloseWindow();
     }
     mesh_free(&env->mesh);
-    Vec2Array_free(&env->boundary_poly);
+    cross_field_free(&env->cross_field);
+    qmshape_free(&env->shape);
     Vec2Array_free(&env->cache.candidates_local);
     IntArray_free(&env->cache.valid_boundary_idx);
     IntArray_free(&env->cache.valid_candidate_idx);
