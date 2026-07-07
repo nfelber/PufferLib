@@ -23,6 +23,7 @@ int main() {
     env.candidate_radius_max_ratio = 2.0;
     env.reward_invalid = -0.05;
     env.reward_incomplete = -1.0;
+    env.reward_triangle = -0.5;
     env.base_quad_reward = 0.0;
     env.potential_beta = 0.05;
     env.potential_gamma = 1.0;

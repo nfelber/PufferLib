@@ -79,6 +79,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->export_obj_path = (const char*)export_obj_path_item->ptr;
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
+    env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
     env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;
     env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
     env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;

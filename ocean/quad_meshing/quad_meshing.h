@@ -94,6 +94,7 @@ typedef struct {
     // Reward settings
     float reward_invalid;
     float reward_incomplete;
+    float reward_triangle;
     float base_quad_reward;
     float potential_beta;
     float potential_gamma;
@@ -465,32 +466,7 @@ static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
     float edge_length_cost = 0;
     const MeshVertex* v = &env->mesh.vertices.data[vidx];
     const Vec2 vp = env->mesh.vertices.data[vidx].pos;
-    // const CrossFieldQuery field = cross_field_query(&env->cross_field, vp);
-    // TODO: remove
-    CrossField* cf = &env->cross_field;
-    CrossFieldQuery field;
-    QM_ASSERT(cf->loaded);
-    QM_ASSERT(cf->shape != NULL);
-
-    bool hit = false;
-    UGridCellIterator it = ugrid_point_query(&cf->grid, vp);
-    for (int face_idx; (face_idx = ugrid_cell_it_next(&it)) != -1;) {
-        QM_ASSERT(face_idx >= 0 && face_idx < cf->shape->cross_field_faces.size);
-        const QmShapeCrossFieldFace* face = &cf->shape->cross_field_faces.data[face_idx];
-        if (point_in_triangle(vp, face->tri, 1e-5f)) {
-            field = (CrossFieldQuery){face->u, face->v};
-            hit = true;
-            break;
-        }
-    }
-
-    if (!hit) {
-        fprintf(stderr, "cross_field_query miss at (%f, %f)\n", vp.x, vp.y);
-        mesh_dump_obj(&env->mesh, "debug_mesh_dump.obj");
-        QM_ASSERT(false);
-        field = (CrossFieldQuery){{0.0f, 0.0f}, {0.0f, 0.0f}};
-    }
-    // END
+    const CrossFieldQuery field = cross_field_query(&env->cross_field, vp);
     for (int i=0; i<v->degree; ++i) {
         const int nidx = mesh_neighbor_idx(&env->mesh, vidx, i);
         const int eidx = env->mesh.neighbor_edges.data[nidx];
@@ -758,6 +734,7 @@ void c_step(QuadMeshingEnv* env) {
                 // for (int j = 0; j < 3; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
                 // face[3] = face[2]; // Duplicate last vertex to make (degenerate) quad
                 // env->rewards[0] += compute_quad_quality(env, face);
+                env->rewards[0] += env->reward_triangle;
                 ++new_face_count;
                 mesh_disable_edges_inside_face(&env->mesh, verts, 3);
             };
@@ -856,7 +833,7 @@ void c_render(QuadMeshingEnv* env) {
     }
 
     if (env->render_show_cross_field) {
-        float cross_radius = 0.35f * env->cache.target_edge_length;
+        float cross_radius = 0.1f * env->cache.target_edge_length;
         float cross_thickness = 0.75f * line_thickness;
         Color cross_color = (Color){120, 210, 255, 150};
         for (int i = 0; i < env->shape.cross_field_faces.size; ++i) {
