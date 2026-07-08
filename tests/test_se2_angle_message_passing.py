@@ -719,6 +719,8 @@ def test_quad_meshing_substep0_context_falls_back_to_pooled_sources():
     h_source0 = torch.arange(20, dtype=torch.float32).view(5, frontier_node_hidden_size)
     offsets = torch.tensor([0, 2, 5])
     encoded = QuadMeshEncoding(
+        graph0=None,
+        graph1=None,
         substep=torch.tensor([0, 0], dtype=torch.uint8),
         h_source0=h_source0,
         h_source1=torch.empty(0, frontier_node_hidden_size),
@@ -765,6 +767,8 @@ def test_quad_meshing_substep0_value_uses_provided_context():
     target_hidden_size = 3
     provided_context = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
     encoded = QuadMeshEncoding(
+        graph0=None,
+        graph1=None,
         substep=torch.tensor([0], dtype=torch.uint8),
         h_source0=torch.zeros(2, frontier_node_hidden_size),
         h_source1=torch.empty(0, frontier_node_hidden_size),
@@ -803,6 +807,8 @@ def test_quad_meshing_target_network_scores_target_features_without_source_conca
     frontier_context_hidden_size = 5
     target_hidden_size = 3
     encoded = QuadMeshEncoding(
+        graph0=None,
+        graph1=None,
         substep=torch.tensor([1], dtype=torch.uint8),
         h_source0=torch.empty(0, frontier_node_hidden_size),
         h_source1=torch.ones(2, frontier_node_hidden_size),
@@ -832,3 +838,48 @@ def test_quad_meshing_target_network_scores_target_features_without_source_conca
     assert values.shape == (1, 1)
     assert torch.isfinite(logits).all()
     assert torch.isfinite(values).all()
+
+
+def test_quad_meshing_decoder_masks_to_suggested_vertex_neighborhood():
+    vertices = torch.zeros(4, 2)
+    edges = torch.tensor([
+        [0, 1, 1, 2],
+        [1, 0, 2, 1],
+    ])
+    graph = CSRGraph(
+        vertices=vertices,
+        batch_offsets=torch.tensor([0, 4]),
+        edges=edges,
+        edge_features=torch.zeros(4, 2, dtype=torch.bool),
+        edge_ptr=torch.tensor([0, 1, 3, 4, 4]),
+        target_edge_length=torch.ones(1),
+        suggested_vertex_idx=torch.tensor([1]),
+    )
+    encoded = QuadMeshEncoding(
+        graph0=graph,
+        graph1=None,
+        substep=torch.tensor([0], dtype=torch.uint8),
+        h_source0=torch.arange(4, dtype=torch.float32).view(4, 1),
+        h_source1=torch.empty(0, 1),
+        h_source0_context=torch.zeros(1, 1),
+        h_source0_batch_offset=torch.tensor([0, 4]),
+        h_source1_batch_offset=torch.zeros(1, dtype=torch.long),
+        source_idx=torch.empty(0, dtype=torch.long),
+        h_target=torch.empty(0, 1),
+        h_target_batch_offset=torch.zeros(1, dtype=torch.long),
+    )
+    decoder = QuadMeshingDecoder(
+        [1],
+        frontier_node_hidden_size=1,
+        target_hidden_size=1,
+        frontier_context_hidden_size=1,
+        use_suggested_vertex=True,
+    )
+    with torch.no_grad():
+        decoder.source_head.weight.fill_(1.0)
+        decoder.source_head.bias.zero_()
+
+    logits, _ = decoder(encoded)
+
+    assert torch.isfinite(logits[0, :3]).all()
+    assert torch.isneginf(logits[0, 3])

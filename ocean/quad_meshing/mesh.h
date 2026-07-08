@@ -578,8 +578,8 @@ void mesh_dump_obj(const QuadMesh* mesh, const char* filename) {
     }
     for (int i = 0; i < mesh->edges.size; i++) {
         MeshEdge* e = &mesh->edges.data[i];
-        // if (e->disabled) continue;
-        // if (e->face_count == 0) continue;
+        if (e->disabled) continue;
+        if (e->face_count == 0) continue;
         fprintf(f, "l %d %d\n", e->a + 1, e->b + 1);
     }
     fclose(f);

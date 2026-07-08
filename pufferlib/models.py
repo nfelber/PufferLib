@@ -675,7 +675,16 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         # nn.Linear operates on the channel dimension; vectors keep the spatial axis.
         return self.vector_src(vectors.transpose(1, 2)).transpose(1, 2)
 
-    def forward(self, h, vectors, x, edge_index, edge_ptr, edge_cont=None):
+    def forward(
+        self,
+        h,
+        vectors,
+        x,
+        edge_index,
+        edge_ptr,
+        edge_cont=None,
+        edge_geometry=None,
+    ):
         if self.edge_cont_dim > 0 and edge_cont is None:
             raise ValueError("edge_cont must be provided.")
         if vectors is None:
@@ -683,11 +692,19 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         if vectors.shape != (h.size(0), self.vector_channels, 2):
             raise ValueError("vectors must have shape [N, vector_channels, 2].")
 
-        src = edge_index[0]
-        dst = edge_index[1]
-        delta = x[dst] - x[src]
-        length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True).clamp_min(self.eps)
-        direction = delta / length
+        if edge_geometry is None:
+            src = edge_index[0]
+            dst = edge_index[1]
+            delta = x[dst] - x[src]
+            length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True).clamp_min(self.eps)
+            direction = delta / length
+            denom = (edge_ptr[1:] - edge_ptr[:-1]).clamp_min(1).to(h.dtype)
+        else:
+            src = edge_geometry["src"]
+            dst = edge_geometry["dst"]
+            direction = edge_geometry["direction"]
+            length = edge_geometry["length"]
+            denom = edge_geometry["denom"].to(h.dtype)
 
         v_src = vectors[src]
         dot = (v_src * direction.unsqueeze(1)).sum(dim=-1)
@@ -718,7 +735,6 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         agg_s.index_add_(0, dst, scalar_msg)
         agg_v.index_add_(0, dst, v_msg)
 
-        denom = (edge_ptr[1:] - edge_ptr[:-1]).clamp_min(1).to(h.dtype)
         agg_s = agg_s / denom.unsqueeze(-1)
         agg_v = agg_v / denom[:, None, None]
 
@@ -738,6 +754,7 @@ class CSRGraph:
     edge_features: torch.Tensor  # [E, f] edge features
     edge_ptr: torch.Tensor       # [N + 1] CSR pointer for outgoing edges
     target_edge_length: torch.Tensor  # [B] per-batch target edge length
+    suggested_vertex_idx: Optional[torch.Tensor] = None  # [B] local suggested source vertex index
 
 
 @dataclass
@@ -769,7 +786,9 @@ def _gf_decode_frontier_sizes_kernel(
     valid_batch_idx,        # int64*, [B]
     frontier_size_out,      # int64*, [B]
     target_edge_length_out, # float32*, [B]
+    suggested_vertex_idx_out, # int64*, [B]
     OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
     B: tl.constexpr,
     BLOCK_B: tl.constexpr,
 ):
@@ -791,8 +810,14 @@ def _gf_decode_frontier_sizes_kernel(
     f_hi = tl.load(obs + row + 6, mask=mask, other=0).to(tl.uint32)
     frontier_size = f_lo | (f_hi << 8)
 
+    suggested_pos = row + 9 + frontier_size * (8 + D * 3)
+    s_lo = tl.load(obs + suggested_pos + 0, mask=mask, other=0).to(tl.uint32)
+    s_hi = tl.load(obs + suggested_pos + 1, mask=mask, other=0).to(tl.uint32)
+    suggested = s_lo | (s_hi << 8)
+
     tl.store(frontier_size_out + off, frontier_size.to(tl.int64), mask=mask)
     tl.store(target_edge_length_out + off, target_edge_length_u32.to(tl.float32, bitcast=True), mask=mask)
+    tl.store(suggested_vertex_idx_out + off, suggested.to(tl.int64), mask=mask)
 
 
 @triton.jit
@@ -1042,7 +1067,7 @@ def _cand_decode_counts_kernel(
     frontier_size = f_lo | (f_hi << 8)
 
     neighbor_start = row + 9 + frontier_size * 8
-    source_idx_pos = neighbor_start + frontier_size * D * 3
+    source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
     candidates_start = validity_start + frontier_size
 
@@ -1142,7 +1167,7 @@ def _cand_scatter_new_targets_kernel(
     frontier_size = f_lo | (f_hi << 8)
 
     neighbor_start = row + 9 + frontier_size * 8
-    source_idx_pos = neighbor_start + frontier_size * D * 3
+    source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
     candidates_start = validity_start + frontier_size
 
@@ -1277,6 +1302,12 @@ class CUDAGraphObservationDeserializer:
             self.target_edge_length = torch.empty(
                 (self.B,),
                 dtype=torch.float32,
+                device=self.device,
+            )
+
+            self.suggested_vertex_idx = torch.empty(
+                (self.B,),
+                dtype=torch.long,
                 device=self.device,
             )
 
@@ -1433,7 +1464,9 @@ class CUDAGraphObservationDeserializer:
             self.valid_batch_idx_static,
             self.frontier_size,
             self.target_edge_length,
+            self.suggested_vertex_idx,
             OBS_SIZE=self.obs_size,
+            D=self.D,
             B=self.B,
             BLOCK_B=self.BLOCK_B,
             num_warps=4,
@@ -1637,6 +1670,7 @@ class CUDAGraphObservationDeserializer:
                 edge_features=self.edge_features_flat.view(self.E_CAP, 2),
                 edge_ptr=self.edge_ptr,
                 target_edge_length=self.target_edge_length,
+                suggested_vertex_idx=self.suggested_vertex_idx,
             )
             if self.decode_candidates:
                 return graph, self._candidate_targets()
@@ -1658,6 +1692,7 @@ class CUDAGraphObservationDeserializer:
             edge_features=self.edge_features_flat[: 2 * E].view(E, 2),
             edge_ptr=self.edge_ptr[: N + 1],
             target_edge_length=self.target_edge_length,
+            suggested_vertex_idx=self.suggested_vertex_idx,
         )
 
         if self.decode_candidates:
@@ -2072,6 +2107,18 @@ class PaiNNFrontierStage(nn.Module):
         vectors = state.node_vectors
         if vectors is None:
             vectors = h.new_zeros(h.size(0), self.vector_channels, 2)
+
+        src = state.graph.edges[0]
+        dst = state.graph.edges[1]
+        delta = state.graph.vertices[dst] - state.graph.vertices[src]
+        length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True).clamp_min(1e-8)
+        edge_geometry = {
+            "src": src,
+            "dst": dst,
+            "direction": delta / length,
+            "length": length,
+            "denom": (state.graph.edge_ptr[1:] - state.graph.edge_ptr[:-1]).clamp_min(1),
+        }
         for layer in self.layers:
             with nvtx_range("painn_frontier_message_passing"):
                 h, vectors = layer(
@@ -2081,6 +2128,7 @@ class PaiNNFrontierStage(nn.Module):
                     state.graph.edges,
                     state.graph.edge_ptr,
                     edge_cont=state.edge_features,
+                    edge_geometry=edge_geometry,
                 )
         return FrontierState(state.graph, h, state.edge_features, state.context_features, vectors)
 
@@ -2502,6 +2550,10 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         mlp_ratio=4,
         dropout=0.0,
         residual_scale_init=0.0,
+        fixed_shapes=False,
+        max_frontier=0,
+        max_candidates=0,
+        compile_stage=False,
         eps=1e-8,
     ):
         super().__init__()
@@ -2516,6 +2568,12 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         self.vector_channels = vector_channels
         self.chiral = chiral
         self.eps = eps
+        self.fixed_shapes = bool(fixed_shapes)
+        self.max_frontier = int(max_frontier)
+        self.max_candidates = int(max_candidates)
+        self.compile_stage = bool(compile_stage)
+        if self.fixed_shapes and (self.max_frontier < 1 or self.max_candidates < 0):
+            raise ValueError("fixed_shapes requires max_frontier >= 1 and max_candidates >= 0.")
         self.global_residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
         self.length_encoder = FourierEncoder1D(num_bands=length_bands, include_input=True)
 
@@ -2554,6 +2612,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
             for _ in range(num_layers)
         ])
         self.query_cross_attn = PerceiverCrossAttention(d_model, num_heads, mlp_dim, dropout)
+        self._compiled_forward_impl = None
 
     def _vectors(self, frontier_state):
         graph = frontier_state.graph
@@ -2578,7 +2637,21 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         direction = delta / length.clamp_min(self.eps)
         return length, direction
 
-    def forward(self, state, frontier_state):
+    @staticmethod
+    def _pad_by_batch_fixed(values, batch_idx, offsets, width, fill_value=0.0):
+        B = offsets.numel() - 1
+        width = max(int(width), 1)
+        out = values.new_full((B, width, values.size(-1)), fill_value)
+        mask = torch.ones(B, width, dtype=torch.bool, device=values.device)
+        if values.numel() == 0:
+            return out, mask
+
+        pos = torch.arange(values.size(0), device=values.device) - offsets[batch_idx]
+        out[batch_idx, pos] = values
+        mask[batch_idx, pos] = False
+        return out, mask
+
+    def _forward_impl(self, state, frontier_state):
         graph = frontier_state.graph
         targets = state.targets
         h_target = state.target_features
@@ -2607,11 +2680,19 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
             self._vector_scalars(vectors, node_direction),
         ]
         frontier_tokens = self.frontier_token_proj(torch.cat(frontier_parts, dim=-1))
-        padded_frontier, frontier_mask = FrontierPerceiverStage._pad_by_batch(
-            frontier_tokens,
-            node_batch,
-            vertex_counts,
-        )
+        if self.fixed_shapes:
+            padded_frontier, frontier_mask = self._pad_by_batch_fixed(
+                frontier_tokens,
+                node_batch,
+                graph.batch_offsets,
+                self.max_frontier,
+            )
+        else:
+            padded_frontier, frontier_mask = FrontierPerceiverStage._pad_by_batch(
+                frontier_tokens,
+                node_batch,
+                vertex_counts,
+            )
 
         latents = self.latents.unsqueeze(0).expand(B, -1, -1)
         latents = self.input_cross_attn(latents, padded_frontier, key_padding_mask=frontier_mask)
@@ -2629,11 +2710,19 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         ]
         target_queries = self.target_query_proj(torch.cat(target_parts, dim=-1))
         target_counts = targets.target_batch_offsets[1:] - targets.target_batch_offsets[:-1]
-        padded_queries, _ = FrontierPerceiverStage._pad_by_batch(
-            target_queries,
-            targets.target_batches,
-            target_counts,
-        )
+        if self.fixed_shapes:
+            padded_queries, _ = self._pad_by_batch_fixed(
+                target_queries,
+                targets.target_batches,
+                targets.target_batch_offsets,
+                self.max_frontier + self.max_candidates,
+            )
+        else:
+            padded_queries, _ = FrontierPerceiverStage._pad_by_batch(
+                target_queries,
+                targets.target_batches,
+                target_counts,
+            )
         decoded = self.query_cross_attn(padded_queries, latents)
 
         pos = torch.arange(Q, device=h_target.device) - targets.target_batch_offsets[targets.target_batches]
@@ -2641,6 +2730,18 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         target_update = self.target_out(torch.cat([h_target, decoded_targets], dim=-1))
         target_features = h_target + self.global_residual_scale * target_update
         return TargetState(targets, target_features)
+
+    def forward(self, state, frontier_state):
+        if not self.compile_stage or not state.target_features.is_cuda:
+            return self._forward_impl(state, frontier_state)
+
+        if self._compiled_forward_impl is None:
+            self._compiled_forward_impl = torch.compile(
+                self._forward_impl,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+        return self._compiled_forward_impl(state, frontier_state)
 
 
 class TargetSourceConditionStage(nn.Module):
@@ -3095,8 +3196,6 @@ def distance_to_graph_edges(
 
 @dataclass
 class QuadMeshEncoding:
-    # TODO: experimental
-    # rand: torch.Tensor
     graph0: CSRGraph
     graph1: CSRGraph
     substep: torch.Tensor                    # [B] substep per agent
@@ -3175,6 +3274,8 @@ class QuadMeshingEncoder(nn.Module):
             target_global_perceiver_mlp_ratio=4,
             target_global_perceiver_dropout=0.0,
             target_global_perceiver_residual_scale_init=0.0,
+            target_global_perceiver_fixed_shapes=False,
+            target_global_perceiver_compile=False,
             **kwargs
     ):
         super().__init__()
@@ -3299,6 +3400,10 @@ class QuadMeshingEncoder(nn.Module):
                     mlp_ratio=target_global_perceiver_mlp_ratio,
                     dropout=target_global_perceiver_dropout,
                     residual_scale_init=target_global_perceiver_residual_scale_init,
+                    fixed_shapes=target_global_perceiver_fixed_shapes,
+                    max_frontier=max_frontier,
+                    max_candidates=max_candidates,
+                    compile_stage=target_global_perceiver_compile,
                 ))
             elif stage == "source_condition":
                 target_stages.append(TargetSourceConditionStage(
@@ -3365,7 +3470,7 @@ class QuadMeshingEncoder(nn.Module):
                     deserialize_candidates=False,
                     exact_output=True,
                     copy_obs=False,
-                    use_cuda_graph=True,
+                    use_cuda_graph=False,
                 )
 
             frontier_state = self._encode_frontier(graph0)
@@ -3391,7 +3496,7 @@ class QuadMeshingEncoder(nn.Module):
                     deserialize_candidates=True,
                     exact_output=True,
                     copy_obs=False,
-                    use_cuda_graph=True,
+                    use_cuda_graph=False,
                 )
 
             frontier_state = self._encode_frontier(graph1)
@@ -3411,8 +3516,6 @@ class QuadMeshingEncoder(nn.Module):
             h_target_batch_offset = torch.zeros(1, device=device, dtype=torch.long)
 
         return QuadMeshEncoding(
-            # TODO: experimental
-            # rand = (obs[:, -1].float() / 256)[substep == 0],
             graph0=graph0,
             graph1=graph1,
             substep=substep,
@@ -3553,6 +3656,8 @@ class QuadMeshingDecoder(nn.Module):
         frontier_node_hidden_size,
         target_hidden_size,
         frontier_context_hidden_size=None,
+        use_suggested_vertex=False,
+        debug_nan_checks=False,
         **kwargs,
     ):
         super().__init__()
@@ -3563,12 +3668,89 @@ class QuadMeshingDecoder(nn.Module):
         self.frontier_node_hidden_size = frontier_node_hidden_size
         self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
+        self.use_suggested_vertex = bool(use_suggested_vertex)
+        self.debug_nan_checks = bool(debug_nan_checks)
+        self.max_frontier = int(kwargs.get("max_frontier", 0) or 0)
+        self.max_candidates = int(kwargs.get("max_candidates", 0) or 0)
+        self.max_degree = int(kwargs.get("max_degree", 0) or 0)
 
         self.source_head = layer_init(nn.Linear(frontier_node_hidden_size, 1), 0.01)
         self.target_head = layer_init(nn.Linear(target_hidden_size, 1), 0.01)
 
         self.source_value_head = layer_init(nn.Linear(frontier_context_hidden_size, 1), 1)
         self.target_value_head = layer_init(nn.Linear(frontier_node_hidden_size, 1), 1)
+
+
+    def _mask_to_suggested_sources(self, packed_logits, graph: CSRGraph, batch_offsets):
+        if graph is None or graph.suggested_vertex_idx is None:
+            return packed_logits
+
+        B = batch_offsets.numel() - 1
+        if B == 0 or packed_logits.numel() == 0:
+            return packed_logits
+
+        counts = batch_offsets[1:] - batch_offsets[:-1]
+        suggested = graph.suggested_vertex_idx[:B]
+        valid = (suggested >= 0) & (suggested < counts)
+
+        centers = batch_offsets[:-1] + suggested
+        centers = centers[valid]
+
+        source_batch = torch.repeat_interleave(
+            torch.arange(B, device=packed_logits.device),
+            counts,
+            output_size=packed_logits.numel(),
+        )
+        allowed = ~valid[source_batch]
+        allowed[centers] = True
+
+        edge_counts = graph.edge_ptr[centers + 1] - graph.edge_ptr[centers]
+
+        if self.max_degree > 0 and packed_logits.is_cuda:
+            local_edge = torch.arange(self.max_degree, device=packed_logits.device)
+            edge_idx = graph.edge_ptr[centers, None] + local_edge
+            edge_mask = local_edge < edge_counts[:, None]
+            allowed[graph.edges[1, edge_idx[edge_mask]]] = True
+        else:
+            total_edges = int(edge_counts.sum().item())
+            if total_edges == 0:
+                return packed_logits.masked_fill(~allowed, -torch.inf)
+
+            edge_starts = graph.edge_ptr[centers]
+            edge_batch = torch.repeat_interleave(
+                torch.arange(centers.numel(), device=packed_logits.device),
+                edge_counts,
+            )
+            local_edge = torch.arange(total_edges, device=packed_logits.device) - torch.repeat_interleave(
+                torch.cumsum(edge_counts, dim=0) - edge_counts,
+                edge_counts,
+            )
+            edge_idx = edge_starts[edge_batch] + local_edge
+            allowed[graph.edges[1, edge_idx]] = True
+
+        return packed_logits.masked_fill(~allowed, -torch.inf)
+
+
+    @staticmethod
+    def _scatter_packed_logits(logits, packed_logits, target_rows, batch_offsets, counts):
+        total = packed_logits.numel()
+        if total == 0 or target_rows.numel() == 0:
+            return
+
+        device = packed_logits.device
+        local_starts = torch.cumsum(counts, dim=0) - counts
+        batch = torch.repeat_interleave(
+            torch.arange(counts.numel(), device=device),
+            counts,
+            output_size=total,
+        )
+        cols = torch.arange(total, device=device) - torch.repeat_interleave(
+            local_starts,
+            counts,
+            output_size=total,
+        )
+        idx = batch_offsets[:-1][batch] + cols
+        logits[target_rows[batch], cols] = packed_logits[idx]
 
 
     def forward(self, encoded: QuadMeshEncoding):
@@ -3597,10 +3779,13 @@ class QuadMeshingDecoder(nn.Module):
         B  = substep.numel()
         B0 = sources_per_batch.numel()
         B1 = targets_per_batch.numel()
-        L = int(max(
-            sources_per_batch.max().item() if B0 > 0 else 1,
-            targets_per_batch.max().item() if B1 > 0 else 1,
-        ))
+        if self.max_frontier > 0:
+            L = max(self.max_frontier, self.max_frontier + self.max_candidates)
+        else:
+            L = int(max(
+                sources_per_batch.max().item() if B0 > 0 else 1,
+                targets_per_batch.max().item() if B1 > 0 else 1,
+            ))
 
         logits = torch.full((B, L), -torch.inf, device=device)
         values = torch.zeros(B, 1, device=device)
@@ -3608,47 +3793,45 @@ class QuadMeshingDecoder(nn.Module):
         # SUBSTEP 0
         if B0 > 0:
             packed_logits = self.source_head(h_source0).squeeze(1)
-
-            # TODO: experimental
-            # edge_batch_offset = encoded.graph0.edge_ptr[h_source0_batch_offset]
-            # edges_per_batch = edge_batch_offset[1:] - edge_batch_offset[:-1]
-            # random_edge_idx = edge_batch_offset[:-1] + torch.floor(encoded.rand * edges_per_batch).long()
-            # random_edges = encoded.graph0.edges[:, random_edge_idx] # [2, B0]
-            # random_sources = random_edges.reshape(2 * B0) # [2 * B0]
-            # mask = torch.zeros(packed_logits.size(0), dtype=torch.bool, device=device)
-            # mask[random_sources] = True
-            # packed_logits = packed_logits.masked_fill(~mask, -torch.inf)
+            if self.use_suggested_vertex:
+                packed_logits = self._mask_to_suggested_sources(
+                    packed_logits,
+                    encoded.graph0,
+                    h_source0_batch_offset,
+                )
 
             target_rows = (substep == 0).nonzero(as_tuple=True)[0] # [B0]
-            target_rows_2d = target_rows[:, None].expand(B0, L)    # [B0, L]
-            cols = torch.arange(L, device=device).expand(B0, L)    # [B0, L]
-            mask = cols < sources_per_batch[:, None]               # [B0, L]
+            self._scatter_packed_logits(
+                logits,
+                packed_logits,
+                target_rows,
+                h_source0_batch_offset,
+                sources_per_batch,
+            )
 
-            idx = h_source0_batch_offset[:-1, None] + cols
-            logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
-
-            values[substep == 0] = self.source_value_head(h_source0_context)
+            values[target_rows] = self.source_value_head(h_source0_context)
 
         # SUBSTEP 1
         if B1 > 0:
             packed_logits = self.target_head(h_target).squeeze(1)
 
             target_rows = (substep == 1).nonzero(as_tuple=True)[0] # [B1]
-            target_rows_2d = target_rows[:, None].expand(B1, L)    # [B1, L]
-            cols = torch.arange(L, device=device).expand(B1, L)    # [B1, L]
-            mask = cols < targets_per_batch[:, None]               # [B1, L]
-
-            idx = h_target_batch_offset[:-1, None] + cols
-            logits[target_rows_2d[mask], cols[mask]] = packed_logits[idx[mask]]
+            self._scatter_packed_logits(
+                logits,
+                packed_logits,
+                target_rows,
+                h_target_batch_offset,
+                targets_per_batch,
+            )
 
             # Fix no valid options
             no_valid = targets_per_batch == 0                        # [B1]
             logits[target_rows[no_valid], 0] = 1.0
 
             h_source_per_batch = h_source1[h_source1_batch_offset[:-1] + source_idx] # [B, frontier_node_hidden_size]
-            values[substep == 1] = self.target_value_head(h_source_per_batch)
+            values[target_rows] = self.target_value_head(h_source_per_batch)
 
-        if torch.isnan(logits).any() or torch.isnan(values).any():
+        if self.debug_nan_checks and (torch.isnan(logits).any() or torch.isnan(values).any()):
             nan_logits = torch.isnan(logits).any(dim=1)
             nan_values = torch.isnan(values).squeeze(-1)
             rows = torch.nonzero(nan_logits | nan_values, as_tuple=False).flatten()

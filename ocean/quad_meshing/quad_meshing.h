@@ -325,19 +325,29 @@ static size_t obs_frontier_bytes(const QuadMesh* mesh) {
     return 2*sizeof(uint16_t) + mesh->frontier.size * (2*sizeof(float) + mesh->max_degree * (sizeof(uint16_t) + sizeof(uint8_t)));
 }
 
-static void serialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+static void serialize_obs_suggested_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
     obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh);
     serialize_u16(&obs->sb, source);
 }
 
-uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+uint16_t deserialize_obs_suggested_source(SerialObsBuffer* obs, const QuadMesh* mesh) {
     obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh);
+    return deserialize_u16(&obs->sb);
+}
+
+static void serialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+    obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
+    serialize_u16(&obs->sb, source);
+}
+
+uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint16_t source) {
+    obs->sb.pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
     return deserialize_u16(&obs->sb);
 }
 
 static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_boundary_idx, 0);
@@ -363,7 +373,7 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
 
 void deserialize_obs_validity_mask(SerialObsBuffer* obs, QuadMesh* mesh, BoolArray* mask) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t);
 
     // Frontier validity mask
     BoolArray_reserve(mask, mesh->frontier.size);
@@ -378,7 +388,7 @@ static size_t obs_validity_bytes(QuadMesh* mesh) {
 
 static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_candidate_idx, 0);
@@ -404,7 +414,7 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
 
 void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Array* candidates) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + sizeof(uint16_t) + obs_validity_bytes(mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(mesh);
 
     int valid_count = deserialize_u16(sb);
 
@@ -438,6 +448,7 @@ static void compute_observations(QuadMeshingEnv* env) {
     if (substep == 0) {
         BENCH_START(obs_frontier, "quad_meshing.obs_frontier");
         serialize_obs_frontier(&obs, &env->mesh);
+        serialize_obs_suggested_source(&obs, &env->mesh, (uint16_t)rand_range(&env->rng, env->mesh.frontier.size));
         BENCH_END(obs_frontier);
     } else {
         int source = env->mesh.frontier.data[source_slot];

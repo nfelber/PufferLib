@@ -212,8 +212,6 @@ class PuffeRL:
         prof.mark(0)
         for t in range(horizon):
             o_device = torch.as_tensor(self.vec_obs, device=device)
-            # TODO: experimental
-            # o_device[:, -1] = torch.floor(torch.rand(o_device.size(0), device=device) * 256)
 
             prof.mark(1)
             with torch.no_grad():

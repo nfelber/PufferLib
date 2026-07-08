@@ -12,12 +12,13 @@
 // - max degree [2]
 // - frontier vertices [MAX_FRONTIER_SIZE * 8]
 // - frontier neighbors [MAX_FRONTIER_SIZE * MAX_DEGREE * 3]
+// - suggested source frontier index [2]
 // - source index [2] (substep 1 only)
 // - frontier validity mask [MAX_FRONTIER_SIZE]
 // - valid new vertex candidates count [2]
 // - valid new vertex candidates [MAX_NEW_CANDIDATES * 8]
 #define OBS_TENSOR_T ByteTensor // Pack observations in raw bytes buffer
-#define MAX_FRONTIER_SIZE 256 // Assume less than 2^16
+#define MAX_FRONTIER_SIZE 512 // Assume less than 2^16
 #define MAX_DEGREE 8
 #define MAX_NEW_CANDIDATES 768 // Assume less than 2^16
 
@@ -28,6 +29,7 @@
   2 + \
   MAX_FRONTIER_SIZE * 8 + \
   MAX_FRONTIER_SIZE * MAX_DEGREE * 3 + \
+  2 + \
   2 + \
   MAX_FRONTIER_SIZE + \
   2 + \
