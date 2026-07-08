@@ -84,6 +84,9 @@ void my_init(Env* env, Dict* kwargs) {
     env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
     env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;
     env->frontier_quality_weight = (float)dict_get(kwargs, "frontier_quality_weight")->value;
+    env->frontier_edge_length_weight = (float)dict_get(kwargs, "frontier_edge_length_weight")->value;
+    env->frontier_alignment_weight = (float)dict_get(kwargs, "frontier_alignment_weight")->value;
+    env->frontier_angle_weight = (float)dict_get(kwargs, "frontier_angle_weight")->value;
     env->frontier_size_pressure_weight = (float)dict_get(kwargs, "frontier_size_pressure_weight")->value;
     env->degree_pressure_weight = (float)dict_get(kwargs, "degree_pressure_weight")->value;
     env->safe_frontier_size_ratio = (float)dict_get(kwargs, "safe_frontier_size_ratio")->value;

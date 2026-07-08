@@ -53,6 +53,7 @@ typedef enum {
     MESH_VALID_INTERSECT,
     MESH_VALID_WEDGE_BLOCKED,
     MESH_VALID_BOUNDARY_VIOLATION,
+    MESH_VALID_TOO_FAR,
 } MeshValidReason;
 
 /** Allocates mesh buffers with capacity/degree limits. */
@@ -518,17 +519,21 @@ bool mesh_register_face(QuadMesh* mesh, const int* verts, int n) {
 
 
 /** Validates an existing target; returns reason. */
-MeshValidReason mesh_validate_existing_target(const QuadMesh* mesh, int source, int target, bool boundary_mode) {
+MeshValidReason mesh_validate_existing_target(const QuadMesh* mesh, int source, int target, bool boundary_mode, float max_distance) {
     if (target == source) return MESH_VALID_SAME_VERTEX;
     if (mesh_edge_exists(mesh, source, target)) return MESH_VALID_EDGE_EXISTS;
     if (mesh->vertices.data[source].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
     if (mesh->vertices.data[target].degree >= mesh->max_degree) return MESH_VALID_DEGREE_FULL;
+    Vec2 tp = mesh->vertices.data[target].pos;
+    if (max_distance > 0.0f) {
+        Vec2 sp = mesh->vertices.data[source].pos;
+        if (sqrd_norm2(sub2(tp, sp)) > max_distance * max_distance) return MESH_VALID_TOO_FAR;
+    }
     if (boundary_mode) {
         int l3 = mesh_ring_frontier_neighbor(mesh, source, -3);
         int r3 = mesh_ring_frontier_neighbor(mesh, source,  3);
         if (target != l3 && target != r3) return MESH_VALID_BOUNDARY_VIOLATION;
     }
-    Vec2 tp = mesh->vertices.data[target].pos;
     return mesh_validate_edge(mesh, source, tp, target);
 }
 
@@ -557,6 +562,7 @@ const char* mesh_valid_reason_str(MeshValidReason r) {
         case MESH_VALID_INTERSECT: return "edge-intersection";
         case MESH_VALID_WEDGE_BLOCKED: return "wedge-blocked";
         case MESH_VALID_BOUNDARY_VIOLATION: return "boundary-violation";
+        case MESH_VALID_TOO_FAR: return "too-far";
         default: return "invalid";
     }
 }

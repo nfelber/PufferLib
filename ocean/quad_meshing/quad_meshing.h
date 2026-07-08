@@ -99,6 +99,9 @@ typedef struct {
     float potential_beta;
     float potential_gamma;
     float frontier_quality_weight;
+    float frontier_edge_length_weight;
+    float frontier_alignment_weight;
+    float frontier_angle_weight;
     float frontier_size_pressure_weight;
     float degree_pressure_weight;
     float safe_frontier_size_ratio;
@@ -351,7 +354,7 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
     for (int i=0; i<env->mesh.frontier.size; ++i) {
         int target = env->mesh.frontier.data[i];
         uint8_t valid = !boundary_mode || target == l3 || target == r3;
-        valid = valid && mesh_validate_existing_target(&env->mesh, source, target, false) == MESH_VALID_OK;
+        valid = valid && mesh_validate_existing_target(&env->mesh, source, target, false, env->cache.candidate_radius_max) == MESH_VALID_OK;
         if (valid) IntArray_push(&env->cache.valid_boundary_idx, i);
         serialize_u8(sb, valid);
     }
@@ -464,6 +467,7 @@ static float compute_edge_length_quality(float edge_length, float target_edge_le
 static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
     float alignment_cost = 0;
     float edge_length_cost = 0;
+    float angle_cost = 0;
     const MeshVertex* v = &env->mesh.vertices.data[vidx];
     const Vec2 vp = env->mesh.vertices.data[vidx].pos;
     const CrossFieldQuery field = cross_field_query(&env->cross_field, vp);
@@ -471,7 +475,7 @@ static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
         const int nidx = mesh_neighbor_idx(&env->mesh, vidx, i);
         const int eidx = env->mesh.neighbor_edges.data[nidx];
         const MeshEdge* ei = &env->mesh.edges.data[eidx];
-        if (ei->face_count >= 2) continue;
+        if (ei->disabled || ei->face_count >= 2) continue;
 
         const int nvidx = env->mesh.neighbors.data[nidx];
         const Vec2 np = env->mesh.vertices.data[nvidx].pos;
@@ -485,10 +489,50 @@ static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
         const float dv = dot2(edir, field.v);
         const float s = fmaxf(du * du, dv * dv);
         alignment_cost += 4.0f * s * (1.0f - s);
+
+        const bool cw_face_i = mesh_edge_face_orientation_from_vertex(&env->mesh, eidx, vidx);
+        if (ei->face_count == 1 && !cw_face_i) continue;
+
+        float angle = 2.0f * M_PI;
+        for (int j=0; j<v->degree; ++j) {
+            if (i == j) continue;
+
+            const int jnidx = mesh_neighbor_idx(&env->mesh, vidx, j);
+            const int jeidx = env->mesh.neighbor_edges.data[jnidx];
+            const MeshEdge* ej = &env->mesh.edges.data[jeidx];
+            if (ej->disabled || ej->face_count >= 2) continue;
+
+            const bool cw_face_j = mesh_edge_face_orientation_from_vertex(&env->mesh, jeidx, vidx);
+            if (ej->face_count == 1 && cw_face_j) continue;
+
+            const int jnvidx = env->mesh.neighbors.data[jnidx];
+            const Vec2 jnp = env->mesh.vertices.data[jnvidx].pos;
+            const Vec2 ejvec = sub2(jnp, vp);
+
+            float ang = atan2f(cross2(eivec, ejvec), dot2(eivec, ejvec));
+            if (ang <= 0.0f) ang += 2.0f * M_PI;
+            angle = fminf(angle, ang);
+        }
+
+        angle_cost += fabs(
+            0.75f * M_PI
+            - fabs(1.25f * M_PI - fabs(angle - 1.25f * M_PI) - 0.75f * M_PI)
+            - 0.5f * M_PI
+        );
     }
 
-    return 0.5f * (alignment_cost / env->mesh.max_degree)
-         + 0.5f * (edge_length_cost / env->mesh.max_degree);
+    const float edge_term = edge_length_cost / env->mesh.max_degree;
+    const float alignment_term = alignment_cost / env->mesh.max_degree;
+    const float angle_term = angle_cost / (0.5f * M_PI * (env->mesh.max_degree + 1));
+    const float weight_sum = env->frontier_edge_length_weight
+        + env->frontier_alignment_weight
+        + env->frontier_angle_weight;
+
+    if (weight_sum <= 0.0f) return 0.0f;
+
+    return (env->frontier_edge_length_weight * edge_term
+        + env->frontier_alignment_weight * alignment_term
+        + env->frontier_angle_weight * angle_term) / weight_sum;
 }
 
 static float get_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
@@ -650,7 +694,7 @@ void c_step(QuadMeshingEnv* env) {
         int bidx = env->cache.valid_boundary_idx.data[target_slot];
         QM_ASSERT(bidx < env->mesh.frontier.size);
         target_vertex = env->mesh.frontier.data[bidx];
-        valid = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode) == MESH_VALID_OK;
+        valid = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode, env->cache.candidate_radius_max) == MESH_VALID_OK;
     } else {
         int cidx = env->cache.valid_candidate_idx.data[target_slot - valid_boundary_size];
         QM_ASSERT(cidx < env->cache.candidates_local.size);
@@ -888,7 +932,7 @@ void c_render(QuadMeshingEnv* env) {
             if (fidx >= 0) c = (Color){0, 140, 255, 255};
         } else if (source >= 0) {
             if (fidx >= 0) {
-                MeshValidReason r = mesh_validate_existing_target(&env->mesh, source, i, env->boundary_mode);
+                MeshValidReason r = mesh_validate_existing_target(&env->mesh, source, i, env->boundary_mode, env->cache.candidate_radius_max);
                 c = (r == MESH_VALID_OK) ? (Color){0, 220, 120, 255} : (Color){220, 80, 80, 255};
             } else {
                 c = (Color){80, 80, 80, 255};
@@ -946,7 +990,7 @@ void c_render(QuadMeshingEnv* env) {
             } else {
                 int target_vertex = env->mesh.frontier.data[best_target];
                 tp = env->mesh.vertices.data[target_vertex].pos;
-                r = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode);
+                r = mesh_validate_existing_target(&env->mesh, source, target_vertex, env->boundary_mode, env->cache.candidate_radius_max);
             }
             DrawText(TextFormat("Target: %s (%f, %f)", mesh_valid_reason_str(r), tp.x, tp.y), 20, GetScreenHeight() - 40, 20, RAYWHITE);
         }

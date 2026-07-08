@@ -25,9 +25,12 @@ int main() {
     env.reward_incomplete = -1.0;
     env.reward_triangle = -0.5;
     env.base_quad_reward = 0.0;
-    env.potential_beta = 0.05;
+    env.potential_beta = 0.15;
     env.potential_gamma = 1.0;
     env.frontier_quality_weight = 1.0;
+    env.frontier_edge_length_weight = 1.0;
+    env.frontier_alignment_weight = 1.0;
+    env.frontier_angle_weight = 1.0;
     env.frontier_size_pressure_weight = 1.0;
     env.degree_pressure_weight = 1.0;
     env.safe_frontier_size_ratio = 0.9;

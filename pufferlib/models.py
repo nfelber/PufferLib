@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import numpy as np
-from typing import Dict
+from typing import Dict, Optional
 from contextlib import contextmanager
 
 import torch
@@ -641,6 +641,7 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         out_dim,
         edge_cont_dim=0,
         vector_channels=16,
+        length_bands=4,
         hidden_dim=128,
         chiral=True,
         eps=1e-8,
@@ -655,12 +656,13 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         self.eps = eps
         self.out_dim = out_dim
         self.scalar_residual = node_dim == out_dim
+        self.length_encoder = FourierEncoder1D(num_bands=length_bands, include_input=True)
 
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
         phi_m_in = (
             2 * node_dim
             + edge_cont_dim
-            + 1  # edge length
+            + self.length_encoder.out_dim
             + vector_scalar_dim
         )
         vector_coeff_dim = vector_channels * (3 if chiral else 2)
@@ -698,7 +700,7 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         parts = [h[src], h[dst]]
         if self.edge_cont_dim > 0:
             parts.append(edge_cont)
-        parts += [length, *vector_parts]
+        parts += [self.length_encoder(length), *vector_parts]
 
         msg = self.phi_m(torch.cat(parts, dim=-1))
         scalar_msg = msg[:, : self.out_dim]
@@ -1735,8 +1737,6 @@ def deserialize_observation(
 # ============================================================================
 
 import math
-from typing import Optional
-
 class FourierEncoder2D(nn.Module):
     def __init__(
         self,
@@ -1776,6 +1776,45 @@ class FourierEncoder2D(nn.Module):
         feat = feat.flatten(-2)
         if self.include_input:
             feat = torch.cat([coords, feat], dim=-1)
+        return feat
+
+
+class FourierEncoder1D(nn.Module):
+    def __init__(
+        self,
+        num_bands: int,
+        max_freq: Optional[float] = None,
+        include_input: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_bands < 0:
+            raise ValueError("num_bands can't be negative.")
+        if max_freq is not None and max_freq <= 0:
+            raise ValueError("max_freq must be positive.")
+        self.num_bands = num_bands
+        self.include_input = include_input
+        if max_freq is None:
+            freq_bands = 2.0 ** torch.arange(num_bands, dtype=torch.float32)
+        else:
+            freq_bands = torch.logspace(
+                0.0, math.log2(max_freq), steps=num_bands, base=2.0
+            ).to(dtype=torch.float32)
+        self.register_buffer("freq_bands", freq_bands, persistent=False)
+
+    @property
+    def out_dim(self) -> int:
+        base = 2 * self.num_bands
+        return base + 1 if self.include_input else base
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.shape[-1] != 1:
+            raise ValueError("Expected values with last dimension size 1.")
+        values = values.to(dtype=torch.float32)
+        scaled = values * self.freq_bands
+        scaled = 2.0 * math.pi * scaled
+        feat = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1)
+        if self.include_input:
+            feat = torch.cat([values, feat], dim=-1)
         return feat
 
 
@@ -2008,6 +2047,7 @@ class PaiNNFrontierStage(nn.Module):
         edge_hidden_size,
         num_layers=2,
         vector_channels=16,
+        length_bands=4,
         chiral=True,
     ):
         super().__init__()
@@ -2020,6 +2060,7 @@ class PaiNNFrontierStage(nn.Module):
                 out_dim=node_hidden_size,
                 edge_cont_dim=edge_hidden_size,
                 vector_channels=vector_channels,
+                length_bands=length_bands,
                 hidden_dim=node_hidden_size,
                 chiral=chiral,
             )
@@ -2387,22 +2428,24 @@ class PaiNNTargetStage(nn.Module):
         target_hidden_size,
         frontier_node_hidden_size,
         vector_channels=16,
+        length_bands=4,
         chiral=True,
     ):
         super().__init__()
         self.vector_channels = vector_channels
         self.chiral = chiral
         self.eps = 1e-8
+        self.length_encoder = FourierEncoder1D(num_bands=length_bands, include_input=True)
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
         self.mlp = _MLP(
             target_hidden_size
             + frontier_node_hidden_size
-            + 1
+            + self.length_encoder.out_dim
             + vector_scalar_dim,
             target_hidden_size,
             target_hidden_size,
             num_layers=2,
-            final_activation=True,
+            final_activation=False,
         )
 
     def forward(self, state, frontier_state):
@@ -2438,7 +2481,7 @@ class PaiNNTargetStage(nn.Module):
         target_features = self.mlp(torch.cat([
             h_target,
             frontier_state.node_features[source],
-            length,
+            self.length_encoder(length),
             *vector_parts,
         ], dim=-1))
         return TargetState(targets, target_features)
@@ -2452,6 +2495,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         vector_channels=16,
         chiral=True,
         d_model=None,
+        length_bands=4,
         num_latents=16,
         num_layers=2,
         num_heads=4,
@@ -2473,19 +2517,31 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         self.chiral = chiral
         self.eps = eps
         self.global_residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
+        self.length_encoder = FourierEncoder1D(num_bands=length_bands, include_input=True)
 
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
-        frontier_token_dim = 2 * frontier_node_hidden_size + 1 + 2 * vector_scalar_dim
-        target_query_dim = target_hidden_size + frontier_node_hidden_size + 1 + vector_scalar_dim
+        length_dim = self.length_encoder.out_dim
+        frontier_token_dim = 2 * frontier_node_hidden_size + length_dim + 2 * vector_scalar_dim
+        target_query_dim = target_hidden_size + frontier_node_hidden_size + length_dim + vector_scalar_dim
 
-        self.frontier_token_proj = layer_init(nn.Linear(frontier_token_dim, d_model))
-        self.target_query_proj = layer_init(nn.Linear(target_query_dim, d_model))
+        self.frontier_token_proj = nn.Sequential(
+            nn.LayerNorm(frontier_token_dim),
+            layer_init(nn.Linear(frontier_token_dim, 2 * d_model)),
+            nn.SiLU(),
+            layer_init(nn.Linear(2 * d_model, d_model)),
+        )
+        self.target_query_proj = nn.Sequential(
+            nn.LayerNorm(target_query_dim),
+            layer_init(nn.Linear(target_query_dim, 2 * d_model)),
+            nn.SiLU(),
+            layer_init(nn.Linear(2 * d_model, d_model)),
+        )
         self.target_out = _MLP(
             target_hidden_size + d_model,
             target_hidden_size,
             target_hidden_size,
             num_layers=2,
-            final_activation=True,
+            final_activation=False,
         )
 
         self.latents = nn.Parameter(torch.empty(num_latents, d_model))
@@ -2546,7 +2602,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         frontier_parts = [
             frontier_state.node_features,
             frontier_state.node_features[source_for_node],
-            node_length,
+            self.length_encoder(node_length),
             self._vector_scalars(source_vectors_for_node, node_direction),
             self._vector_scalars(vectors, node_direction),
         ]
@@ -2568,7 +2624,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         target_parts = [
             h_target,
             frontier_state.node_features[source_for_target],
-            target_length,
+            self.length_encoder(target_length),
             self._vector_scalars(vectors[source_for_target], target_direction),
         ]
         target_queries = self.target_query_proj(torch.cat(target_parts, dim=-1))
@@ -2595,7 +2651,7 @@ class TargetSourceConditionStage(nn.Module):
             target_hidden_size,
             target_hidden_size,
             num_layers=2,
-            final_activation=True,
+            final_activation=False,
         )
 
     def forward(self, state, frontier_state):
@@ -3092,6 +3148,7 @@ class QuadMeshingEncoder(nn.Module):
             frontier_se2_layers=2,
             frontier_painn_layers=2,
             frontier_painn_vector_channels=16,
+            frontier_painn_length_bands=4,
             frontier_painn_chiral=True,
             frontier_perceiver_num_latents=32,
             frontier_perceiver_layers=2,
@@ -3109,7 +3166,9 @@ class QuadMeshingEncoder(nn.Module):
             target_init_target_log_length=True,
             target_init_relative_distance=True,
             target_init_boundary_flag=True,
+            target_painn_length_bands=4,
             target_global_perceiver_d_model=None,
+            target_global_perceiver_length_bands=4,
             target_global_perceiver_num_latents=16,
             target_global_perceiver_layers=2,
             target_global_perceiver_heads=4,
@@ -3184,6 +3243,7 @@ class QuadMeshingEncoder(nn.Module):
                     edge_hidden_size=frontier_edge_hidden_size,
                     num_layers=frontier_painn_layers,
                     vector_channels=frontier_painn_vector_channels,
+                    length_bands=frontier_painn_length_bands,
                     chiral=frontier_painn_chiral,
                 ))
             else:
@@ -3222,6 +3282,7 @@ class QuadMeshingEncoder(nn.Module):
                     target_hidden_size=target_hidden_size,
                     frontier_node_hidden_size=frontier_node_hidden_size,
                     vector_channels=frontier_painn_vector_channels,
+                    length_bands=target_painn_length_bands,
                     chiral=frontier_painn_chiral,
                 ))
             elif stage == "source_global_perceiver":
@@ -3231,6 +3292,7 @@ class QuadMeshingEncoder(nn.Module):
                     vector_channels=frontier_painn_vector_channels,
                     chiral=frontier_painn_chiral,
                     d_model=target_global_perceiver_d_model,
+                    length_bands=target_global_perceiver_length_bands,
                     num_latents=target_global_perceiver_num_latents,
                     num_layers=target_global_perceiver_layers,
                     num_heads=target_global_perceiver_heads,
