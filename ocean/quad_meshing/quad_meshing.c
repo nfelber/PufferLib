@@ -14,6 +14,7 @@ int main() {
     env.shape_paths = shape_paths;
     env.shape_count = (int)(sizeof(shape_paths) / sizeof(shape_paths[0]));
     env.boundary_mode = false;
+    env.prevent_triangles = true;
     env.export_obj = false;
     env.export_obj_path = "quad_meshing.obj";
     env.candidate_rings = 10;
@@ -57,7 +58,7 @@ int main() {
     env.intersection_tol = 1e-3;
 
     quad_meshing_init(&env);
-    env.observations = (unsigned char*)calloc(1 + 4 + 4 + env.max_frontier * (8 + 3 * env.max_degree + 1) + 2 + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
+    env.observations = (unsigned char*)calloc(1 + 4 + 4 + env.max_frontier * (8 + 3 * env.max_degree + 2) + 2 + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
     env.actions = (float*)calloc(2, sizeof(int));
     env.rewards = (float*)calloc(1, sizeof(float));
     env.terminals = (float*)calloc(1, sizeof(unsigned char));
@@ -197,9 +198,9 @@ int main() {
                     env.actions[0] = best_target;
                     c_step(&env);
                     printf("reward: %f\n", env.rewards[0]);
+                    env.ui_pending_source = -1;
                 }
 
-                env.ui_pending_source = -1;
 
                 BoolArray_free(&validity_mask);
                 Vec2Array_free(&new_candidates);

@@ -15,6 +15,7 @@
 // - suggested source frontier index [2]
 // - source index [2] (substep 1 only)
 // - frontier validity mask [MAX_FRONTIER_SIZE]
+// - frontier target parity [MAX_FRONTIER_SIZE]
 // - valid new vertex candidates count [2]
 // - valid new vertex candidates [MAX_NEW_CANDIDATES * 8]
 #define OBS_TENSOR_T ByteTensor // Pack observations in raw bytes buffer
@@ -31,6 +32,7 @@
   MAX_FRONTIER_SIZE * MAX_DEGREE * 3 + \
   2 + \
   2 + \
+  MAX_FRONTIER_SIZE + \
   MAX_FRONTIER_SIZE + \
   2 + \
   MAX_NEW_CANDIDATES * 8 \
@@ -75,6 +77,7 @@ void my_init(Env* env, Dict* kwargs) {
     QM_ASSERT(env->shape_count > 0);
 
     env->boundary_mode = dict_get(kwargs, "boundary_mode")->value > 0.5;
+    env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
     env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
     DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
     QM_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);

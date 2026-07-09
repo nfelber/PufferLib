@@ -764,6 +764,7 @@ class CandidateTargets:
     target_batch_offsets: torch.Tensor  # [B + 1] target offsets per batch
     target_batches: torch.Tensor        # [Q] batch index per target
     target_positions: torch.Tensor      # [Q, 2] existing vertex or new candidate position
+    target_frontier_parity: torch.Tensor # [Q] parity of hop distance from source; new candidates are odd
 
 
 # =============================================================================
@@ -1051,6 +1052,7 @@ def _cand_decode_counts_kernel(
     valid_node_count,       # int64*, [B]
     target_count,           # int64*, [B]
     node_validity,          # bool*, [N_CAP]
+    node_parity,            # bool*, [N_CAP]
     OBS_SIZE: tl.constexpr,
     D: tl.constexpr,
     F_CAP: tl.constexpr,
@@ -1069,7 +1071,8 @@ def _cand_decode_counts_kernel(
     neighbor_start = row + 9 + frontier_size * 8
     source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
-    candidates_start = validity_start + frontier_size
+    parity_start = validity_start + frontier_size
+    candidates_start = parity_start + frontier_size
 
     src_lo = tl.load(obs + source_idx_pos + 0).to(tl.uint32)
     src_hi = tl.load(obs + source_idx_pos + 1).to(tl.uint32)
@@ -1081,10 +1084,12 @@ def _cand_decode_counts_kernel(
 
     valid_i = i < frontier_size
     validity = tl.load(obs + validity_start + i, mask=valid_i, other=0) != 0
+    parity = tl.load(obs + parity_start + i, mask=valid_i, other=0) != 0
     valid_count = tl.sum(validity.to(tl.int64), axis=0)
 
     vertex_batch_offset = tl.load(vertex_batch_offsets + b)
     tl.store(node_validity + vertex_batch_offset + i, validity, mask=valid_i)
+    tl.store(node_parity + vertex_batch_offset + i, parity, mask=valid_i)
 
     tl.store(source_idx + b, src.to(tl.int64))
     tl.store(candidate_count + b, cand_count.to(tl.int64))
@@ -1109,9 +1114,11 @@ def _cand_scatter_existing_targets_kernel(
     target_batch_offsets,   # int64*, [B + 1]
     valid_node_count,       # int64*, [B]
     node_validity,          # bool*, [N_CAP]
+    node_parity,            # bool*, [N_CAP]
     target_idx,             # int64*, [Q_CAP]
     target_batches,         # int64*, [Q_CAP]
     target_positions,       # float32*, [Q_CAP, 2]
+    target_frontier_parity, # bool*, [Q_CAP]
     F_CAP: tl.constexpr,
     BLOCK_F: tl.constexpr,
 ):
@@ -1133,11 +1140,13 @@ def _cand_scatter_existing_targets_kernel(
 
     x = tl.load(vertices + global_i * 2 + 0, mask=mask, other=0.0)
     y = tl.load(vertices + global_i * 2 + 1, mask=mask, other=0.0)
+    parity = tl.load(node_parity + global_i, mask=mask, other=0)
 
     tl.store(target_idx + out, global_i, mask=mask)
     tl.store(target_batches + out, b, mask=mask)
     tl.store(target_positions + out * 2 + 0, x, mask=mask)
     tl.store(target_positions + out * 2 + 1, y, mask=mask)
+    tl.store(target_frontier_parity + out, parity, mask=mask)
 
 
 @triton.jit
@@ -1150,6 +1159,7 @@ def _cand_scatter_new_targets_kernel(
     target_idx,             # int64*, [Q_CAP]
     target_batches,         # int64*, [Q_CAP]
     target_positions,       # float32*, [Q_CAP, 2]
+    target_frontier_parity, # bool*, [Q_CAP]
     OBS_SIZE: tl.constexpr,
     D: tl.constexpr,
     C_CAP: tl.constexpr,
@@ -1169,7 +1179,8 @@ def _cand_scatter_new_targets_kernel(
     neighbor_start = row + 9 + frontier_size * 8
     source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
-    candidates_start = validity_start + frontier_size
+    parity_start = validity_start + frontier_size
+    candidates_start = parity_start + frontier_size
 
     cand_count = tl.load(candidate_count + b)
     valid = (j < cand_count) & (j < C_CAP)
@@ -1194,6 +1205,7 @@ def _cand_scatter_new_targets_kernel(
     tl.store(target_batches + out, b, mask=valid)
     tl.store(target_positions + out * 2 + 0, x_u32.to(tl.float32, bitcast=True), mask=valid)
     tl.store(target_positions + out * 2 + 1, y_u32.to(tl.float32, bitcast=True), mask=valid)
+    tl.store(target_frontier_parity + out, valid, mask=valid)
 
 
 # =============================================================================
@@ -1389,6 +1401,11 @@ class CUDAGraphObservationDeserializer:
                     dtype=torch.bool,
                     device=self.device,
                 )
+                self.node_parity = torch.empty(
+                    (self.N_CAP,),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
                 self.target_batch_offsets = torch.empty(
                     (self.B + 1,),
                     dtype=torch.long,
@@ -1409,6 +1426,11 @@ class CUDAGraphObservationDeserializer:
                     dtype=torch.float32,
                     device=self.device,
                 )
+                self.target_frontier_parity = torch.empty(
+                    (self.Q_CAP,),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
                 self.target_batch_offsets_tail = self.target_batch_offsets[1:]
             else:
                 self.source_idx = None
@@ -1420,6 +1442,8 @@ class CUDAGraphObservationDeserializer:
                 self.target_idx = None
                 self.target_batches = None
                 self.target_positions = None
+                self.node_parity = None
+                self.target_frontier_parity = None
                 self.target_batch_offsets_tail = None
 
             self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
@@ -1567,6 +1591,7 @@ class CUDAGraphObservationDeserializer:
                 self.valid_node_count,
                 self.target_count,
                 self.node_validity,
+                self.node_parity,
                 OBS_SIZE=self.obs_size,
                 D=self.D,
                 F_CAP=self.F_CAP,
@@ -1593,9 +1618,11 @@ class CUDAGraphObservationDeserializer:
                 self.target_batch_offsets,
                 self.valid_node_count,
                 self.node_validity,
+                self.node_parity,
                 self.target_idx,
                 self.target_batches,
                 self.target_positions,
+                self.target_frontier_parity,
                 F_CAP=self.F_CAP,
                 BLOCK_F=self.BLOCK_F,
                 num_warps=4,
@@ -1612,6 +1639,7 @@ class CUDAGraphObservationDeserializer:
                 self.target_idx,
                 self.target_batches,
                 self.target_positions,
+                self.target_frontier_parity,
                 OBS_SIZE=self.obs_size,
                 D=self.D,
                 C_CAP=max(self.C_CAP, 1),
@@ -1627,6 +1655,7 @@ class CUDAGraphObservationDeserializer:
                 target_batch_offsets=self.target_batch_offsets,
                 target_batches=self.target_batches,
                 target_positions=self.target_positions,
+                target_frontier_parity=self.target_frontier_parity,
             )
 
         return CandidateTargets(
@@ -1635,6 +1664,7 @@ class CUDAGraphObservationDeserializer:
             target_batch_offsets=self.target_batch_offsets,
             target_batches=self.target_batches[:Q],
             target_positions=self.target_positions[:Q],
+            target_frontier_parity=self.target_frontier_parity[:Q],
         )
 
     @torch.no_grad()
@@ -2310,6 +2340,7 @@ class TargetInitStage(nn.Module):
         include_target_log_length=True,
         include_relative_distance=True,
         include_boundary_flag=True,
+        include_frontier_parity=False,
         eps=1e-8,
     ):
         super().__init__()
@@ -2319,6 +2350,7 @@ class TargetInitStage(nn.Module):
         self.include_target_log_length = include_target_log_length
         self.include_relative_distance = include_relative_distance
         self.include_boundary_flag = include_boundary_flag
+        self.include_frontier_parity = include_frontier_parity
         self.eps = eps
         self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
 
@@ -2334,6 +2366,8 @@ class TargetInitStage(nn.Module):
         if include_relative_distance:
             in_dim += 1
         if include_boundary_flag:
+            in_dim += 1
+        if include_frontier_parity:
             in_dim += 1
 
         self.target_proj = layer_init(nn.Linear(in_dim, target_hidden_size)) if in_dim > 0 else None
@@ -2393,6 +2427,9 @@ class TargetInitStage(nn.Module):
         if self.include_boundary_flag:
             boundary_mask = targets.target_idx >= 0
             parts.append(boundary_mask.to(targets.target_positions.dtype).unsqueeze(-1))
+
+        if self.include_frontier_parity:
+            parts.append(targets.target_frontier_parity.to(targets.target_positions.dtype).unsqueeze(-1))
 
         if not parts:
             target_features = self.target_initial.unsqueeze(0).expand(Q, -1)
@@ -3265,6 +3302,7 @@ class QuadMeshingEncoder(nn.Module):
             target_init_target_log_length=True,
             target_init_relative_distance=True,
             target_init_boundary_flag=True,
+            target_init_frontier_parity=False,
             target_painn_length_bands=4,
             target_global_perceiver_d_model=None,
             target_global_perceiver_length_bands=4,
@@ -3371,6 +3409,7 @@ class QuadMeshingEncoder(nn.Module):
                     include_target_log_length=target_init_target_log_length,
                     include_relative_distance=target_init_relative_distance,
                     include_boundary_flag=target_init_boundary_flag,
+                    include_frontier_parity=target_init_frontier_parity,
                 ))
             elif stage == "se2":
                 target_stages.append(SE2TargetStage(

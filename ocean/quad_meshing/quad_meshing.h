@@ -41,6 +41,8 @@ typedef struct {
     float starting_boundary_edge_length;
     IntArray valid_boundary_idx;
     IntArray valid_candidate_idx;
+    IntArray frontier_hop_distance;
+    IntArray frontier_hop_queue;
     Vec2Array candidates_local;
     float potential;
 } QuadMeshingCache;
@@ -74,6 +76,7 @@ typedef struct {
     const char** shape_paths;
     int shape_count;
     bool boundary_mode;
+    bool prevent_triangles;
     bool export_obj;
     const char* export_obj_path;
 
@@ -158,6 +161,8 @@ void quad_meshing_init(QuadMeshingEnv* env)
     Vec2Array_init(&env->cache.candidates_local);
     IntArray_init(&env->cache.valid_boundary_idx);
     IntArray_init(&env->cache.valid_candidate_idx);
+    IntArray_init(&env->cache.frontier_hop_distance);
+    IntArray_init(&env->cache.frontier_hop_queue);
     env->ui_pending_source = -1;
 }
 
@@ -345,6 +350,9 @@ uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint
     return deserialize_u16(&obs->sb);
 }
 
+static void compute_frontier_hop_distances(QuadMeshingEnv* env, int source);
+static bool prevent_triangle_target_allowed(QuadMeshingEnv* env, int target_fidx);
+
 static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode) {
     SerialBuffer* sb = &obs->sb;
     sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t);
@@ -354,6 +362,8 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
 
     int l3 = 0;
     int r3 = 0;
+    compute_frontier_hop_distances(env, source);
+
     if (boundary_mode) {
         l3 = mesh_ring_frontier_neighbor(&env->mesh, source, -3);
         r3 = mesh_ring_frontier_neighbor(&env->mesh, source,  3);
@@ -364,9 +374,17 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
     for (int i=0; i<env->mesh.frontier.size; ++i) {
         int target = env->mesh.frontier.data[i];
         uint8_t valid = !boundary_mode || target == l3 || target == r3;
+        if (!boundary_mode && env->prevent_triangles) {
+            valid = valid && prevent_triangle_target_allowed(env, i);
+        }
         valid = valid && mesh_validate_existing_target(&env->mesh, source, target, false, env->cache.candidate_radius_max) == MESH_VALID_OK;
         if (valid) IntArray_push(&env->cache.valid_boundary_idx, i);
         serialize_u8(sb, valid);
+    }
+
+    for (int i=0; i<env->mesh.frontier.size; ++i) {
+        int dist = env->cache.frontier_hop_distance.data[i];
+        serialize_u8(sb, dist >= 0 ? (uint8_t)(dist & 1) : 0);
     }
     BENCH_END(obs_validity_loop);
 }
@@ -386,9 +404,76 @@ static size_t obs_validity_bytes(QuadMesh* mesh) {
     return mesh->frontier.size * sizeof(uint8_t);
 }
 
+static size_t obs_target_parity_bytes(QuadMesh* mesh) {
+    return mesh->frontier.size * sizeof(uint8_t);
+}
+
+static void compute_frontier_hop_distances(QuadMeshingEnv* env, int source) {
+    QuadMesh* mesh = &env->mesh;
+    IntArray* dist = &env->cache.frontier_hop_distance;
+    IntArray* queue = &env->cache.frontier_hop_queue;
+    int frontier_size = mesh->frontier.size;
+
+    IntArray_resize(dist, frontier_size);
+    IntArray_resize(queue, frontier_size);
+    for (int i = 0; i < frontier_size; ++i) dist->data[i] = -1;
+
+    int source_fidx = mesh->vertices.data[source].frontier_index;
+    QM_ASSERT(source_fidx >= 0 && source_fidx < frontier_size);
+    dist->data[source_fidx] = 0;
+    queue->data[0] = source_fidx;
+
+    int head = 0;
+    int tail = 1;
+    while (head < tail) {
+        int fidx = queue->data[head++];
+        int vidx = mesh->frontier.data[fidx];
+        int next_dist = dist->data[fidx] + 1;
+        int degree = mesh->vertices.data[vidx].degree;
+
+        for (int i = 0; i < degree; ++i) {
+            int nidx = mesh_neighbor_idx(mesh, vidx, i);
+            int nvidx = mesh->neighbors.data[nidx];
+            int nfidx = mesh->vertices.data[nvidx].frontier_index;
+            if (nfidx < 0 || dist->data[nfidx] >= 0) continue;
+
+            int eidx = mesh->neighbor_edges.data[nidx];
+            if (mesh->edges.data[eidx].disabled || mesh->edges.data[eidx].face_count == 2) continue;
+
+            dist->data[nfidx] = next_dist;
+            queue->data[tail++] = nfidx;
+        }
+    }
+}
+
+static bool prevent_triangle_target_allowed(QuadMeshingEnv* env, int target_fidx) {
+    const QuadMesh* mesh = &env->mesh;
+    const IntArray* dist = &env->cache.frontier_hop_distance;
+    int target_dist = dist->data[target_fidx];
+
+    if (target_dist < 0) return false;
+    if (target_dist % 2 != 0) return true;
+    if (target_dist != 2) return false;
+
+    int target = mesh->frontier.data[target_fidx];
+    int degree = mesh->vertices.data[target].degree;
+    for (int i = 0; i < degree; ++i) {
+        int nidx = mesh_neighbor_idx(mesh, target, i);
+        int nvidx = mesh->neighbors.data[nidx];
+        int nfidx = mesh->vertices.data[nvidx].frontier_index;
+        if (nfidx < 0 || dist->data[nfidx] != 2) continue;
+
+        int eidx = mesh->neighbor_edges.data[nidx];
+        if (mesh->edges.data[eidx].disabled || mesh->edges.data[eidx].face_count == 2) continue;
+        return true;
+    }
+
+    return false;
+}
+
 static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(&env->mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(&env->mesh) + obs_target_parity_bytes(&env->mesh);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_candidate_idx, 0);
@@ -414,7 +499,7 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
 
 void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Array* candidates) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(mesh) + obs_target_parity_bytes(mesh);
 
     int valid_count = deserialize_u16(sb);
 
@@ -1020,4 +1105,6 @@ void c_close(QuadMeshingEnv* env) {
     Vec2Array_free(&env->cache.candidates_local);
     IntArray_free(&env->cache.valid_boundary_idx);
     IntArray_free(&env->cache.valid_candidate_idx);
+    IntArray_free(&env->cache.frontier_hop_distance);
+    IntArray_free(&env->cache.frontier_hop_queue);
 }

@@ -476,6 +476,7 @@ def test_quad_meshing_target_se2_pipeline_without_ring_frame(monkeypatch):
         target_batch_offsets=torch.tensor([0, 2]),
         target_batches=torch.tensor([0, 0]),
         target_positions=torch.tensor([[0.8, 0.1], [0.2, 0.7]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True, False]),
     )
     encoder = QuadMeshingEncoder(
         obs_size=1,
@@ -515,6 +516,7 @@ def test_quad_meshing_target_painn_pipeline(monkeypatch):
         target_batch_offsets=torch.tensor([0, 2]),
         target_batches=torch.tensor([0, 0]),
         target_positions=torch.tensor([[0.8, 0.1], [0.2, 0.7]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True, False]),
     )
     encoder = QuadMeshingEncoder(
         obs_size=1,
@@ -555,6 +557,7 @@ def test_quad_meshing_target_source_global_perceiver_pipeline(monkeypatch):
         target_batch_offsets=torch.tensor([0, 2]),
         target_batches=torch.tensor([0, 0]),
         target_positions=torch.tensor([[0.8, 0.1], [0.2, 0.7]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True, False]),
     )
     encoder = QuadMeshingEncoder(
         obs_size=1,
@@ -604,6 +607,7 @@ def test_quad_meshing_target_source_global_perceiver_pipeline(monkeypatch):
         target_batch_offsets=targets.target_batch_offsets,
         target_batches=targets.target_batches,
         target_positions=targets.target_positions @ rot.T + shift,
+        target_frontier_parity=targets.target_frontier_parity,
     )
 
     h_target_rot = encoder._encode_targets(targets_rot, encoder._encode_frontier(graph_rot))
@@ -627,6 +631,7 @@ def test_target_source_global_perceiver_zero_scale_is_identity(monkeypatch):
         target_batch_offsets=torch.tensor([0, 2]),
         target_batches=torch.tensor([0, 0]),
         target_positions=torch.tensor([[0.8, 0.1], [0.2, 0.7]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True, False]),
     )
     encoder = QuadMeshingEncoder(
         obs_size=1,
@@ -679,6 +684,7 @@ def test_quad_meshing_target_source_condition_stage(monkeypatch):
         target_batch_offsets=torch.tensor([0, 1]),
         target_batches=torch.tensor([0]),
         target_positions=torch.tensor([[0.8, 0.1]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True]),
     )
     encoder = QuadMeshingEncoder(
         obs_size=1,
@@ -699,6 +705,52 @@ def test_quad_meshing_target_source_condition_stage(monkeypatch):
 
     assert h_target.shape == (1, 7)
     assert torch.isfinite(h_target).all()
+
+
+def test_target_init_stage_accepts_frontier_parity_feature():
+    x, edge_index, edge_ptr, edge_cont = make_directed_ring(num_nodes=4)
+    graph = make_csr_graph(
+        vertices=x,
+        batch_offsets=torch.tensor([0, x.size(0)]),
+        edges=edge_index,
+        edge_features=edge_cont[:, 1:].bool(),
+        edge_ptr=edge_ptr,
+    )
+    frontier_state = models.FrontierState(
+        graph=graph,
+        node_features=torch.empty(4, 3),
+        edge_features=torch.empty(edge_index.size(1), 2),
+        context_features=torch.empty(1, 3),
+        node_vectors=None,
+    )
+    targets = CandidateTargets(
+        source_idx=torch.tensor([0]),
+        target_idx=torch.tensor([-1, 2]),
+        target_batch_offsets=torch.tensor([0, 2]),
+        target_batches=torch.tensor([0, 0]),
+        target_positions=torch.tensor([[0.8, 0.1], [0.2, 0.7]], dtype=x.dtype),
+        target_frontier_parity=torch.tensor([True, False]),
+    )
+    state = models.TargetState(
+        targets=targets,
+        target_features=torch.empty(0, 5),
+    )
+    stage = models.TargetInitStage(
+        target_hidden_size=5,
+        pos_bands=0,
+        include_ring_frame_pos=False,
+        include_distance=False,
+        include_target_length=False,
+        include_target_log_length=False,
+        include_relative_distance=False,
+        include_boundary_flag=False,
+        include_frontier_parity=True,
+    )
+
+    out = stage(state, frontier_state)
+
+    assert out.target_features.shape == (2, 5)
+    assert torch.isfinite(out.target_features).all()
 
 
 def test_source_edge_perceiver_canonical_direction_tie_breaker():
