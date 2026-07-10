@@ -60,26 +60,6 @@ typedef struct {
 } LoopSegmentVec;
 
 typedef struct {
-    float* data;
-    int size;
-    int cap;
-} FloatVec;
-
-typedef struct {
-    int tri;
-    int edge;
-    float t0;
-    float t1;
-    int side;
-} LoopPortal;
-
-typedef struct {
-    LoopPortal* data;
-    int size;
-    int cap;
-} LoopPortalVec;
-
-typedef struct {
     Vector3 p;
     int tri;
     float distance;
@@ -173,6 +153,22 @@ typedef struct {
     int touched_state_count;
     int max_state_windows;
 } GeodesicPathContext;
+
+typedef struct {
+    int target_count;
+    int ok_count;
+    int failed_count;
+    int direct_count;
+    int segments;
+    int windows_pushed;
+    int windows_popped;
+    int pseudo_sources;
+    int touched_state_count;
+    int max_state_windows;
+    double total_ms;
+    double propagation_ms;
+    double emission_ms;
+} SharedGeodesicStats;
 
 typedef struct {
     Vector3* nodes;
@@ -288,53 +284,6 @@ static void loop_segment_vec_clear(LoopSegmentVec* v) {
 }
 
 static void loop_segment_vec_free(LoopSegmentVec* v) {
-    free(v->data);
-    memset(v, 0, sizeof(*v));
-}
-
-static void float_vec_push(FloatVec* v, float value) {
-    if (v->size == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 8;
-        v->data = (float*)checked_realloc(v->data, (size_t)v->cap * sizeof(float));
-    }
-    v->data[v->size++] = value;
-}
-
-static int compare_floats(const void* pa, const void* pb) {
-    float a = *(const float*)pa;
-    float b = *(const float*)pb;
-    if (a < b) return -1;
-    if (a > b) return 1;
-    return 0;
-}
-
-static void float_vec_sort_unique(FloatVec* v) {
-    if (v->size <= 1) return;
-    qsort(v->data, (size_t)v->size, sizeof(float), compare_floats);
-    int out = 0;
-    for (int i = 0; i < v->size; ++i) {
-        float value = Clamp(v->data[i], 0.0f, 1.0f);
-        if (out > 0 && fabsf(value - v->data[out - 1]) <= 1e-5f) continue;
-        v->data[out++] = value;
-    }
-    v->size = out;
-}
-
-static void float_vec_free(FloatVec* v) {
-    free(v->data);
-    memset(v, 0, sizeof(*v));
-}
-
-static void loop_portal_vec_push(LoopPortalVec* v, LoopPortal value) {
-    if (value.t1 <= value.t0 + 1e-5f || value.side == 0) return;
-    if (v->size == v->cap) {
-        v->cap = v->cap ? v->cap * 2 : 64;
-        v->data = (LoopPortal*)checked_realloc(v->data, (size_t)v->cap * sizeof(LoopPortal));
-    }
-    v->data[v->size++] = value;
-}
-
-static void loop_portal_vec_free(LoopPortalVec* v) {
     free(v->data);
     memset(v, 0, sizeof(*v));
 }
@@ -1639,6 +1588,241 @@ static bool append_window_chain_path(
     return append_window_segment_backtrace(surface, windows, start, wi, start_p, end_p, path, segments, append);
 }
 
+static bool geodesic_seed_source_root(
+    const SurfaceMesh* surface,
+    const SurfaceSample* samples,
+    int source,
+    GeodesicPathContext* path_ctx
+) {
+    GeoWindow root = {0};
+    root.tri = samples[source].tri;
+    root.entry_edge = -1;
+    root.parent = -1;
+    root.key = 0.0f;
+    root.offset = 0.0f;
+    root.t0 = 0.0f;
+    root.t1 = 1.0f;
+    root.source_vertex = -1;
+    if (!copy_precomputed_tri2d(path_ctx, root.tri, root.tri2d)) return false;
+    float su, sv, sw;
+    barycentric3(samples[source].p,
+        surface->vertices[surface->tris[3 * root.tri + 0]],
+        surface->vertices[surface->tris[3 * root.tri + 1]],
+        surface->vertices[surface->tris[3 * root.tri + 2]], &su, &sv, &sw);
+    root.source2 = barycentric_to_2d(su, sv, sw, root.tri2d[0], root.tri2d[1], root.tri2d[2]);
+    geodesic_push_window(path_ctx, root, root.tri * 4, 0.0f);
+    return true;
+}
+
+static int geodesic_find_best_target_window(
+    const SurfaceMesh* surface,
+    const SurfaceSample* samples,
+    int target,
+    const FMMContext* ctx,
+    const GeodesicPathContext* path_ctx,
+    float* out_distance
+) {
+    float best_target = (samples[target].stamp == ctx->query_id && isfinite(samples[target].distance)) ? samples[target].distance * 1.0001f + 1e-6f : INFINITY;
+    int best_target_window = -1;
+    int target_tri = samples[target].tri;
+    for (int state_offset = 0; state_offset < 4; ++state_offset) {
+        int state = target_tri * 4 + state_offset;
+        if (state < 0 || state >= path_ctx->state_count || path_ctx->state_stamp[state] != path_ctx->query_id) continue;
+        const IntVec* list = &path_ctx->state_windows[state];
+        for (int i = 0; i < list->size; ++i) {
+            int wi = list->data[i];
+            const GeoWindow* w = &path_ctx->windows.data[wi];
+            float tu, tv, tw;
+            barycentric3(samples[target].p,
+                surface->vertices[surface->tris[3 * w->tri + 0]],
+                surface->vertices[surface->tris[3 * w->tri + 1]],
+                surface->vertices[surface->tris[3 * w->tri + 2]], &tu, &tv, &tw);
+            Vector2 target2 = barycentric_to_2d(tu, tv, tw, w->tri2d[0], w->tri2d[1], w->tri2d[2]);
+            if (!geo_window_sees_point(w, target2)) continue;
+            float d = w->offset + Vector2Distance(w->source2, target2);
+            bool better = d < best_target - 1e-6f;
+            if (!better && fabsf(d - best_target) <= 1e-6f && best_target_window >= 0) {
+                better = window_chain_uses_pseudo_source(&path_ctx->windows, best_target_window) && !window_chain_uses_pseudo_source(&path_ctx->windows, wi);
+            }
+            if (better) {
+                best_target = d;
+                best_target_window = wi;
+            }
+        }
+    }
+    if (best_target_window >= 0 && out_distance) *out_distance = best_target;
+    return best_target_window;
+}
+
+static bool build_shared_source_geodesic_paths(
+    const SurfaceMesh* surface,
+    const PropGraph* graph,
+    const SurfaceSample* samples,
+    int sample_count,
+    int source,
+    const FMMContext* ctx,
+    GeodesicPathContext* path_ctx,
+    LoopSegmentVec* segments,
+    SharedGeodesicStats* stats
+) {
+    memset(stats, 0, sizeof(*stats));
+    stats->total_ms = -1.0;
+    stats->propagation_ms = -1.0;
+    stats->emission_ms = -1.0;
+    loop_segment_vec_clear(segments);
+    if (source < 0 || source >= sample_count) return false;
+
+    float stop_distance = 0.0f;
+    for (int i = 0; i < sample_count; ++i) {
+        if (i == source || samples[i].disabled) continue;
+        if (!(samples[i].stamp == ctx->query_id && samples[i].in_radius && isfinite(samples[i].distance))) continue;
+        ++stats->target_count;
+        stop_distance = fmaxf(stop_distance, samples[i].distance * 1.0001f + 1e-6f);
+    }
+    if (stats->target_count <= 0) {
+        stats->total_ms = 0.0;
+        stats->propagation_ms = 0.0;
+        stats->emission_ms = 0.0;
+        return true;
+    }
+
+    double total_t0 = now_seconds();
+    double prop_t0 = total_t0;
+    geodesic_path_context_begin(path_ctx);
+    if (!geodesic_seed_source_root(surface, samples, source, path_ctx)) return false;
+
+    while (path_ctx->heap.size > 0) {
+        WindowHeapItem item = window_heap_pop(&path_ctx->heap);
+        ++path_ctx->windows_popped;
+        if (item.key >= stop_distance) break;
+        GeoWindow w = path_ctx->windows.data[item.window];
+
+        for (int edge = 0; edge < 3; ++edge) {
+            if (edge == w.entry_edge) continue;
+            int next_tri = surface->tri_neighbors[3 * w.tri + edge];
+            if (next_tri < 0) continue;
+
+            int a = (edge + 1) % 3;
+            int b = (edge + 2) % 3;
+            float clipped_t0;
+            float clipped_t1;
+            if (!geo_window_clip_edge(&w, edge, &clipped_t0, &clipped_t1)) continue;
+
+            int va = surface->tris[3 * w.tri + a];
+            int vb = surface->tris[3 * w.tri + b];
+            int endpoint_vids[2] = {va, vb};
+            float endpoint_ts[2] = {clipped_t0, clipped_t1};
+            Vector2 endpoint_points[2] = {w.tri2d[a], w.tri2d[b]};
+            for (int pi = 0; pi < 2; ++pi) {
+                if ((pi == 0 && endpoint_ts[pi] > 1e-5f) || (pi == 1 && endpoint_ts[pi] < 1.0f - 1e-5f)) continue;
+                int vid = endpoint_vids[pi];
+                if (!path_ctx->pseudo_source_vertex[vid]) continue;
+                float vd = w.offset + Vector2Distance(w.source2, endpoint_points[pi]);
+                if (vd >= geodesic_get_best_vertex(path_ctx, vid) - 1e-6f || vd >= stop_distance) continue;
+                geodesic_set_best_vertex(path_ctx, vid, vd);
+                ++path_ctx->pseudo_sources;
+
+                int begin = graph->node_tri_offsets[vid];
+                int end = graph->node_tri_offsets[vid + 1];
+                for (int ti = begin; ti < end; ++ti) {
+                    int seed_tri = graph->node_tri_ids[ti];
+                    GeoWindow vw = {0};
+                    vw.tri = seed_tri;
+                    vw.entry_edge = -1;
+                    vw.parent = item.window;
+                    vw.key = vd;
+                    vw.offset = vd;
+                    vw.t0 = 0.0f;
+                    vw.t1 = 1.0f;
+                    vw.source_vertex = vid;
+                    if (!copy_precomputed_tri2d(path_ctx, seed_tri, vw.tri2d)) continue;
+                    int local = tri_local_index(surface, seed_tri, vid);
+                    if (local < 0) continue;
+                    vw.source2 = vw.tri2d[local];
+                    geodesic_push_window(path_ctx, vw, seed_tri * 4, vd);
+                }
+            }
+
+            if (clipped_t1 < clipped_t0 + 1e-6f) continue;
+
+            Vector2 clipped_a = lerp2(w.tri2d[a], w.tri2d[b], clipped_t0);
+            Vector2 clipped_b = lerp2(w.tri2d[a], w.tri2d[b], clipped_t1);
+            float key = w.offset + distance_point_segment_2d(w.source2, clipped_a, clipped_b);
+            if (key >= stop_distance) continue;
+
+            int next_entry = local_edge_between(surface, next_tri, va, vb);
+            if (next_entry < 0) continue;
+            int next_state = next_tri * 4 + next_entry + 1;
+
+            GeoWindow nw = {0};
+            nw.tri = next_tri;
+            nw.entry_edge = next_entry;
+            nw.parent = item.window;
+            nw.key = key;
+            nw.offset = w.offset;
+            nw.source_vertex = w.source_vertex;
+            nw.source2 = w.source2;
+            if (!unfold_neighbor_triangle(surface, w.tri, edge, next_tri, w.tri2d, nw.tri2d)) continue;
+            int na = surface->tris[3 * next_tri + (next_entry + 1) % 3];
+            int nb = surface->tris[3 * next_tri + (next_entry + 2) % 3];
+            if (na == va && nb == vb) {
+                nw.t0 = clipped_t0;
+                nw.t1 = clipped_t1;
+            } else {
+                nw.t0 = 1.0f - clipped_t1;
+                nw.t1 = 1.0f - clipped_t0;
+            }
+            geodesic_state_list(path_ctx, next_state);
+            if (geo_window_dominated(&path_ctx->windows, path_ctx->state_windows, next_state, nw.t0, nw.t1, key)) continue;
+            geodesic_push_window(path_ctx, nw, next_state, key);
+        }
+    }
+
+    double prop_t1 = now_seconds();
+    Vec3Vec tmp_path = {0};
+    LoopSegmentVec tmp_segments = {0};
+    for (int i = 0; i < sample_count; ++i) {
+        if (i == source || samples[i].disabled) continue;
+        if (!(samples[i].stamp == ctx->query_id && samples[i].in_radius && isfinite(samples[i].distance))) continue;
+
+        if (samples[source].tri == samples[i].tri) {
+            loop_segment_vec_push(segments, (LoopSegment){.tri = samples[source].tri, .a = samples[source].p, .b = samples[i].p});
+            ++stats->ok_count;
+            ++stats->direct_count;
+            continue;
+        }
+
+        int wi = geodesic_find_best_target_window(surface, samples, i, ctx, path_ctx, NULL);
+        if (wi < 0) {
+            ++stats->failed_count;
+            continue;
+        }
+
+        vec3_vec_clear(&tmp_path);
+        loop_segment_vec_clear(&tmp_segments);
+        if (append_window_chain_path(surface, samples, source, &path_ctx->windows, wi, samples[i].p, samples[i].tri, &tmp_path, &tmp_segments, false)) {
+            for (int si = 0; si < tmp_segments.size; ++si) loop_segment_vec_push(segments, tmp_segments.data[si]);
+            ++stats->ok_count;
+        } else {
+            ++stats->failed_count;
+        }
+    }
+    vec3_vec_free(&tmp_path);
+    loop_segment_vec_free(&tmp_segments);
+
+    double total_t1 = now_seconds();
+    stats->segments = segments->size;
+    stats->windows_pushed = path_ctx->windows_pushed;
+    stats->windows_popped = path_ctx->windows_popped;
+    stats->pseudo_sources = path_ctx->pseudo_sources;
+    stats->touched_state_count = path_ctx->touched_state_count;
+    stats->max_state_windows = path_ctx->max_state_windows;
+    stats->propagation_ms = 1000.0 * (prop_t1 - prop_t0);
+    stats->total_ms = 1000.0 * (total_t1 - total_t0);
+    stats->emission_ms = stats->total_ms - stats->propagation_ms;
+    return true;
+}
+
 static bool build_geodesic_path(
     const SurfaceMesh* surface,
     const PropGraph* graph,
@@ -1839,6 +2023,22 @@ static void draw_geodesic_path(const Vec3Vec* path, float radius) {
     draw_path_color(path, radius, (Color){255, 80, 220, 220});
 }
 
+static Vector3 triangle_normal_offset(const SurfaceMesh* surface, int tri, float amount);
+
+static void draw_loop_segments_color(const SurfaceMesh* surface, const LoopSegmentVec* segments, float radius, Color color, float offset) {
+    if (segments->size <= 0) return;
+    float r = fmaxf(radius * 0.0015f, 0.00025f);
+    for (int i = 0; i < segments->size; ++i) {
+        const LoopSegment* seg = &segments->data[i];
+        Vector3 o = triangle_normal_offset(surface, seg->tri, offset);
+        Vector3 a = Vector3Add(seg->a, o);
+        Vector3 b = Vector3Add(seg->b, o);
+        DrawLine3D(a, b, color);
+        DrawSphere(a, r, color);
+        DrawSphere(b, r, color);
+    }
+}
+
 enum {
     LOOP_EDGE_BLOCKED = 1,
     LOOP_EDGE_LEFT = 2,
@@ -1861,9 +2061,7 @@ typedef struct {
     unsigned char* boundary_tri;
     unsigned char* side_mark;
     unsigned char* conflict_tri;
-    LoopPortal* portals;
     int tri_count;
-    int portal_count;
 } LoopDebugData;
 
 static void loop_debug_free(LoopDebugData* debug) {
@@ -1871,7 +2069,6 @@ static void loop_debug_free(LoopDebugData* debug) {
     free(debug->boundary_tri);
     free(debug->side_mark);
     free(debug->conflict_tri);
-    free(debug->portals);
     memset(debug, 0, sizeof(*debug));
 }
 
@@ -1881,7 +2078,6 @@ static void loop_debug_capture(
     const unsigned char* boundary_tri,
     const unsigned char* side_mark,
     const unsigned char* conflict_tri,
-    const LoopPortalVec* portals,
     int tri_count
 ) {
     loop_debug_free(debug);
@@ -1890,21 +2086,14 @@ static void loop_debug_capture(
     debug->boundary_tri = (unsigned char*)malloc((size_t)tri_count * sizeof(unsigned char));
     debug->side_mark = (unsigned char*)malloc((size_t)tri_count * sizeof(unsigned char));
     debug->conflict_tri = (unsigned char*)malloc((size_t)tri_count * sizeof(unsigned char));
-    debug->portal_count = portals ? portals->size : 0;
-    debug->portals = debug->portal_count > 0 ? (LoopPortal*)malloc((size_t)debug->portal_count * sizeof(LoopPortal)) : NULL;
     if (!debug->flags || !debug->boundary_tri || !debug->side_mark || !debug->conflict_tri) {
         fprintf(stderr, "out of memory while capturing loop debug data\n");
-        exit(1);
-    }
-    if (debug->portal_count > 0 && !debug->portals) {
-        fprintf(stderr, "out of memory while capturing loop portal debug data\n");
         exit(1);
     }
     memcpy(debug->flags, flags, (size_t)tri_count * 3 * sizeof(unsigned char));
     memcpy(debug->boundary_tri, boundary_tri, (size_t)tri_count * sizeof(unsigned char));
     memcpy(debug->side_mark, side_mark, (size_t)tri_count * sizeof(unsigned char));
     memcpy(debug->conflict_tri, conflict_tri, (size_t)tri_count * sizeof(unsigned char));
-    if (debug->portal_count > 0) memcpy(debug->portals, portals->data, (size_t)debug->portal_count * sizeof(LoopPortal));
 }
 
 static Vector2 surface_point_to_tri2d(const SurfaceMesh* surface, int tri, Vector3 p, const Vector2 tri2d[3]) {
@@ -1941,11 +2130,29 @@ static void loop_mark_point_vertex_fan_boundary(
     }
 }
 
+static void loop_update_local_vertex_side(
+    int tri,
+    int local_vertex,
+    int side,
+    float dist2,
+    unsigned char* vertex_side,
+    float* vertex_dist2
+) {
+    if (side == 0) return;
+    int idx = 3 * tri + local_vertex;
+    if (dist2 < vertex_dist2[idx]) {
+        vertex_dist2[idx] = dist2;
+        vertex_side[idx] = (unsigned char)side;
+    }
+}
+
 static void loop_mark_segment_blocked_edges(
     const SurfaceMesh* surface,
     const PropGraph* graph,
     const LoopSegment* seg,
     unsigned char* flags,
+    unsigned char* vertex_side,
+    float* vertex_dist2,
     unsigned char* boundary_tri,
     int* conflicts
 ) {
@@ -1971,43 +2178,14 @@ static void loop_mark_segment_blocked_edges(
         }
 
         flags[3 * seg->tri + edge] |= LOOP_EDGE_BLOCKED;
-        int nb = surface->tri_neighbors[3 * seg->tri + edge];
-        if (nb >= 0) {
-            int va = surface->tris[3 * seg->tri + (edge + 1) % 3];
-            int vb = surface->tris[3 * seg->tri + (edge + 2) % 3];
-            int nb_edge = local_edge_between(surface, nb, va, vb);
-            if (nb_edge >= 0) flags[3 * nb + nb_edge] |= LOOP_EDGE_BLOCKED;
-        }
+        Vector2 hit = lerp2(tri2d[ea], tri2d[eb], u);
+        int side_a = cross2v(dir, Vector2Subtract(tri2d[ea], hit)) > 0.0f ? 1 : 2;
+        int side_b = cross2v(dir, Vector2Subtract(tri2d[eb], hit)) > 0.0f ? 1 : 2;
+        loop_update_local_vertex_side(seg->tri, ea, side_a, Vector2DistanceSqr(tri2d[ea], hit), vertex_side, vertex_dist2);
+        loop_update_local_vertex_side(seg->tri, eb, side_b, Vector2DistanceSqr(tri2d[eb], hit), vertex_side, vertex_dist2);
+
     }
     (void)conflicts;
-}
-
-static bool loop_nearest_segment_side_in_tri(
-    const SurfaceMesh* surface,
-    const LoopSegmentVec* loop_segments,
-    int tri,
-    Vector2 p2,
-    const Vector2 tri2d[3],
-    int* out_side
-) {
-    float best = INFINITY;
-    float best_side = 0.0f;
-    for (int i = 0; i < loop_segments->size; ++i) {
-        const LoopSegment* seg = &loop_segments->data[i];
-        if (seg->tri != tri) continue;
-        Vector2 a2 = surface_point_to_tri2d(surface, tri, seg->a, tri2d);
-        Vector2 b2 = surface_point_to_tri2d(surface, tri, seg->b, tri2d);
-        Vector2 dir = Vector2Subtract(b2, a2);
-        if (Vector2LengthSqr(dir) < 1e-14f) continue;
-        float d = distance_point_segment_2d(p2, a2, b2);
-        if (d < best) {
-            best = d;
-            best_side = cross2v(dir, Vector2Subtract(p2, a2));
-        }
-    }
-    if (!isfinite(best) || fabsf(best_side) <= 1e-7f) return false;
-    *out_side = best_side > 0.0f ? 1 : -1;
-    return true;
 }
 
 typedef struct {
@@ -2096,171 +2274,6 @@ static int local_component_side(const LocalClassPoint* points, int point_count, 
     return side;
 }
 
-static void loop_classify_interval_portals_for_tri(
-    const SurfaceMesh* surface,
-    const LoopSegmentVec* loop_segments,
-    int tri,
-    const unsigned char* boundary_tri,
-    unsigned char* flags,
-    LoopPortalVec* portals,
-    int* conflicts
-) {
-    Vector2 tri2d[3];
-    if (!triangle_to_2d(surface, tri, tri2d)) return;
-
-    FloatVec edge_params[3] = {0};
-    for (int edge = 0; edge < 3; ++edge) {
-        float_vec_push(&edge_params[edge], 0.0f);
-        float_vec_push(&edge_params[edge], 1.0f);
-    }
-
-    LocalCutSegment* cuts = NULL;
-    int cut_count = 0;
-    int cut_cap = 0;
-    LocalClassPoint* points = NULL;
-    int point_count = 0;
-    int point_cap = 0;
-
-    float tri_scale = fmaxf(Vector2Distance(tri2d[0], tri2d[1]), fmaxf(Vector2Distance(tri2d[1], tri2d[2]), Vector2Distance(tri2d[2], tri2d[0])));
-    float seed_eps = fmaxf(tri_scale * 1e-4f, 1e-7f);
-
-    for (int i = 0; i < 3; ++i) {
-        Vector2 corner = Vector2Add(
-            Vector2Scale(tri2d[i], 1.0f - 2.0f * seed_eps / fmaxf(tri_scale, 1e-8f)),
-            Vector2Scale(Vector2Add(tri2d[(i + 1) % 3], tri2d[(i + 2) % 3]), seed_eps / fmaxf(tri_scale, 1e-8f)));
-        if (point_inside_triangle_2d(corner, tri2d)) {
-            local_class_point_push(&points, &point_count, &point_cap, (LocalClassPoint){.p = corner, .side = 0, .edge = -1, .portal = false});
-        }
-    }
-
-    for (int i = 0; i < loop_segments->size; ++i) {
-        const LoopSegment* seg = &loop_segments->data[i];
-        if (seg->tri != tri) continue;
-        Vector2 a2 = surface_point_to_tri2d(surface, tri, seg->a, tri2d);
-        Vector2 b2 = surface_point_to_tri2d(surface, tri, seg->b, tri2d);
-        Vector2 dir = Vector2Subtract(b2, a2);
-        float len = Vector2Length(dir);
-        if (len <= 1e-8f) continue;
-        local_cut_segment_push(&cuts, &cut_count, &cut_cap, (LocalCutSegment){.a = a2, .b = b2});
-
-        for (int edge = 0; edge < 3; ++edge) {
-            int ea = (edge + 1) % 3;
-            int eb = (edge + 2) % 3;
-            float t, u;
-            if (!segment_intersect_2d(a2, b2, tri2d[ea], tri2d[eb], &t, &u)) continue;
-            if (u > 1e-5f && u < 1.0f - 1e-5f) float_vec_push(&edge_params[edge], u);
-        }
-
-        Vector2 mid = Vector2Scale(Vector2Add(a2, b2), 0.5f);
-        Vector2 n = Vector2Scale((Vector2){-dir.y, dir.x}, 1.0f / len);
-        add_local_side_seed(&points, &point_count, &point_cap, mid, n, 1, seed_eps, tri2d);
-        add_local_side_seed(&points, &point_count, &point_cap, mid, Vector2Scale(n, -1.0f), 2, seed_eps, tri2d);
-    }
-
-    if (cut_count == 0) goto done;
-
-    int same_cross_edge = -1;
-    int crossed_edge_count = 0;
-    for (int edge = 0; edge < 3; ++edge) {
-        float_vec_sort_unique(&edge_params[edge]);
-        if (edge_params[edge].size > 2) {
-            same_cross_edge = edge;
-            ++crossed_edge_count;
-        }
-    }
-
-    int same_edge_opposite_side = 0;
-    if (crossed_edge_count == 1 && edge_params[same_cross_edge].size >= 4) {
-        int nearest = 0;
-        if (loop_nearest_segment_side_in_tri(surface, loop_segments, tri, tri2d[same_cross_edge], tri2d, &nearest)) {
-            same_edge_opposite_side = nearest > 0 ? 1 : 2;
-        }
-    }
-
-    for (int edge = 0; edge < 3; ++edge) {
-        int nb = surface->tri_neighbors[3 * tri + edge];
-        if (nb < 0 || boundary_tri[nb]) continue;
-        int a = (edge + 1) % 3;
-        int b = (edge + 2) % 3;
-        for (int i = 0; i < edge_params[edge].size - 1; ++i) {
-            float t0 = edge_params[edge].data[i];
-            float t1 = edge_params[edge].data[i + 1];
-            if (t1 <= t0 + 1e-5f) continue;
-            float tm = 0.5f * (t0 + t1);
-            Vector2 p = lerp2(tri2d[a], tri2d[b], tm);
-            local_class_point_push(&points, &point_count, &point_cap, (LocalClassPoint){.p = p, .side = 0, .edge = edge, .t0 = t0, .t1 = t1, .portal = true});
-        }
-    }
-
-    int* queue = (int*)malloc((size_t)fmaxf((float)point_count, 1.0f) * sizeof(int));
-    if (!queue) {
-        fprintf(stderr, "out of memory while classifying local loop portals\n");
-        exit(1);
-    }
-    int comp_count = 0;
-    for (int start = 0; start < point_count; ++start) {
-        if (points[start].comp >= 0) continue;
-        int head = 0;
-        int tail = 0;
-        points[start].comp = comp_count;
-        queue[tail++] = start;
-        while (head < tail) {
-            int pidx = queue[head++];
-            for (int j = 0; j < point_count; ++j) {
-                if (points[j].comp >= 0) continue;
-                if (local_connection_crosses_cut(points[pidx].p, points[j].p, cuts, cut_count)) continue;
-                points[j].comp = comp_count;
-                queue[tail++] = j;
-            }
-        }
-        ++comp_count;
-    }
-    free(queue);
-
-    int* comp_side = (int*)calloc((size_t)fmaxf((float)comp_count, 1.0f), sizeof(int));
-    if (!comp_side) {
-        fprintf(stderr, "out of memory while labeling local loop components\n");
-        exit(1);
-    }
-    for (int comp = 0; comp < comp_count; ++comp) comp_side[comp] = local_component_side(points, point_count, comp, conflicts, tri);
-
-    for (int i = 0; i < point_count; ++i) {
-        if (!points[i].portal) continue;
-        int side = points[i].comp >= 0 ? comp_side[points[i].comp] : 0;
-        if (same_edge_opposite_side != 0 && points[i].edge != same_cross_edge) side = same_edge_opposite_side;
-        if (side == 0) {
-            int nearest = 0;
-            if (loop_nearest_segment_side_in_tri(surface, loop_segments, tri, points[i].p, tri2d, &nearest)) side = nearest > 0 ? 1 : 2;
-        }
-        if (side == 0) {
-            fprintf(stderr, "loop portal interval unlabeled: tri=%d edge=%d t=[%.6f, %.6f]\n", tri, points[i].edge, points[i].t0, points[i].t1);
-            ++*conflicts;
-            continue;
-        }
-        flags[3 * tri + points[i].edge] |= side == 1 ? LOOP_EDGE_LEFT : LOOP_EDGE_RIGHT;
-        loop_portal_vec_push(portals, (LoopPortal){.tri = tri, .edge = points[i].edge, .t0 = points[i].t0, .t1 = points[i].t1, .side = side});
-    }
-    free(comp_side);
-
-done:
-    for (int edge = 0; edge < 3; ++edge) float_vec_free(&edge_params[edge]);
-    free(cuts);
-    free(points);
-}
-
-static void loop_classify_interval_portals(
-    const SurfaceMesh* surface,
-    const LoopSegmentVec* loop_segments,
-    const unsigned char* boundary_tri,
-    unsigned char* flags,
-    LoopPortalVec* portals,
-    int* conflicts
-) {
-    for (int tri = 0; tri < surface->tri_count; ++tri) {
-        if (boundary_tri[tri]) loop_classify_interval_portals_for_tri(surface, loop_segments, tri, boundary_tri, flags, portals, conflicts);
-    }
-}
-
 static float surface_triangle_area(const SurfaceMesh* surface, int tri) {
     return triangle_area(
         surface->vertices[surface->tris[3 * tri + 0]],
@@ -2272,7 +2285,7 @@ static const char* loop_debug_mode_name(int mode) {
     switch (mode) {
         case 0: return "off";
         case 1: return "boundary";
-        case 2: return "portals";
+        case 2: return "cuts";
         case 3: return "flood";
         case 4: return "conflicts";
         case 5: return "all";
@@ -2304,21 +2317,12 @@ static void draw_loop_debug_edge(const SurfaceMesh* surface, int tri, int edge, 
     DrawLine3D(Vector3Add(surface->vertices[a], o), Vector3Add(surface->vertices[b], o), color);
 }
 
-static void draw_loop_debug_edge_interval(const SurfaceMesh* surface, const LoopPortal* portal, Color color, float offset) {
-    Vector3 o = triangle_normal_offset(surface, portal->tri, offset);
-    int a = surface->tris[3 * portal->tri + (portal->edge + 1) % 3];
-    int b = surface->tris[3 * portal->tri + (portal->edge + 2) % 3];
-    Vector3 p0 = Vector3Add(Vector3Scale(surface->vertices[a], 1.0f - portal->t0), Vector3Scale(surface->vertices[b], portal->t0));
-    Vector3 p1 = Vector3Add(Vector3Scale(surface->vertices[a], 1.0f - portal->t1), Vector3Scale(surface->vertices[b], portal->t1));
-    DrawLine3D(Vector3Add(p0, o), Vector3Add(p1, o), color);
-}
-
 static void draw_loop_debug(const SurfaceMesh* surface, const LoopDebugData* debug, int mode, int chosen_side, float marker_scale) {
     if (mode <= 0 || !debug->flags || debug->tri_count != surface->tri_count) return;
-    float off = fmaxf(marker_scale * 0.00025f, 1e-5f);
+    float off = fmaxf(marker_scale * 0.00005f, 2e-6f);
 
     bool show_boundary = mode == 1 || mode == 5;
-    bool show_portals = mode == 2 || mode == 5;
+    bool show_cuts = mode == 2 || mode == 5;
     bool show_flood = mode == 3 || mode == 5;
     bool show_conflicts = mode == 4 || mode == 5;
 
@@ -2341,16 +2345,20 @@ static void draw_loop_debug(const SurfaceMesh* surface, const LoopDebugData* deb
         }
     }
 
-    if (show_portals) {
+    if (show_cuts) {
         for (int tri = 0; tri < surface->tri_count; ++tri) {
             for (int edge = 0; edge < 3; ++edge) {
                 unsigned char f = debug->flags[3 * tri + edge];
-                if (f & LOOP_EDGE_BLOCKED) draw_loop_debug_edge(surface, tri, edge, (Color){255, 40, 40, 255}, off * 3.0f);
+                if (f & LOOP_EDGE_BLOCKED) {
+                    draw_loop_debug_edge(surface, tri, edge, (Color){255, 40, 40, 255}, off * 3.0f);
+                } else if ((f & LOOP_EDGE_LEFT) && (f & LOOP_EDGE_RIGHT)) {
+                    draw_loop_debug_edge(surface, tri, edge, (Color){255, 40, 255, 255}, off * 3.0f);
+                } else if (f & LOOP_EDGE_LEFT) {
+                    draw_loop_debug_edge(surface, tri, edge, (Color){40, 140, 255, 255}, off * 3.0f);
+                } else if (f & LOOP_EDGE_RIGHT) {
+                    draw_loop_debug_edge(surface, tri, edge, (Color){255, 190, 40, 255}, off * 3.0f);
+                }
             }
-        }
-        for (int i = 0; i < debug->portal_count; ++i) {
-            Color color = debug->portals[i].side == 1 ? (Color){40, 140, 255, 255} : (Color){255, 190, 40, 255};
-            draw_loop_debug_edge_interval(surface, &debug->portals[i], color, off * 3.5f);
         }
     }
 }
@@ -2377,6 +2385,50 @@ static void loop_enqueue_tri(
     }
     side_mark[tri] = mark;
     queue[(*tail)++] = tri;
+}
+
+static void loop_seed_cut_edges_from_vertices(
+    const SurfaceMesh* surface,
+    const unsigned char* vertex_side,
+    const unsigned char* boundary_tri,
+    unsigned char* flags,
+    int* queue_left,
+    int* left_tail,
+    int* queue_right,
+    int* right_tail,
+    unsigned char* side_mark,
+    unsigned char* conflict_tri,
+    int* classification_conflicts,
+    int* flood_conflicts
+) {
+    for (int tri = 0; tri < surface->tri_count; ++tri) {
+        if (!boundary_tri[tri]) continue;
+        for (int edge = 0; edge < 3; ++edge) {
+            if (flags[3 * tri + edge] & LOOP_EDGE_BLOCKED) continue;
+
+            int a = (edge + 1) % 3;
+            int b = (edge + 2) % 3;
+            bool has_left = vertex_side[3 * tri + a] == 1 || vertex_side[3 * tri + b] == 1;
+            bool has_right = vertex_side[3 * tri + a] == 2 || vertex_side[3 * tri + b] == 2;
+            if (!has_left && !has_right) continue;
+
+            if (has_left && has_right) {
+                fprintf(stderr, "loop cut edge side conflict: tri=%d edge=%d\n", tri, edge);
+                flags[3 * tri + edge] |= LOOP_EDGE_LEFT | LOOP_EDGE_RIGHT;
+                if (conflict_tri) conflict_tri[tri] = 1;
+                ++*classification_conflicts;
+                continue;
+            }
+
+            int side = has_left ? 1 : 2;
+            flags[3 * tri + edge] |= side == 1 ? LOOP_EDGE_LEFT : LOOP_EDGE_RIGHT;
+
+            int nb = surface->tri_neighbors[3 * tri + edge];
+            if (nb < 0 || boundary_tri[nb]) continue;
+            if (side == 1) loop_enqueue_tri(nb, 1, queue_left, left_tail, side_mark, boundary_tri, conflict_tri, flood_conflicts);
+            else loop_enqueue_tri(nb, 2, queue_right, right_tail, side_mark, boundary_tri, conflict_tri, flood_conflicts);
+        }
+    }
 }
 
 static bool loop_flood_pop(
@@ -2499,31 +2551,28 @@ static LoopRemovalStats remove_samples_inside_loop(
     if (loop_segments->size <= 0) return stats;
 
     unsigned char* flags = (unsigned char*)calloc((size_t)surface->tri_count * 3, sizeof(unsigned char));
+    unsigned char* vertex_side = (unsigned char*)calloc((size_t)surface->tri_count * 3, sizeof(unsigned char));
+    float* vertex_dist2 = (float*)malloc((size_t)surface->tri_count * 3 * sizeof(float));
     unsigned char* boundary_tri = (unsigned char*)calloc((size_t)surface->tri_count, sizeof(unsigned char));
     unsigned char* side_mark = (unsigned char*)calloc((size_t)surface->tri_count, sizeof(unsigned char));
     unsigned char* conflict_tri = (unsigned char*)calloc((size_t)surface->tri_count, sizeof(unsigned char));
     int* queue_left = (int*)malloc((size_t)surface->tri_count * sizeof(int));
     int* queue_right = (int*)malloc((size_t)surface->tri_count * sizeof(int));
-    LoopPortalVec portals = {0};
-    if (!flags || !boundary_tri || !side_mark || !conflict_tri || !queue_left || !queue_right) {
+    if (!flags || !vertex_side || !vertex_dist2 || !boundary_tri || !side_mark || !conflict_tri || !queue_left || !queue_right) {
         fprintf(stderr, "out of memory while removing loop interior\n");
         exit(1);
     }
+    for (int i = 0; i < surface->tri_count * 3; ++i) vertex_dist2[i] = INFINITY;
 
     for (int i = 0; i < loop_segments->size; ++i) {
-        loop_mark_segment_blocked_edges(surface, graph, &loop_segments->data[i], flags, boundary_tri, &stats.classification_conflicts);
+        loop_mark_segment_blocked_edges(surface, graph, &loop_segments->data[i], flags, vertex_side, vertex_dist2, boundary_tri, &stats.classification_conflicts);
     }
-    loop_classify_interval_portals(surface, loop_segments, boundary_tri, flags, &portals, &stats.classification_conflicts);
 
     int left_head = 0, left_tail = 0;
     int right_head = 0, right_tail = 0;
-    for (int i = 0; i < portals.size; ++i) {
-        LoopPortal p = portals.data[i];
-        int nb = surface->tri_neighbors[3 * p.tri + p.edge];
-        if (nb < 0 || boundary_tri[nb]) continue;
-        if (p.side == 1) loop_enqueue_tri(nb, 1, queue_left, &left_tail, side_mark, boundary_tri, conflict_tri, &stats.flood_conflicts);
-        else if (p.side == 2) loop_enqueue_tri(nb, 2, queue_right, &right_tail, side_mark, boundary_tri, conflict_tri, &stats.flood_conflicts);
-    }
+    loop_seed_cut_edges_from_vertices(surface, vertex_side, boundary_tri, flags,
+        queue_left, &left_tail, queue_right, &right_tail, side_mark, conflict_tri,
+        &stats.classification_conflicts, &stats.flood_conflicts);
 
     bool prefer_left = true;
     while (left_head < left_tail || right_head < right_tail) {
@@ -2544,7 +2593,7 @@ static LoopRemovalStats remove_samples_inside_loop(
     }
 
     if (stats.left_tris <= 0 && stats.right_tris <= 0) {
-        fprintf(stderr, "loop removal failed: no flood seed portals\n");
+        fprintf(stderr, "loop removal failed: no flood seed cuts\n");
     } else if (stats.right_tris <= 0 || (stats.left_tris > 0 && stats.left_area <= stats.right_area)) {
         stats.chosen_side = 1;
     } else {
@@ -2585,15 +2634,16 @@ static LoopRemovalStats remove_samples_inside_loop(
         stats.classification_conflicts, stats.flood_conflicts);
     fflush(stdout);
 
-    if (debug) loop_debug_capture(debug, flags, boundary_tri, side_mark, conflict_tri, &portals, surface->tri_count);
+    if (debug) loop_debug_capture(debug, flags, boundary_tri, side_mark, conflict_tri, surface->tri_count);
 
     free(flags);
+    free(vertex_side);
+    free(vertex_dist2);
     free(boundary_tri);
     free(side_mark);
     free(conflict_tri);
     free(queue_left);
     free(queue_right);
-    loop_portal_vec_free(&portals);
     return stats;
 }
 
@@ -2609,6 +2659,23 @@ static void print_path_stats(int source, int target, bool ok, int path_points, d
         path_ctx->windows_pushed, path_ctx->windows_popped, path_ctx->pseudo_sources,
         path_ctx->touched_state_count, path_ctx->max_state_windows);
     fflush(stdout);
+}
+
+static void print_shared_path_stats(int source, const SharedGeodesicStats* stats) {
+    double us_per_ok = stats->ok_count > 0 ? 1000.0 * stats->total_ms / (double)stats->ok_count : 0.0;
+    printf("shared_paths source=%d targets=%d ok=%d failed=%d direct=%d total_ms=%.3f prop_ms=%.3f emit_ms=%.3f us_per_ok=%.3f segments=%d windows=%d popped=%d pseudo=%d touched_states=%d max_state_windows=%d\n",
+        source, stats->target_count, stats->ok_count, stats->failed_count, stats->direct_count,
+        stats->total_ms, stats->propagation_ms, stats->emission_ms, us_per_ok, stats->segments,
+        stats->windows_pushed, stats->windows_popped, stats->pseudo_sources,
+        stats->touched_state_count, stats->max_state_windows);
+    fflush(stdout);
+}
+
+static void reset_shared_path_stats(SharedGeodesicStats* stats) {
+    memset(stats, 0, sizeof(*stats));
+    stats->total_ms = -1.0;
+    stats->propagation_ms = -1.0;
+    stats->emission_ms = -1.0;
 }
 
 static void update_orbit_camera(Camera3D* camera, float min_dist, float max_dist) {
@@ -2845,14 +2912,17 @@ int main(int argc, char** argv) {
     PropGraph prop_graph = build_prop_graph(&surface, steiner_spacing);
     FMMContext fmm = fmm_context_create(prop_graph.node_count, surface.tri_count);
     GeodesicPathContext path_ctx = geodesic_path_context_create(&surface, &prop_graph);
+    GeodesicPathContext shared_path_ctx = geodesic_path_context_create(&surface, &prop_graph);
     double preprocess_t1 = now_seconds();
 
     int source = rand_r(&rng) % sample_count;
     int target = -1;
     Vec3Vec geodesic_path = {0};
     Vec3Vec loop_draw_path = {0};
+    LoopSegmentVec shared_path_segments = {0};
     LoopSegmentVec path_segments = {0};
     LoopSegmentVec loop_segments = {0};
+    LoopSegmentVec loop_debug_segments = {0};
     LoopRemovalStats loop_stats = {0};
     LoopDebugData loop_debug = {0};
     int loop_first_source = -1;
@@ -2862,6 +2932,10 @@ int main(int argc, char** argv) {
     double query_ms = 0.0;
     double path_ms = -1.0;
     bool path_ok = false;
+    bool show_shared_paths = false;
+    bool shared_paths_ready = false;
+    SharedGeodesicStats shared_stats;
+    reset_shared_path_stats(&shared_stats);
     int in_radius = compute_source_and_measure_steiner(&prop_graph, &topo, samples, sample_count, source, radius, &fmm, &query_ms);
     printf("preprocess_ms=%.3f\n", 1000.0 * (preprocess_t1 - preprocess_t0));
     fflush(stdout);
@@ -2900,7 +2974,11 @@ int main(int argc, char** argv) {
             path_ok = false;
             vec3_vec_clear(&geodesic_path);
             vec3_vec_clear(&loop_draw_path);
+            loop_segment_vec_clear(&shared_path_segments);
             loop_segment_vec_clear(&loop_segments);
+            loop_segment_vec_clear(&loop_debug_segments);
+            shared_paths_ready = false;
+            reset_shared_path_stats(&shared_stats);
             in_radius = compute_source_and_measure_steiner(&prop_graph, &topo, samples, sample_count, source, radius, &fmm, &query_ms);
             print_query_stats(source, radius, in_radius, query_ms);
         }
@@ -2909,6 +2987,7 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_P)) show_all_points = !show_all_points;
         if (IsKeyPressed(KEY_D)) show_distance_colors = !show_distance_colors;
         if (IsKeyPressed(KEY_V)) show_graph_vertices = !show_graph_vertices;
+        if (IsKeyPressed(KEY_G)) show_shared_paths = !show_shared_paths;
         if (IsKeyPressed(KEY_N)) loop_debug_mode = (loop_debug_mode + 1) % 6;
         if (IsKeyPressed(KEY_B)) loop_debug_mode = loop_debug_mode == 0 ? 5 : loop_debug_mode - 1;
         if (IsKeyPressed(KEY_UP)) {
@@ -2917,6 +2996,9 @@ int main(int argc, char** argv) {
             path_ms = -1.0;
             path_ok = false;
             vec3_vec_clear(&geodesic_path);
+            loop_segment_vec_clear(&shared_path_segments);
+            shared_paths_ready = false;
+            reset_shared_path_stats(&shared_stats);
             in_radius = compute_source_and_measure_steiner(&prop_graph, &topo, samples, sample_count, source, radius, &fmm, &query_ms);
             print_query_stats(source, radius, in_radius, query_ms);
         }
@@ -2926,6 +3008,9 @@ int main(int argc, char** argv) {
             path_ms = -1.0;
             path_ok = false;
             vec3_vec_clear(&geodesic_path);
+            loop_segment_vec_clear(&shared_path_segments);
+            shared_paths_ready = false;
+            reset_shared_path_stats(&shared_stats);
             in_radius = compute_source_and_measure_steiner(&prop_graph, &topo, samples, sample_count, source, radius, &fmm, &query_ms);
             print_query_stats(source, radius, in_radius, query_ms);
         }
@@ -2944,9 +3029,13 @@ int main(int argc, char** argv) {
                     path_ok = false;
                     vec3_vec_clear(&geodesic_path);
                     vec3_vec_clear(&loop_draw_path);
+                    loop_segment_vec_clear(&shared_path_segments);
                     loop_segment_vec_clear(&loop_segments);
+                    loop_segment_vec_clear(&loop_debug_segments);
                     in_radius = compute_source_and_measure_steiner(&prop_graph, &topo, samples, sample_count, source, radius, &fmm, &query_ms);
                     print_query_stats(source, radius, in_radius, query_ms);
+                    shared_paths_ready = build_shared_source_geodesic_paths(&surface, &prop_graph, samples, sample_count, source, &fmm, &shared_path_ctx, &shared_path_segments, &shared_stats);
+                    print_shared_path_stats(source, &shared_stats);
                 }
             } else if (shift) {
                 int picked = pick_sample_screen(samples, sample_count, camera, GetMousePosition(), true, fmm.query_id);
@@ -2958,11 +3047,19 @@ int main(int argc, char** argv) {
                     path_ms = 1000.0 * (path_t1 - path_t0);
                     print_path_stats(source, target, path_ok, geodesic_path.size, path_ms, &path_ctx);
                     if (path_ok) {
-                        if (loop_first_source < 0) loop_first_source = source;
+                        if (loop_first_source < 0) {
+                            loop_first_source = source;
+                            vec3_vec_clear(&loop_draw_path);
+                            loop_segment_vec_clear(&loop_segments);
+                            loop_segment_vec_clear(&loop_debug_segments);
+                        }
                         for (int i = 0; i < geodesic_path.size; ++i) vec3_vec_push_unique(&loop_draw_path, geodesic_path.data[i]);
                         for (int i = 0; i < path_segments.size; ++i) loop_segment_vec_push(&loop_segments, path_segments.data[i]);
                         ++loop_saved_paths;
                         source = target;
+                        loop_segment_vec_clear(&shared_path_segments);
+                        shared_paths_ready = false;
+                        reset_shared_path_stats(&shared_stats);
 
                         if (loop_saved_paths >= 3 && loop_first_source >= 0 && !samples[loop_first_source].disabled) {
                             float old_radius = radius;
@@ -2982,6 +3079,8 @@ int main(int argc, char** argv) {
                             if (close_ok) {
                                 for (int i = 0; i < geodesic_path.size; ++i) vec3_vec_push_unique(&loop_draw_path, geodesic_path.data[i]);
                                 for (int i = 0; i < path_segments.size; ++i) loop_segment_vec_push(&loop_segments, path_segments.data[i]);
+                                loop_segment_vec_clear(&loop_debug_segments);
+                                for (int i = 0; i < loop_segments.size; ++i) loop_segment_vec_push(&loop_debug_segments, loop_segments.data[i]);
                                 loop_stats = remove_samples_inside_loop(&surface, &prop_graph, &topo, samples, &loop_segments, &loop_debug);
                                 loop_debug_mode = loop_stats.flood_conflicts > 0 || loop_stats.classification_conflicts > 0 ? 4 : 3;
                                 disabled_samples += loop_stats.disabled_samples;
@@ -3038,38 +3137,60 @@ int main(int argc, char** argv) {
         if (!show_distance_colors) {
             draw_point_crosses(samples, sample_count, camera, hit_point_radius, true, fmm.query_id, (Color){40, 220, 120, 230});
         }
-        draw_path_color(&loop_draw_path, radius, (Color){255, 170, 40, 230});
-        draw_geodesic_path(&geodesic_path, radius);
+        bool offset_paths = loop_debug_mode > 0;
+        float path_debug_offset = fmaxf(marker_scale * 0.00035f, 1e-5f);
+        if (show_shared_paths && shared_paths_ready && shared_path_segments.size > 0) {
+            draw_loop_segments_color(&surface, &shared_path_segments, radius, (Color){80, 220, 255, 160}, path_debug_offset * 1.6f);
+        }
+        LoopSegmentVec* display_loop_segments = loop_segments.size > 0 ? &loop_segments : &loop_debug_segments;
+        if (offset_paths && display_loop_segments->size > 0) {
+            draw_loop_segments_color(&surface, display_loop_segments, radius, (Color){255, 170, 40, 230}, path_debug_offset);
+        } else {
+            draw_path_color(&loop_draw_path, radius, (Color){255, 170, 40, 230});
+        }
+        if (offset_paths && path_segments.size > 0) {
+            draw_loop_segments_color(&surface, &path_segments, radius, (Color){255, 80, 220, 220}, path_debug_offset * 1.1f);
+        } else {
+            draw_geodesic_path(&geodesic_path, radius);
+        }
         DrawSphere(samples[source].p, source_radius, (Color){255, 80, 60, 255});
         if (target >= 0) DrawSphere(samples[target].p, source_radius * 0.8f, (Color){255, 80, 220, 255});
         DrawSphereWires(samples[source].p, radius, 24, 12, (Color){255, 210, 80, 70});
         DrawBoundingBox(surface.bounds, (Color){90, 140, 220, 80});
         EndMode3D();
 
-        DrawRectangle(12, 12, 920, 262, (Color){0, 0, 0, 170});
+        DrawRectangle(12, 12, 980, 314, (Color){0, 0, 0, 170});
         DrawText(TextFormat("mesh: %s", mesh_path), 24, 24, 18, RAYWHITE);
         DrawText(TextFormat("triangles: %d | prop nodes: %d | samples: %d active / %d total | steiner spacing: %.4f",
             surface.tri_count, prop_graph.node_count, sample_count - disabled_samples, sample_count, prop_graph.spacing), 24, 50, 18, RAYWHITE);
         DrawText(TextFormat("source: %d | target: %d | radius: %.6f | in radius: %d", source, target, radius, in_radius), 24, 76, 18, RAYWHITE);
         DrawText(TextFormat("radius-bounded local FMM query: %.3f ms", query_ms), 24, 102, 18, (Color){120, 255, 160, 255});
         DrawText(path_ms >= 0.0 ? TextFormat("point-to-point geodesic path: %.3f ms | ok: %d | points: %d | windows: %d/%d", path_ms, path_ok ? 1 : 0, geodesic_path.size, path_ctx.windows_popped, path_ctx.windows_pushed) : "point-to-point geodesic path: n/a", 24, 128, 18, (Color){255, 130, 220, 255});
+        DrawText(shared_stats.total_ms >= 0.0 ? TextFormat("shared source paths: %.3f ms total | prop %.3f | emit %.3f | targets %d ok %d | %.2f us/ok | draw G:%s",
+            shared_stats.total_ms, shared_stats.propagation_ms, shared_stats.emission_ms,
+            shared_stats.target_count, shared_stats.ok_count,
+            shared_stats.ok_count > 0 ? 1000.0 * shared_stats.total_ms / (double)shared_stats.ok_count : 0.0,
+            show_shared_paths ? "on" : "off") : TextFormat("shared source paths: n/a | draw G:%s", show_shared_paths ? "on" : "off"), 24, 154, 18, (Color){80, 220, 255, 255});
         DrawText(TextFormat("loop paths: %d/3 | loop segments: %d | last disabled: %d | side: %s | conflicts: %d/%d",
             loop_saved_paths, loop_segments.size, loop_stats.disabled_samples,
             loop_stats.chosen_side == 1 ? "left" : (loop_stats.chosen_side == 2 ? "right" : "none"),
-            loop_stats.classification_conflicts, loop_stats.flood_conflicts), 24, 154, 18, (Color){255, 190, 90, 255});
-        DrawText(TextFormat("loop debug: %s | N/B cycle | boundary gray, blocked red, left blue, right yellow, conflicts red fill", loop_debug_mode_name(loop_debug_mode)), 24, 180, 18, (Color){180, 210, 255, 255});
-        DrawText(TextFormat("preprocessing excluded from query timing: %.3f ms", 1000.0 * (preprocess_t1 - preprocess_t0)), 24, 206, 18, (Color){180, 190, 200, 255});
-        DrawText("controls: left-drag orbit | right-drag pan | Ctrl+left reset loop/source | Shift+left add path | wheel zoom | R/Space random", 24, 232, 18, (Color){180, 190, 200, 255});
+            loop_stats.classification_conflicts, loop_stats.flood_conflicts), 24, 180, 18, (Color){255, 190, 90, 255});
+        DrawText(TextFormat("loop debug: %s | N/B cycle | boundary gray, blocked red, left blue, right yellow, conflicts red fill", loop_debug_mode_name(loop_debug_mode)), 24, 206, 18, (Color){180, 210, 255, 255});
+        DrawText(TextFormat("preprocessing excluded from query timing: %.3f ms", 1000.0 * (preprocess_t1 - preprocess_t0)), 24, 232, 18, (Color){180, 190, 200, 255});
+        DrawText("controls: left-drag orbit | right-drag pan | Ctrl+left reset loop/source+shared paths | Shift+left add path | G shared draw | wheel zoom | R/Space random", 24, 258, 18, (Color){180, 190, 200, 255});
 
         EndDrawing();
     }
 
     fmm_context_free(&fmm);
     geodesic_path_context_free(&path_ctx);
+    geodesic_path_context_free(&shared_path_ctx);
     vec3_vec_free(&geodesic_path);
     vec3_vec_free(&loop_draw_path);
+    loop_segment_vec_free(&shared_path_segments);
     loop_segment_vec_free(&path_segments);
     loop_segment_vec_free(&loop_segments);
+    loop_segment_vec_free(&loop_debug_segments);
     loop_debug_free(&loop_debug);
     prop_graph_free(&prop_graph);
     surface_topo_free(&topo, &surface);
