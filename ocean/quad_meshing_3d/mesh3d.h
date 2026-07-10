@@ -101,8 +101,18 @@ typedef struct {
 } Qm3MeshEdge;
 
 typedef struct {
+    uint8_t n;
+    uint32_t vertices[4];
+    uint32_t edges[4];
+    float area;
+    float quality;
+    bool disabled;
+} Qm3MeshFace;
+
+typedef struct {
     Qm3MeshVertex* vertices;
     Qm3MeshEdge* edges;
+    Qm3MeshFace* faces;
     int32_t* neighbors;
     int32_t* neighbor_edges;
     uint32_t* frontier;
@@ -112,6 +122,10 @@ typedef struct {
     uint32_t vertex_cap;
     uint32_t edge_count;
     uint32_t edge_cap;
+    uint32_t face_count;
+    uint32_t face_cap;
+    uint32_t quad_count;
+    uint32_t tri_count;
     uint32_t frontier_count;
     uint32_t frontier_cap;
     uint32_t max_degree;
@@ -125,6 +139,9 @@ static void qm3_mesh_init(Qm3Mesh* mesh, uint32_t max_degree) {
 static void qm3_mesh_reset(Qm3Mesh* mesh) {
     mesh->vertex_count = 0;
     mesh->edge_count = 0;
+    mesh->face_count = 0;
+    mesh->quad_count = 0;
+    mesh->tri_count = 0;
     mesh->frontier_count = 0;
     qm3_path_clear(&mesh->edge_path_points);
     qm3_path_segment_clear(&mesh->edge_path_segments);
@@ -133,6 +150,7 @@ static void qm3_mesh_reset(Qm3Mesh* mesh) {
 static void qm3_mesh_free(Qm3Mesh* mesh) {
     free(mesh->vertices);
     free(mesh->edges);
+    free(mesh->faces);
     free(mesh->neighbors);
     free(mesh->neighbor_edges);
     free(mesh->frontier);
@@ -159,6 +177,12 @@ static void qm3_mesh_reserve_edges(Qm3Mesh* mesh, uint32_t cap) {
     if (cap <= mesh->edge_cap) return;
     mesh->edges = (Qm3MeshEdge*)qm3_checked_realloc(mesh->edges, (size_t)cap * sizeof(Qm3MeshEdge));
     mesh->edge_cap = cap;
+}
+
+static void qm3_mesh_reserve_faces(Qm3Mesh* mesh, uint32_t cap) {
+    if (cap <= mesh->face_cap) return;
+    mesh->faces = (Qm3MeshFace*)qm3_checked_realloc(mesh->faces, (size_t)cap * sizeof(Qm3MeshFace));
+    mesh->face_cap = cap;
 }
 
 static void qm3_mesh_reserve_frontier(Qm3Mesh* mesh, uint32_t cap) {
@@ -222,6 +246,182 @@ static int32_t qm3_mesh_edge_index(const Qm3Mesh* mesh, uint32_t a, uint32_t b) 
         if ((uint32_t)mesh->neighbors[nidx] == b) return eidx;
     }
     return -1;
+}
+
+static float qm3_mesh_face_area(const Qm3Mesh* mesh, const uint32_t* verts, uint32_t n) {
+    if (n < 3) return 0.0f;
+    Qm3Vec3 p0 = mesh->vertices[verts[0]].pos;
+    float area = 0.0f;
+    for (uint32_t i = 1; i + 1 < n; ++i) {
+        Qm3Vec3 a = qm3_sub(mesh->vertices[verts[i]].pos, p0);
+        Qm3Vec3 b = qm3_sub(mesh->vertices[verts[i + 1]].pos, p0);
+        Qm3Vec3 c = (Qm3Vec3){
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x,
+        };
+        area += 0.5f * qm3_len(c);
+    }
+    return area;
+}
+
+static bool qm3_face_has_same_vertices(const Qm3MeshFace* face, const uint32_t* verts, uint32_t n) {
+    if (face->disabled || face->n != n) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        bool found = false;
+        for (uint32_t j = 0; j < n; ++j) {
+            if (face->vertices[j] == verts[i]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+static bool qm3_mesh_register_face(Qm3Mesh* mesh, const uint32_t* verts, uint32_t n) {
+    QM3_ASSERT(n == 3 || n == 4);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (verts[i] >= mesh->vertex_count || mesh->vertices[verts[i]].disabled) return false;
+        for (uint32_t j = i + 1; j < n; ++j) if (verts[i] == verts[j]) return false;
+    }
+    for (uint32_t fi = 0; fi < mesh->face_count; ++fi) {
+        if (qm3_face_has_same_vertices(&mesh->faces[fi], verts, n)) return false;
+    }
+
+    uint32_t edges[4];
+    for (uint32_t i = 0; i < n; ++i) {
+        int32_t eidx = qm3_mesh_edge_index(mesh, verts[i], verts[(i + 1) % n]);
+        if (eidx < 0) return false;
+        Qm3MeshEdge* edge = &mesh->edges[eidx];
+        if (edge->disabled || edge->face_count >= 2) return false;
+        edges[i] = (uint32_t)eidx;
+    }
+
+    if (mesh->face_count == mesh->face_cap) {
+        uint32_t new_cap = mesh->face_cap ? mesh->face_cap * 2 : 64;
+        qm3_mesh_reserve_faces(mesh, new_cap);
+    }
+
+    Qm3MeshFace* face = &mesh->faces[mesh->face_count++];
+    memset(face, 0, sizeof(*face));
+    face->n = (uint8_t)n;
+    face->area = qm3_mesh_face_area(mesh, verts, n);
+    face->quality = 0.0f;
+    face->disabled = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        face->vertices[i] = verts[i];
+        face->edges[i] = edges[i];
+        Qm3MeshEdge* edge = &mesh->edges[edges[i]];
+        edge->face_count++;
+        if (edge->face_count == 2) {
+            QM3_ASSERT(mesh->vertices[edge->a].open_edges > 0);
+            QM3_ASSERT(mesh->vertices[edge->b].open_edges > 0);
+            mesh->vertices[edge->a].open_edges--;
+            mesh->vertices[edge->b].open_edges--;
+        }
+    }
+    if (n == 4) mesh->quad_count++;
+    else mesh->tri_count++;
+
+    for (uint32_t i = 0; i < n; ++i) qm3_mesh_update_frontier_vertex(mesh, verts[i]);
+    return true;
+}
+
+static bool qm3_mesh_edge_is_face_boundary(const Qm3MeshFace* face, uint32_t eidx) {
+    if (!face || face->disabled) return false;
+    for (uint32_t i = 0; i < face->n; ++i) if (face->edges[i] == eidx) return true;
+    return false;
+}
+
+static bool qm3_mesh_vertex_is_face_boundary(const Qm3MeshFace* face, uint32_t vidx) {
+    if (!face || face->disabled) return false;
+    for (uint32_t i = 0; i < face->n; ++i) if (face->vertices[i] == vidx) return true;
+    return false;
+}
+
+static void qm3_mesh_remove_neighbor_edge(Qm3Mesh* mesh, uint32_t v, uint32_t eidx) {
+    Qm3MeshVertex* vertex = &mesh->vertices[v];
+    for (uint32_t i = 0; i < vertex->degree; ++i) {
+        size_t nidx = (size_t)v * mesh->max_degree + i;
+        if (mesh->neighbor_edges[nidx] != (int32_t)eidx) continue;
+        uint32_t last = vertex->degree - 1;
+        size_t last_idx = (size_t)v * mesh->max_degree + last;
+        mesh->neighbors[nidx] = mesh->neighbors[last_idx];
+        mesh->neighbor_edges[nidx] = mesh->neighbor_edges[last_idx];
+        mesh->neighbors[last_idx] = -1;
+        mesh->neighbor_edges[last_idx] = -1;
+        vertex->degree--;
+        return;
+    }
+}
+
+static void qm3_mesh_disable_edge(Qm3Mesh* mesh, uint32_t eidx) {
+    if (eidx >= mesh->edge_count) return;
+    Qm3MeshEdge* edge = &mesh->edges[eidx];
+    if (edge->disabled) return;
+    uint32_t a = edge->a;
+    uint32_t b = edge->b;
+    if (edge->face_count < 2) {
+        if (mesh->vertices[a].open_edges > 0) mesh->vertices[a].open_edges--;
+        if (mesh->vertices[b].open_edges > 0) mesh->vertices[b].open_edges--;
+    }
+    qm3_mesh_remove_neighbor_edge(mesh, a, eidx);
+    qm3_mesh_remove_neighbor_edge(mesh, b, eidx);
+    edge->disabled = true;
+    if (mesh->vertices[a].degree == 0) mesh->vertices[a].disabled = true;
+    if (mesh->vertices[b].degree == 0) mesh->vertices[b].disabled = true;
+    qm3_mesh_update_frontier_vertex(mesh, a);
+    qm3_mesh_update_frontier_vertex(mesh, b);
+}
+
+static uint32_t qm3_mesh_detect_triangles(const Qm3Mesh* mesh, uint32_t u, uint32_t v, uint32_t* out_cycles, uint32_t max_cycles) {
+    uint32_t count = 0;
+    int32_t uv = qm3_mesh_edge_index(mesh, u, v);
+    if (uv < 0 || mesh->edges[uv].face_count >= 2) return count;
+    for (uint32_t i = 0; i < mesh->vertices[u].degree; ++i) {
+        uint32_t a = (uint32_t)mesh->neighbors[(size_t)u * mesh->max_degree + i];
+        if (a == v) continue;
+        int32_t ua = qm3_mesh_edge_index(mesh, u, a);
+        int32_t av = qm3_mesh_edge_index(mesh, a, v);
+        if (ua < 0 || av < 0) continue;
+        if (mesh->edges[ua].face_count >= 2 || mesh->edges[av].face_count >= 2) continue;
+        if (count < max_cycles) {
+            out_cycles[count * 3 + 0] = u;
+            out_cycles[count * 3 + 1] = a;
+            out_cycles[count * 3 + 2] = v;
+            count++;
+        }
+    }
+    return count;
+}
+
+static uint32_t qm3_mesh_detect_quads(const Qm3Mesh* mesh, uint32_t u, uint32_t v, uint32_t* out_cycles, uint32_t max_cycles) {
+    uint32_t count = 0;
+    int32_t uv = qm3_mesh_edge_index(mesh, u, v);
+    if (uv < 0 || mesh->edges[uv].face_count >= 2) return count;
+    for (uint32_t i = 0; i < mesh->vertices[u].degree; ++i) {
+        uint32_t a = (uint32_t)mesh->neighbors[(size_t)u * mesh->max_degree + i];
+        if (a == v) continue;
+        for (uint32_t j = 0; j < mesh->vertices[v].degree; ++j) {
+            uint32_t b = (uint32_t)mesh->neighbors[(size_t)v * mesh->max_degree + j];
+            if (b == u || b == a) continue;
+            int32_t ua = qm3_mesh_edge_index(mesh, u, a);
+            int32_t vb = qm3_mesh_edge_index(mesh, v, b);
+            int32_t ab = qm3_mesh_edge_index(mesh, a, b);
+            if (ua < 0 || vb < 0 || ab < 0) continue;
+            if (mesh->edges[ua].face_count >= 2 || mesh->edges[vb].face_count >= 2 || mesh->edges[ab].face_count >= 2) continue;
+            if (count < max_cycles) {
+                out_cycles[count * 4 + 0] = u;
+                out_cycles[count * 4 + 1] = a;
+                out_cycles[count * 4 + 2] = b;
+                out_cycles[count * 4 + 3] = v;
+                count++;
+            }
+        }
+    }
+    return count;
 }
 
 static uint32_t qm3_mesh_add_edge_with_path(
@@ -326,7 +526,7 @@ static void qm3_mesh_build_from_frontier_edges(Qm3Mesh* mesh, const Qm3Surface* 
         int tri_b = (int)surface->samples[sample_b].tri;
         if (tri_a >= 0) segments[segment_count++] = (Qm3PathSegment){.tri = tri_a, .a = points[0], .b = points[1]};
         if (tri_b >= 0 && tri_b != tri_a) segments[segment_count++] = (Qm3PathSegment){.tri = tri_b, .a = points[0], .b = points[1]};
-        qm3_mesh_add_edge_with_path(mesh, a, b, 1, points, 2, segments, segment_count, qm3_distance(points[0], points[1]));
+        qm3_mesh_add_edge_with_path(mesh, a, b, 0, points, 2, segments, segment_count, qm3_distance(points[0], points[1]));
     }
 
     free(sample_to_graph);

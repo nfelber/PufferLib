@@ -90,6 +90,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->geodesic_steiner_spacing_ratio = (float)dict_get(kwargs, "geodesic_steiner_spacing_ratio")->value;
     env->target_quad_area = (float)dict_get(kwargs, "target_quad_area")->value;
     env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
+    env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
 
     load_surface_paths_from_folder(env, kwargs);
     QM3_ASSERT(env->shape_count > 0);
