@@ -88,9 +88,23 @@ void my_init(Env* env, Dict* kwargs) {
     env->max_degree = (int)dict_get(kwargs, "max_degree")->value;
     env->candidate_radius_ratio = (float)dict_get(kwargs, "candidate_radius_ratio")->value;
     env->geodesic_steiner_spacing_ratio = (float)dict_get(kwargs, "geodesic_steiner_spacing_ratio")->value;
-    env->target_quad_area = (float)dict_get(kwargs, "target_quad_area")->value;
+    env->target_edge_length_ratio = (float)dict_get(kwargs, "target_edge_length_ratio")->value;
     env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
     env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
+    env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
+    env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
+    env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
+    env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;
+    env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
+    env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;
+    env->frontier_quality_weight = (float)dict_get(kwargs, "frontier_quality_weight")->value;
+    env->frontier_edge_length_weight = (float)dict_get(kwargs, "frontier_edge_length_weight")->value;
+    env->frontier_alignment_weight = (float)dict_get(kwargs, "frontier_alignment_weight")->value;
+    env->frontier_angle_weight = (float)dict_get(kwargs, "frontier_angle_weight")->value;
+    env->frontier_size_pressure_weight = (float)dict_get(kwargs, "frontier_size_pressure_weight")->value;
+    env->degree_pressure_weight = (float)dict_get(kwargs, "degree_pressure_weight")->value;
+    env->safe_frontier_size_ratio = (float)dict_get(kwargs, "safe_frontier_size_ratio")->value;
+    env->safe_degree_ratio = (float)dict_get(kwargs, "safe_degree_ratio")->value;
 
     load_surface_paths_from_folder(env, kwargs);
     QM3_ASSERT(env->shape_count > 0);
