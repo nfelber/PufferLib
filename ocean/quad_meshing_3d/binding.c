@@ -88,6 +88,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->max_degree = (int)dict_get(kwargs, "max_degree")->value;
     env->candidate_radius_ratio = (float)dict_get(kwargs, "candidate_radius_ratio")->value;
     env->geodesic_steiner_spacing_ratio = (float)dict_get(kwargs, "geodesic_steiner_spacing_ratio")->value;
+    env->target_quad_area = (float)dict_get(kwargs, "target_quad_area")->value;
+    env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
 
     load_surface_paths_from_folder(env, kwargs);
     QM3_ASSERT(env->shape_count > 0);
@@ -102,7 +104,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->render_show_normals = dict_get(kwargs, "render_show_normals")->value > 0.5;
     env->render_show_cross_field = dict_get(kwargs, "render_show_cross_field")->value > 0.5;
     env->render_show_graph = dict_get(kwargs, "render_show_graph")->value > 0.5;
-    env->render_show_feature_edges = dict_get(kwargs, "render_show_feature_edges")->value > 0.5;
+    env->render_show_graph_paths = dict_get(kwargs, "render_show_graph_paths")->value > 0.5;
     env->render_show_candidates = dict_get(kwargs, "render_show_candidates")->value > 0.5;
 
     quad_meshing_3d_init(env);

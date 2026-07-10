@@ -35,6 +35,20 @@ typedef enum {
     QM3_TARGET_EXISTING_FRONTIER = 1,
 } Qm3TargetKind;
 
+typedef enum {
+    QM3_PHASE_SOURCE = 0,
+    QM3_PHASE_TARGET = 1,
+} Qm3Phase;
+
+typedef enum {
+    QM3_ACTION_NONE = 0,
+    QM3_ACTION_SOURCE_SELECTED = 1,
+    QM3_ACTION_TARGET_COMMITTED = 2,
+    QM3_ACTION_INVALID_SOURCE = 3,
+    QM3_ACTION_INVALID_TARGET = 4,
+    QM3_ACTION_NO_VALID_TARGET = 5,
+} Qm3ActionResult;
+
 typedef struct {
     Qm3TargetKind kind;
     uint32_t graph_vertex;
@@ -91,9 +105,12 @@ typedef struct {
     Qm3ContinuousContext continuous_ctx;
     Qm3GraphTriSegmentArray* graph_tri_segments;
     Qm3GraphTriVertexArray* graph_tri_vertices;
+    int32_t* sample_to_graph;
     uint32_t graph_tri_segment_count;
     uint32_t graph_tri_vertex_count;
     bool geodesic_ready;
+    Qm3Phase phase;
+    Qm3ActionResult last_action_result;
     Qm3TargetCandidate* candidates;
     uint32_t candidate_count;
     uint32_t candidate_cap;
@@ -112,6 +129,9 @@ typedef struct {
     int32_t source_frontier_idx;
     int32_t target_candidate_idx;
     int32_t debug_candidate_idx;
+    int episode_length;
+    float episode_return;
+    int episode_max_length;
     Qm3Path selected_path;
     bool selected_path_ok;
     const char** shape_paths;
@@ -121,6 +141,8 @@ typedef struct {
     float candidate_radius_ratio;
     float candidate_radius;
     float geodesic_steiner_spacing_ratio;
+    float target_quad_area;
+    float episode_max_length_ratio;
 
     int render_target_fps;
     int render_width;
@@ -193,6 +215,31 @@ static const char* qm3_candidate_kind_str(Qm3TargetKind kind) {
         case QM3_TARGET_EXISTING_FRONTIER: return "existing";
         default: return "unknown";
     }
+}
+
+static const char* qm3_phase_str(Qm3Phase phase) {
+    switch (phase) {
+        case QM3_PHASE_SOURCE: return "source";
+        case QM3_PHASE_TARGET: return "target";
+        default: return "unknown";
+    }
+}
+
+static const char* qm3_action_result_str(Qm3ActionResult result) {
+    switch (result) {
+        case QM3_ACTION_NONE: return "none";
+        case QM3_ACTION_SOURCE_SELECTED: return "source_selected";
+        case QM3_ACTION_TARGET_COMMITTED: return "target_committed";
+        case QM3_ACTION_INVALID_SOURCE: return "invalid_source";
+        case QM3_ACTION_INVALID_TARGET: return "invalid_target";
+        case QM3_ACTION_NO_VALID_TARGET: return "no_valid_target";
+        default: return "unknown";
+    }
+}
+
+static uint32_t qm3_clamp_action_index(float action) {
+    if (!isfinite(action) || action < 0.0f) return 0;
+    return (uint32_t)action;
 }
 
 static int32_t qm3_pick_frontier_screen(const QuadMeshing3DEnv* env, Vector2 mouse, float radius_px) {
@@ -595,6 +642,17 @@ static void qm3_graph_tri_vertices_free(Qm3GraphTriVertexArray** buckets, uint32
     *buckets = NULL;
 }
 
+static void qm3_ensure_graph_tri_buckets(QuadMeshing3DEnv* env) {
+    if (!env->graph_tri_segments) {
+        env->graph_tri_segments = (Qm3GraphTriSegmentArray*)calloc((size_t)env->surface.triangle_count, sizeof(Qm3GraphTriSegmentArray));
+        QM3_ASSERT(env->graph_tri_segments != NULL || env->surface.triangle_count == 0);
+    }
+    if (!env->graph_tri_vertices) {
+        env->graph_tri_vertices = (Qm3GraphTriVertexArray*)calloc((size_t)env->surface.triangle_count, sizeof(Qm3GraphTriVertexArray));
+        QM3_ASSERT(env->graph_tri_vertices != NULL || env->surface.triangle_count == 0);
+    }
+}
+
 static bool qm3_point_to_base_tri2d(const Qm3Surface* surface, const Qm3ContinuousContext* ctx, int tri, Qm3Vec3 p, Qm3Vec2* out) {
     if (tri < 0 || tri >= (int)surface->triangle_count || !ctx->tri2d_valid[tri]) return false;
     Qm3Tri t = surface->triangles[tri];
@@ -747,63 +805,86 @@ static void qm3_point_support_tris(const Qm3Surface* surface, Qm3Vec3 p, int bas
     }
 }
 
+static void qm3_rebuild_sample_to_graph(QuadMeshing3DEnv* env) {
+    free(env->sample_to_graph);
+    env->sample_to_graph = NULL;
+    if (env->surface.sample_count == 0) return;
+    env->sample_to_graph = (int32_t*)malloc((size_t)env->surface.sample_count * sizeof(int32_t));
+    QM3_ASSERT(env->sample_to_graph != NULL);
+    for (uint32_t i = 0; i < env->surface.sample_count; ++i) env->sample_to_graph[i] = -1;
+    for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) {
+        const Qm3MeshVertex* v = &env->mesh.vertices[vi];
+        if (v->disabled || v->sample_id >= env->surface.sample_count) continue;
+        env->sample_to_graph[v->sample_id] = (int32_t)vi;
+    }
+}
+
+static void qm3_insert_graph_tri_vertex(QuadMeshing3DEnv* env, uint32_t vi) {
+    if (vi >= env->mesh.vertex_count) return;
+    qm3_ensure_graph_tri_buckets(env);
+    Qm3MeshVertex vertex = env->mesh.vertices[vi];
+    if (vertex.disabled || vertex.degree == 0 || vertex.surface_tri < 0 || vertex.surface_tri >= (int32_t)env->surface.triangle_count) return;
+    int32_t incident_edge = -1;
+    for (uint32_t i = 0; i < vertex.degree; ++i) {
+        size_t nidx = (size_t)vi * env->mesh.max_degree + i;
+        int32_t eidx = env->mesh.neighbor_edges[nidx];
+        if (eidx >= 0 && !env->mesh.edges[eidx].disabled) {
+            incident_edge = eidx;
+            break;
+        }
+    }
+    if (incident_edge < 0) return;
+    Qm3IntArray support = {0};
+    qm3_point_support_tris(&env->surface, vertex.pos, vertex.surface_tri, &support);
+    for (int i = 0; i < support.size; ++i) {
+        int tri = support.data[i];
+        Qm3Vec2 p;
+        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, vertex.pos, &p)) continue;
+        qm3_graph_tri_vertex_push(&env->graph_tri_vertices[tri], (Qm3GraphTriVertex){
+            .graph_vertex = vi,
+            .incident_edge = (uint32_t)incident_edge,
+            .p = p,
+        });
+        env->graph_tri_vertex_count++;
+    }
+    qm3_int_free(&support);
+}
+
+static void qm3_insert_graph_tri_edge_segments(QuadMeshing3DEnv* env, uint32_t ei) {
+    if (ei >= env->mesh.edge_count) return;
+    qm3_ensure_graph_tri_buckets(env);
+    Qm3MeshEdge edge = env->mesh.edges[ei];
+    if (edge.disabled || edge.segment_count == 0) return;
+    uint32_t end = edge.segment_offset + edge.segment_count;
+    if (end > env->mesh.edge_path_segments.count) end = env->mesh.edge_path_segments.count;
+    for (uint32_t si = edge.segment_offset; si < end; ++si) {
+        const Qm3PathSegment* seg = &env->mesh.edge_path_segments.data[si];
+        if (seg->tri < 0 || seg->tri >= (int)env->surface.triangle_count) continue;
+        Qm3Vec2 a, b;
+        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->a, &a)) continue;
+        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->b, &b)) continue;
+        qm3_graph_tri_segment_push(&env->graph_tri_segments[seg->tri], (Qm3GraphTriSegment){
+            .edge = ei,
+            .a = a,
+            .b = b,
+        });
+        env->graph_tri_segment_count++;
+    }
+}
+
 static void qm3_build_graph_tri_segments(QuadMeshing3DEnv* env) {
     qm3_graph_tri_segments_free(&env->graph_tri_segments, env->surface.triangle_count);
     qm3_graph_tri_vertices_free(&env->graph_tri_vertices, env->surface.triangle_count);
-    env->graph_tri_segments = (Qm3GraphTriSegmentArray*)calloc((size_t)env->surface.triangle_count, sizeof(Qm3GraphTriSegmentArray));
-    env->graph_tri_vertices = (Qm3GraphTriVertexArray*)calloc((size_t)env->surface.triangle_count, sizeof(Qm3GraphTriVertexArray));
-    QM3_ASSERT(env->graph_tri_segments != NULL || env->surface.triangle_count == 0);
-    QM3_ASSERT(env->graph_tri_vertices != NULL || env->surface.triangle_count == 0);
+    qm3_ensure_graph_tri_buckets(env);
     env->graph_tri_segment_count = 0;
     env->graph_tri_vertex_count = 0;
 
     for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) {
-        Qm3MeshVertex vertex = env->mesh.vertices[vi];
-        if (vertex.disabled || vertex.degree == 0 || vertex.surface_tri < 0 || vertex.surface_tri >= (int32_t)env->surface.triangle_count) continue;
-        int32_t incident_edge = -1;
-        for (uint32_t i = 0; i < vertex.degree; ++i) {
-            size_t nidx = (size_t)vi * env->mesh.max_degree + i;
-            int32_t eidx = env->mesh.neighbor_edges[nidx];
-            if (eidx >= 0 && !env->mesh.edges[eidx].disabled) {
-                incident_edge = eidx;
-                break;
-            }
-        }
-        if (incident_edge < 0) continue;
-        Qm3IntArray support = {0};
-        qm3_point_support_tris(&env->surface, vertex.pos, vertex.surface_tri, &support);
-        for (int i = 0; i < support.size; ++i) {
-            int tri = support.data[i];
-            Qm3Vec2 p;
-            if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, vertex.pos, &p)) continue;
-            qm3_graph_tri_vertex_push(&env->graph_tri_vertices[tri], (Qm3GraphTriVertex){
-                .graph_vertex = vi,
-                .incident_edge = (uint32_t)incident_edge,
-                .p = p,
-            });
-            env->graph_tri_vertex_count++;
-        }
-        qm3_int_free(&support);
+        qm3_insert_graph_tri_vertex(env, vi);
     }
 
     for (uint32_t ei = 0; ei < env->mesh.edge_count; ++ei) {
-        Qm3MeshEdge edge = env->mesh.edges[ei];
-        if (edge.disabled || edge.segment_count == 0) continue;
-        uint32_t end = edge.segment_offset + edge.segment_count;
-        if (end > env->mesh.edge_path_segments.count) end = env->mesh.edge_path_segments.count;
-        for (uint32_t si = edge.segment_offset; si < end; ++si) {
-            const Qm3PathSegment* seg = &env->mesh.edge_path_segments.data[si];
-            if (seg->tri < 0 || seg->tri >= (int)env->surface.triangle_count) continue;
-            Qm3Vec2 a, b;
-            if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->a, &a)) continue;
-            if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->b, &b)) continue;
-            qm3_graph_tri_segment_push(&env->graph_tri_segments[seg->tri], (Qm3GraphTriSegment){
-                .edge = ei,
-                .a = a,
-                .b = b,
-            });
-            env->graph_tri_segment_count++;
-        }
+        qm3_insert_graph_tri_edge_segments(env, ei);
     }
 }
 
@@ -999,19 +1080,12 @@ static void qm3_compute_source_candidates(QuadMeshing3DEnv* env) {
         &query_cap
     );
 
-    int32_t* sample_to_graph = (int32_t*)malloc((size_t)env->surface.sample_count * sizeof(int32_t));
-    QM3_ASSERT(sample_to_graph != NULL || env->surface.sample_count == 0);
-    for (uint32_t i = 0; i < env->surface.sample_count; ++i) sample_to_graph[i] = -1;
-    for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) {
-        const Qm3MeshVertex* v = &env->mesh.vertices[vi];
-        if (v->disabled || v->sample_id >= env->surface.sample_count) continue;
-        sample_to_graph[v->sample_id] = (int32_t)vi;
-    }
+    if (!env->sample_to_graph && env->surface.sample_count > 0) qm3_rebuild_sample_to_graph(env);
 
     for (uint32_t i = 0; i < query_count; ++i) {
         uint32_t sample_id = query_samples[i];
         if (sample_id >= env->surface.sample_count) continue;
-        if (sample_to_graph[sample_id] >= 0) continue;
+        if (env->sample_to_graph && env->sample_to_graph[sample_id] >= 0) continue;
         Qm3CandidateValidity validity = QM3_CANDIDATE_VALID;
         if (source_vertex->disabled) validity = QM3_CANDIDATE_DISABLED;
         else if (source_vertex->degree >= env->mesh.max_degree) validity = QM3_CANDIDATE_MAX_DEGREE;
@@ -1033,7 +1107,6 @@ static void qm3_compute_source_candidates(QuadMeshing3DEnv* env) {
         else if (source_vertex->degree >= env->mesh.max_degree || target_vertex->degree >= env->mesh.max_degree) validity = QM3_CANDIDATE_MAX_DEGREE;
         qm3_candidate_push(env, QM3_TARGET_EXISTING_FRONTIER, target_vidx, target_vertex->sample_id, validity);
     }
-    free(sample_to_graph);
     free(query_samples);
     env->timing_target_query_ms = qm3_time_ms() - query_start;
     qm3_compute_all_continuous_paths(env);
@@ -1080,16 +1153,114 @@ static void qm3_select_random_target(QuadMeshing3DEnv* env) {
     qm3_update_selected_path(env);
 }
 
+static int32_t qm3_nth_valid_candidate(const QuadMeshing3DEnv* env, uint32_t slot) {
+    for (uint32_t i = 0; i < env->candidate_count; ++i) {
+        if (!env->candidates[i].path_ok) continue;
+        if (slot == 0) return (int32_t)i;
+        slot--;
+    }
+    return -1;
+}
+
+static void qm3_clear_target_selection(QuadMeshing3DEnv* env) {
+    env->candidate_count = 0;
+    env->valid_candidate_count = 0;
+    env->candidate_existing_count = 0;
+    env->candidate_sample_count = 0;
+    env->continuous_paths_ok = 0;
+    env->invalid_unreachable_count = 0;
+    env->invalid_intersect_count = 0;
+    env->source_frontier_idx = -1;
+    env->target_candidate_idx = -1;
+    env->debug_candidate_idx = -1;
+    env->selected_path_ok = false;
+    qm3_path_clear(&env->selected_path);
+}
+
+static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidate_idx) {
+    if (env->source_frontier_idx < 0 || (uint32_t)env->source_frontier_idx >= env->mesh.frontier_count) {
+        env->last_action_result = QM3_ACTION_INVALID_SOURCE;
+        return false;
+    }
+    if (candidate_idx >= env->candidate_count) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+    Qm3TargetCandidate* candidate = &env->candidates[candidate_idx];
+    if (!candidate->path_ok || candidate->path_count < 2 || candidate->segment_count == 0) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+
+    uint32_t source_vidx = env->mesh.frontier[env->source_frontier_idx];
+    uint32_t target_vidx = candidate->graph_vertex;
+    bool inserted_vertex = false;
+    if (candidate->kind == QM3_TARGET_NEW_SAMPLE) {
+        if (!env->sample_to_graph && env->surface.sample_count > 0) qm3_rebuild_sample_to_graph(env);
+        if (candidate->sample_id >= env->surface.sample_count || !env->sample_to_graph) {
+            env->last_action_result = QM3_ACTION_INVALID_TARGET;
+            return false;
+        }
+        uint32_t before_vertices = env->mesh.vertex_count;
+        target_vidx = qm3_mesh_vertex_for_sample(&env->mesh, &env->surface, env->sample_to_graph, candidate->sample_id);
+        inserted_vertex = env->mesh.vertex_count > before_vertices;
+    } else if (target_vidx >= env->mesh.vertex_count) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+
+    if (source_vidx == target_vidx || qm3_mesh_edge_index(&env->mesh, source_vidx, target_vidx) >= 0) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+    if (env->mesh.vertices[source_vidx].degree >= env->mesh.max_degree || env->mesh.vertices[target_vidx].degree >= env->mesh.max_degree) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+
+    uint32_t path_end = candidate->path_offset + candidate->path_count;
+    uint32_t segment_end = candidate->segment_offset + candidate->segment_count;
+    if (path_end > env->candidate_path_points.count || segment_end > env->candidate_path_segments.count) {
+        env->last_action_result = QM3_ACTION_INVALID_TARGET;
+        return false;
+    }
+
+    uint32_t before_edges = env->mesh.edge_count;
+    uint32_t edge_idx = qm3_mesh_add_edge_with_path(
+        &env->mesh,
+        source_vidx,
+        target_vidx,
+        0,
+        &env->candidate_path_points.points[candidate->path_offset],
+        candidate->path_count,
+        &env->candidate_path_segments.data[candidate->segment_offset],
+        candidate->segment_count,
+        candidate->path_length
+    );
+    if (env->mesh.edge_count > before_edges) {
+        qm3_insert_graph_tri_edge_segments(env, edge_idx);
+        if (inserted_vertex) qm3_insert_graph_tri_vertex(env, target_vidx);
+    }
+
+    env->last_action_result = QM3_ACTION_TARGET_COMMITTED;
+    env->phase = QM3_PHASE_SOURCE;
+    qm3_clear_target_selection(env);
+    return true;
+}
+
 static void qm3_select_source_frontier(QuadMeshing3DEnv* env, int32_t source_frontier_idx) {
     if (env->mesh.frontier_count == 0) {
-        env->source_frontier_idx = -1;
-        env->candidate_count = 0;
+        qm3_clear_target_selection(env);
+        env->phase = QM3_PHASE_SOURCE;
+        env->last_action_result = QM3_ACTION_INVALID_SOURCE;
         return;
     }
     if (source_frontier_idx < 0) source_frontier_idx = 0;
     env->source_frontier_idx = source_frontier_idx % (int32_t)env->mesh.frontier_count;
     qm3_compute_source_candidates(env);
     qm3_update_selected_path(env);
+    env->phase = QM3_PHASE_TARGET;
+    env->last_action_result = env->valid_candidate_count > 0 ? QM3_ACTION_SOURCE_SELECTED : QM3_ACTION_NO_VALID_TARGET;
 }
 
 static void qm3_select_random_source(QuadMeshing3DEnv* env) {
@@ -1108,7 +1279,27 @@ static void quad_meshing_3d_init(QuadMeshing3DEnv* env) {
     env->source_frontier_idx = -1;
     env->target_candidate_idx = -1;
     env->debug_candidate_idx = -1;
+    env->phase = QM3_PHASE_SOURCE;
+    env->last_action_result = QM3_ACTION_NONE;
     env->geodesic_ready = false;
+}
+
+static void qm3_update_episode_max_length(QuadMeshing3DEnv* env) {
+    float target_area = env->target_quad_area;
+    if (target_area <= 1e-12f) {
+        float sample_count = env->surface.sample_count > 0 ? (float)env->surface.sample_count : 1.0f;
+        target_area = fmaxf(env->surface.info.total_area / sample_count, 1e-12f);
+    }
+    float ratio = env->episode_max_length_ratio > 0.0f ? env->episode_max_length_ratio : 1.5f;
+    env->episode_max_length = (int)ceilf((env->surface.info.total_area / target_area) * ratio);
+    if (env->episode_max_length < 1) env->episode_max_length = 1;
+}
+
+static void qm3_add_log(QuadMeshing3DEnv* env) {
+    env->log.score += env->episode_return;
+    env->log.episode_return += env->episode_return;
+    env->log.episode_length += (float)env->episode_length;
+    env->log.n += 1.0f;
 }
 
 static void qm3_free_geodesic_state(QuadMeshing3DEnv* env) {
@@ -1144,17 +1335,29 @@ static void quad_meshing_3d_load_shape(QuadMeshing3DEnv* env, int shape_idx) {
     QM3_ASSERT(shape_idx >= 0 && shape_idx < env->shape_count);
     qm3_surface_load(&env->surface, env->shape_paths[shape_idx]);
     qm3_mesh_build_from_frontier_edges(&env->mesh, &env->surface);
+    qm3_rebuild_sample_to_graph(env);
     qm3_build_geodesic_state(env);
+    qm3_update_episode_max_length(env);
     env->candidate_radius = 0.0f;
-    qm3_select_random_source(env);
+    qm3_clear_target_selection(env);
+    env->phase = QM3_PHASE_SOURCE;
     env->loaded_shape = shape_idx;
 }
 
 void c_reset(QuadMeshing3DEnv* env) {
+    env->episode_length = 0;
+    env->episode_return = 0.0f;
     if (env->shape_count > 0 && env->loaded_shape < 0) quad_meshing_3d_load_shape(env, 0);
-    else qm3_mesh_build_from_frontier_edges(&env->mesh, &env->surface);
+    else {
+        qm3_mesh_build_from_frontier_edges(&env->mesh, &env->surface);
+        qm3_rebuild_sample_to_graph(env);
+        if (env->geodesic_ready) qm3_build_graph_tri_segments(env);
+        qm3_update_episode_max_length(env);
+    }
     env->candidate_radius = 0.0f;
-    qm3_select_random_source(env);
+    qm3_clear_target_selection(env);
+    env->phase = QM3_PHASE_SOURCE;
+    env->last_action_result = QM3_ACTION_NONE;
     if (env->rewards) env->rewards[0] = 0.0f;
     if (env->terminals) env->terminals[0] = 0.0f;
 }
@@ -1162,6 +1365,30 @@ void c_reset(QuadMeshing3DEnv* env) {
 void c_step(QuadMeshing3DEnv* env) {
     if (env->rewards) env->rewards[0] = 0.0f;
     if (env->terminals) env->terminals[0] = 0.0f;
+    env->episode_length++;
+
+    if (env->phase == QM3_PHASE_SOURCE) {
+        uint32_t source_slot = qm3_clamp_action_index(env->actions ? env->actions[0] : 0.0f);
+        if (source_slot < env->mesh.frontier_count) qm3_select_source_frontier(env, (int32_t)source_slot);
+        else env->last_action_result = QM3_ACTION_INVALID_SOURCE;
+    } else {
+        uint32_t target_slot = qm3_clamp_action_index(env->actions ? env->actions[0] : 0.0f);
+        int32_t candidate_idx = qm3_nth_valid_candidate(env, target_slot);
+        if (candidate_idx >= 0) qm3_commit_target_candidate(env, (uint32_t)candidate_idx);
+        else env->last_action_result = QM3_ACTION_INVALID_TARGET;
+    }
+
+    bool terminal = env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0;
+    if (terminal) {
+        float reward = env->rewards ? env->rewards[0] : 0.0f;
+        env->episode_return += reward;
+        qm3_add_log(env);
+        c_reset(env);
+        if (env->rewards) env->rewards[0] = reward;
+        if (env->terminals) env->terminals[0] = 1.0f;
+    } else {
+        env->episode_return += env->rewards ? env->rewards[0] : 0.0f;
+    }
 }
 
 void c_render(QuadMeshing3DEnv* env) {
@@ -1206,6 +1433,14 @@ void c_render(QuadMeshing3DEnv* env) {
     if (IsKeyPressed(KEY_LEFT) && env->mesh.frontier_count > 0) qm3_select_source_frontier(env, env->source_frontier_idx - 1 + (int32_t)env->mesh.frontier_count);
     if (IsKeyPressed(KEY_D) && env->candidate_count > 0) qm3_select_target_candidate(env, env->target_candidate_idx + 1);
     if (IsKeyPressed(KEY_A) && env->candidate_count > 0) qm3_select_target_candidate(env, env->target_candidate_idx - 1);
+    if (IsKeyPressed(KEY_ENTER) && env->phase == QM3_PHASE_TARGET && env->target_candidate_idx >= 0) {
+        env->episode_length++;
+        qm3_commit_target_candidate(env, (uint32_t)env->target_candidate_idx);
+        if (env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0) {
+            qm3_add_log(env);
+            c_reset(env);
+        }
+    }
     if (IsKeyPressed(KEY_UP)) {
         env->candidate_radius *= 1.1f;
         qm3_compute_source_candidates(env);
@@ -1303,8 +1538,15 @@ void c_render(QuadMeshing3DEnv* env) {
         surface->vertex_count, surface->triangle_count, surface->sample_count, surface->frontier_edge_count, env->prop_graph.node_count), 24, 24, 18, RAYWHITE);
     DrawText(TextFormat("area: %.6f | sample density: %.2f | sharp dihedral: %.2f deg",
         surface->info.total_area, surface->info.sample_density, surface->info.sharp_dihedral_radians * RAD2DEG), 24, 50, 18, RAYWHITE);
-    DrawText(TextFormat("graph: vertices: %u | edges: %u | frontier vertices: %u | max degree: %u",
-        env->mesh.vertex_count, env->mesh.edge_count, env->mesh.frontier_count, env->mesh.max_degree), 24, 76, 18, (Color){120, 220, 255, 255});
+    DrawText(TextFormat("phase: %s | step: %d / %d | return: %.3f | frontier: %u | edges: %u | graph vertices: %u | last: %s",
+        qm3_phase_str(env->phase),
+        env->episode_length,
+        env->episode_max_length,
+        env->episode_return,
+        env->mesh.frontier_count,
+        env->mesh.edge_count,
+        env->mesh.vertex_count,
+        qm3_action_result_str(env->last_action_result)), 24, 76, 18, (Color){120, 220, 255, 255});
     DrawText(TextFormat("source: %d / %u | radius: %.5f | candidates: %u (samples %u existing %u) valid: %u | continuous: %u | target: %d | path: %s %.5f (%u pts)",
         env->source_frontier_idx, env->mesh.frontier_count, env->candidate_radius, env->candidate_count,
         env->candidate_sample_count,
@@ -1349,7 +1591,7 @@ void c_render(QuadMeshing3DEnv* env) {
     } else {
         DrawText("debug candidate: off (I toggles validity overlay)", 24, 154, 18, (Color){150, 160, 175, 255});
     }
-    DrawText("controls: Ctrl+LMB source | Shift+LMB target | R/Space random source | Left/Right source | T random target | A/D valid target | ,/. debug target | Up/Down radius", 24, 180, 18, (Color){180, 190, 200, 255});
+    DrawText("controls: Ctrl+LMB source | Shift+LMB target | Enter commit | R/Space random source | Left/Right source | T random target | A/D valid target | ,/. debug target | Up/Down radius", 24, 180, 18, (Color){180, 190, 200, 255});
 
     int footer_y = GetScreenHeight() - 42;
     DrawRectangle(12, footer_y - 8, 920, 34, (Color){0, 0, 0, 170});
@@ -1374,6 +1616,8 @@ void c_close(QuadMeshing3DEnv* env) {
     qm3_path_segment_free(&env->candidate_path_segments);
     qm3_free_geodesic_state(env);
     qm3_path_free(&env->selected_path);
+    free(env->sample_to_graph);
+    env->sample_to_graph = NULL;
     qm3_mesh_free(&env->mesh);
     qm3_surface_free(&env->surface);
 }
