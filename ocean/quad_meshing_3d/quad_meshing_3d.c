@@ -33,7 +33,6 @@ int main(int argc, char** argv) {
     env.render_show_normals = false;
     env.render_show_cross_field = false;
     env.render_show_graph = true;
-    env.render_show_feature_edges = false;
     env.render_show_candidates = true;
 
     quad_meshing_3d_init(&env);
@@ -41,11 +40,11 @@ int main(int argc, char** argv) {
 
     if (check_only) {
         printf("loaded %s\n", path);
-        printf("vertices=%u triangles=%u samples=%u sharp_edges=%u area=%.8f sample_density=%.3f sharp_dihedral_deg=%.3f\n",
+        printf("vertices=%u triangles=%u samples=%u frontier_edges=%u area=%.8f sample_density=%.3f sharp_dihedral_deg=%.3f\n",
             env.surface.vertex_count,
             env.surface.triangle_count,
             env.surface.sample_count,
-            env.surface.sharp_edge_count,
+            env.surface.frontier_edge_count,
             env.surface.info.total_area,
             env.surface.info.sample_density,
             env.surface.info.sharp_dihedral_radians * RAD2DEG);
@@ -56,14 +55,19 @@ int main(int argc, char** argv) {
             env.graph_tri_vertex_count,
             env.mesh.frontier_count,
             env.mesh.max_degree);
-        printf("source_frontier=%d candidate_radius=%.8f candidate_count=%u prop_nodes=%d prop_edges=%d spacing=%.8f\n",
+        printf("persistent_graph_path_points=%u persistent_graph_path_segments=%u\n",
+            env.mesh.edge_path_points.count,
+            env.mesh.edge_path_segments.count);
+        printf("source_frontier=%d candidate_radius=%.8f candidate_count=%u candidate_samples=%u candidate_existing=%u prop_nodes=%d prop_edges=%d spacing=%.8f\n",
             env.source_frontier_idx,
             env.candidate_radius,
             env.candidate_count,
+            env.candidate_sample_count,
+            env.candidate_existing_count,
             env.prop_graph.node_count,
             env.prop_graph.edge_count,
             env.prop_graph.spacing);
-        printf("continuous_paths_ok=%u valid_candidates=%u invalid_unreachable=%u invalid_intersect=%u target_candidate=%d path_ok=%d path_points=%u path_length=%.8f\n",
+        printf("continuous_paths_ok=%u valid_candidates=%u invalid_unreachable=%u invalid_intersect=%u target_candidate=%d path_ok=%d path_points=%u path_segments=%u cached_path_points=%u cached_path_segments=%u path_length=%.8f\n",
             env.continuous_paths_ok,
             env.valid_candidate_count,
             env.invalid_unreachable_count,
@@ -71,6 +75,9 @@ int main(int argc, char** argv) {
             env.target_candidate_idx,
             env.selected_path_ok ? 1 : 0,
             env.selected_path.count,
+            env.target_candidate_idx >= 0 ? env.candidates[env.target_candidate_idx].segment_count : 0,
+            env.candidate_path_points.count,
+            env.candidate_path_segments.count,
             env.selected_path.length);
         printf("timing_ms targets=%.3f geodesic_paths=%.3f intersections=%.3f intersection_tests=%u total=%.3f\n",
             env.timing_target_query_ms,

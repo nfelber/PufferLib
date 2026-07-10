@@ -74,13 +74,6 @@ typedef struct {
     int tri_count;
 } Qm3FMMContext;
 
-typedef struct {
-    Qm3Vec3* points;
-    uint32_t count;
-    uint32_t cap;
-    float length;
-} Qm3Path;
-
 enum {
     QM3_FMM_FAR = 0,
     QM3_FMM_TRIAL = 1,
@@ -140,28 +133,52 @@ static Qm3HeapItem qm3_heap_pop(Qm3MinHeap* h) {
     return out;
 }
 
-static float qm3_distance(Qm3Vec3 a, Qm3Vec3 b) {
-    return qm3_len(qm3_sub(a, b));
+static void qm3_barycentric3f(Qm3Vec3 p, Qm3Vec3 a, Qm3Vec3 b, Qm3Vec3 c, float* u, float* v, float* w) {
+    Qm3Vec3 v0 = qm3_sub(b, a), v1 = qm3_sub(c, a), v2 = qm3_sub(p, a);
+    float d00 = qm3_dot(v0, v0), d01 = qm3_dot(v0, v1), d11 = qm3_dot(v1, v1);
+    float d20 = qm3_dot(v2, v0), d21 = qm3_dot(v2, v1);
+    float denom = d00 * d11 - d01 * d01;
+    if (fabsf(denom) < 1e-20f) { *u = 1.0f; *v = 0.0f; *w = 0.0f; return; }
+    *v = (d11 * d20 - d01 * d21) / denom;
+    *w = (d00 * d21 - d01 * d20) / denom;
+    *u = 1.0f - *v - *w;
 }
 
-static void qm3_path_clear(Qm3Path* path) {
-    path->count = 0;
-    path->length = 0.0f;
-}
+typedef struct {
+    int source_vertex;
+    int tri_count;
+    int tris[2];
+} Qm3SourceSupport;
 
-static void qm3_path_free(Qm3Path* path) {
-    free(path->points);
-    memset(path, 0, sizeof(*path));
-}
+static Qm3SourceSupport qm3_source_support(const Qm3Surface* surface, Qm3Vec3 p, int source_tri, float tol) {
+    Qm3SourceSupport support = {.source_vertex = -1, .tri_count = 0, .tris = {-1, -1}};
+    if (source_tri < 0 || source_tri >= (int)surface->triangle_count) return support;
 
-static void qm3_path_push(Qm3Path* path, Qm3Vec3 p) {
-    if (path->count > 0 && qm3_distance(path->points[path->count - 1], p) <= 1e-7f) return;
-    if (path->count == path->cap) {
-        path->cap = path->cap ? path->cap * 2 : 64;
-        path->points = (Qm3Vec3*)qm3_checked_realloc(path->points, (size_t)path->cap * sizeof(Qm3Vec3));
+    Qm3Tri tri = surface->triangles[source_tri];
+    uint32_t verts[3] = {tri.a, tri.b, tri.c};
+    float bary[3];
+    qm3_barycentric3f(p, surface->vertices[tri.a], surface->vertices[tri.b], surface->vertices[tri.c], &bary[0], &bary[1], &bary[2]);
+
+    int near_zero = 0;
+    for (int i = 0; i < 3; ++i) if (bary[i] <= tol) near_zero++;
+    if (near_zero >= 2) {
+        int vertex_local = 0;
+        if (bary[1] > bary[vertex_local]) vertex_local = 1;
+        if (bary[2] > bary[vertex_local]) vertex_local = 2;
+        support.source_vertex = (int)verts[vertex_local];
+        return support;
     }
-    if (path->count > 0) path->length += qm3_distance(path->points[path->count - 1], p);
-    path->points[path->count++] = p;
+
+    support.tris[support.tri_count++] = source_tri;
+    if (near_zero == 1) {
+        for (int edge = 0; edge < 3; ++edge) {
+            if (bary[edge] > tol) continue;
+            int neighbor = ((int*)&surface->triangle_neighbors[source_tri])[edge];
+            if (neighbor >= 0) support.tris[support.tri_count++] = neighbor;
+            break;
+        }
+    }
+    return support;
 }
 
 static Qm3SurfaceTopo qm3_surface_topo_build(const Qm3Surface* surface) {
@@ -383,7 +400,7 @@ static int qm3_geodesic_candidate_query(
     const Qm3PropGraph* graph,
     const Qm3SurfaceTopo* topo,
     Qm3Vec3 source_pos,
-    int source_surface_vertex,
+    int source_tri,
     float radius,
     Qm3FMMContext* ctx,
     uint32_t** out_candidates,
@@ -400,12 +417,24 @@ static int qm3_geodesic_candidate_query(
     ctx->reached_tri_count = 0;
     float stop_radius = radius + graph->spacing;
 
-    if (source_surface_vertex >= 0 && source_surface_vertex < graph->node_count) {
-        qm3_fmm_push_trial(ctx, source_surface_vertex, 0.0f, -1, -1);
-        for (int i = graph->node_tri_offsets[source_surface_vertex]; i < graph->node_tri_offsets[source_surface_vertex + 1]; ++i) qm3_fmm_mark_triangle(ctx, graph->node_tri_ids[i]);
+    Qm3SourceSupport source = qm3_source_support(surface, source_pos, source_tri, 1e-5f);
+    if (source.source_vertex >= 0 && source.source_vertex < graph->node_count) {
+        qm3_fmm_push_trial(ctx, source.source_vertex, 0.0f, -1, -1);
+        for (int i = graph->node_tri_offsets[source.source_vertex]; i < graph->node_tri_offsets[source.source_vertex + 1]; ++i) {
+            qm3_fmm_mark_triangle(ctx, graph->node_tri_ids[i]);
+        }
     } else {
-        (void)source_pos;
-        return 0;
+        if (source.tri_count == 0) return 0;
+        for (int ti = 0; ti < source.tri_count; ++ti) {
+            int tri = source.tris[ti];
+            int begin = graph->tri_node_offsets[tri];
+            int end = graph->tri_node_offsets[tri + 1];
+            for (int i = begin; i < end; ++i) {
+                int node = graph->tri_node_ids[i];
+                qm3_fmm_push_trial(ctx, node, qm3_distance(source_pos, graph->nodes[node]), -1, tri);
+            }
+            qm3_fmm_mark_triangle(ctx, tri);
+        }
     }
 
     while (ctx->heap.size > 0) {

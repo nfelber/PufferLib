@@ -6,18 +6,6 @@ typedef struct { float x, y; } Qm3Vec2;
 
 typedef struct {
     int tri;
-    Qm3Vec3 a;
-    Qm3Vec3 b;
-} Qm3PathSegment;
-
-typedef struct {
-    Qm3PathSegment* data;
-    uint32_t count;
-    uint32_t cap;
-} Qm3PathSegmentArray;
-
-typedef struct {
-    int tri;
     int entry_edge;
     int parent;
     float key;
@@ -71,18 +59,6 @@ static float qm3_v2_cross(Qm3Vec2 a, Qm3Vec2 b) { return a.x * b.y - a.y * b.x; 
 static float qm3_v2_len(Qm3Vec2 a) { return sqrtf(qm3_v2_dot(a, a)); }
 static float qm3_v2_dist(Qm3Vec2 a, Qm3Vec2 b) { return qm3_v2_len(qm3_v2_sub(a, b)); }
 static Qm3Vec2 qm3_v2_lerp(Qm3Vec2 a, Qm3Vec2 b, float t) { return qm3_v2_add(a, qm3_v2_scale(qm3_v2_sub(b, a), t)); }
-
-static void qm3_path_segment_clear(Qm3PathSegmentArray* a) { a->count = 0; }
-
-static void qm3_path_segment_free(Qm3PathSegmentArray* a) { free(a->data); memset(a, 0, sizeof(*a)); }
-
-static void qm3_path_segment_push(Qm3PathSegmentArray* a, Qm3PathSegment v) {
-    if (a->count == a->cap) {
-        a->cap = a->cap ? a->cap * 2 : 64;
-        a->data = (Qm3PathSegment*)qm3_checked_realloc(a->data, (size_t)a->cap * sizeof(Qm3PathSegment));
-    }
-    a->data[a->count++] = v;
-}
 
 static void qm3_geo_window_push(Qm3GeoWindowArray* a, Qm3GeoWindow v) {
     if (a->size == a->cap) {
@@ -415,16 +391,20 @@ static bool qm3_seed_source_roots(
     const Qm3PropGraph* graph,
     Qm3ContinuousContext* ctx,
     Qm3Vec3 source_p,
-    int source_tri,
-    int source_surface_vertex
+    int source_tri
 ) {
     qm3_continuous_context_begin(ctx);
     bool seeded = false;
-    if (source_surface_vertex >= 0 && source_surface_vertex < graph->node_count) {
-        int begin = graph->node_tri_offsets[source_surface_vertex];
-        int end = graph->node_tri_offsets[source_surface_vertex + 1];
+    Qm3SourceSupport source = qm3_source_support(s, source_p, source_tri, 1e-5f);
+    if (source.source_vertex >= 0 && source.source_vertex < graph->node_count) {
+        int begin = graph->node_tri_offsets[source.source_vertex];
+        int end = graph->node_tri_offsets[source.source_vertex + 1];
         for (int i = begin; i < end; ++i) {
             seeded |= qm3_seed_source_root_in_tri(s, ctx, source_p, graph->node_tri_ids[i]);
+        }
+    } else {
+        for (int i = 0; i < source.tri_count; ++i) {
+            seeded |= qm3_seed_source_root_in_tri(s, ctx, source_p, source.tris[i]);
         }
     }
     if (!seeded) seeded = qm3_seed_source_root_in_tri(s, ctx, source_p, source_tri);
@@ -437,11 +417,10 @@ static bool qm3_build_shared_source_windows(
     Qm3ContinuousContext* ctx,
     Qm3Vec3 source_p,
     int source_tri,
-    int source_surface_vertex,
     float stop_distance
 ) {
     if (!isfinite(stop_distance) || stop_distance <= 0.0f) return false;
-    if (!qm3_seed_source_roots(s, graph, ctx, source_p, source_tri, source_surface_vertex)) return false;
+    if (!qm3_seed_source_roots(s, graph, ctx, source_p, source_tri)) return false;
     while (ctx->heap.size > 0) {
         Qm3WindowHeapItem item = qm3_window_heap_pop(&ctx->heap);
         ctx->windows_popped++;

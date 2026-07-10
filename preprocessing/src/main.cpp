@@ -44,7 +44,7 @@ constexpr std::uint32_t kSurfSectionTriangleNeighbors = 6;
 constexpr std::uint32_t kSurfSectionFaceDirU = 7;
 constexpr std::uint32_t kSurfSectionFaceDirV = 8;
 constexpr std::uint32_t kSurfSectionSamples = 9;
-constexpr std::uint32_t kSurfSectionSharpEdges = 10;
+constexpr std::uint32_t kSurfSectionFrontierEdges = 10;
 
 struct Vec2f {
     float x;
@@ -83,12 +83,9 @@ struct SurfaceSampleRecord {
     std::uint32_t reserved;
 };
 
-struct SharpEdgeRecord {
+struct FrontierEdgeRecord {
     std::uint32_t a;
     std::uint32_t b;
-    std::int32_t f0;
-    std::int32_t f1;
-    float angle;
 };
 
 struct CrossFieldFaceRecord {
@@ -1230,36 +1227,12 @@ void save_surface_cache_3d(
         face_dir_v.push_back(normalize_vec3f(row_to_vec3f(dir_v.row(f))));
     }
 
-    std::vector<SharpEdgeRecord> sharp_edges;
-    sharp_edges.reserve(edges.size());
-    for (const auto& item : edges) {
-        const EdgeAdjacency& adj = item.second;
-        float angle = static_cast<float>(M_PI);
-        bool sharp = adj.f1 < 0;
-        if (adj.f0 >= 0 && adj.f1 >= 0) {
-            const Eigen::RowVector3d n0 = vec3_to_row(face_normals[static_cast<size_t>(adj.f0)]);
-            const Eigen::RowVector3d n1 = vec3_to_row(face_normals[static_cast<size_t>(adj.f1)]);
-            const double dot = std::clamp(n0.dot(n1), -1.0, 1.0);
-            angle = static_cast<float>(std::acos(dot));
-            sharp = angle >= sharp_dihedral_radians;
-        }
-        if (sharp) {
-            sharp_edges.push_back(SharpEdgeRecord{
-                adj.a,
-                adj.b,
-                adj.f0,
-                adj.f1,
-                angle,
-            });
-        }
-    }
-
-    const std::uint32_t sample_count = static_cast<std::uint32_t>(std::ceil(total_area * sample_density));
+    const std::uint32_t random_sample_count = static_cast<std::uint32_t>(std::ceil(total_area * sample_density));
     std::vector<SurfaceSampleRecord> samples;
-    samples.reserve(sample_count);
+    samples.reserve(random_sample_count);
     std::mt19937 rng(sample_seed);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
-    for (std::uint32_t i = 0; i < sample_count; ++i) {
+    for (std::uint32_t i = 0; i < random_sample_count; ++i) {
         const double pick = unit(rng) * total_area;
         const size_t tri_idx = static_cast<size_t>(
             std::lower_bound(face_cdf.begin(), face_cdf.end(), pick) - face_cdf.begin()
@@ -1285,11 +1258,54 @@ void save_surface_cache_3d(
         });
     }
 
+    std::vector<FrontierEdgeRecord> frontier_edges;
+    frontier_edges.reserve(edges.size());
+    const std::uint32_t invalid_sample = std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> frontier_vertex_samples(vertices.size(), invalid_sample);
+    const auto sample_for_frontier_vertex = [&](std::uint32_t vertex, std::int32_t incident_tri) -> std::uint32_t {
+        std::uint32_t& sample_id = frontier_vertex_samples[vertex];
+        if (sample_id != invalid_sample) return sample_id;
+        if (vertex >= vertices.size()) {
+            throw std::runtime_error("Frontier vertex index is out of range.");
+        }
+        if (incident_tri < 0) {
+            throw std::runtime_error("Sharp frontier vertex has no incident triangle.");
+        }
+        sample_id = static_cast<std::uint32_t>(samples.size());
+        samples.push_back(SurfaceSampleRecord{
+            vertices[vertex],
+            vertex_normals[vertex],
+            static_cast<std::uint32_t>(incident_tri),
+            0,
+        });
+        return sample_id;
+    };
+
+    for (const auto& item : edges) {
+        const EdgeAdjacency& adj = item.second;
+        float angle = static_cast<float>(M_PI);
+        bool sharp = adj.f1 < 0;
+        if (adj.f0 >= 0 && adj.f1 >= 0) {
+            const Eigen::RowVector3d n0 = vec3_to_row(face_normals[static_cast<size_t>(adj.f0)]);
+            const Eigen::RowVector3d n1 = vec3_to_row(face_normals[static_cast<size_t>(adj.f1)]);
+            const double dot = std::clamp(n0.dot(n1), -1.0, 1.0);
+            angle = static_cast<float>(std::acos(dot));
+            sharp = angle >= sharp_dihedral_radians;
+        }
+        if (sharp) {
+            const std::int32_t incident_tri = adj.f0 >= 0 ? adj.f0 : adj.f1;
+            frontier_edges.push_back(FrontierEdgeRecord{
+                sample_for_frontier_vertex(adj.a, incident_tri),
+                sample_for_frontier_vertex(adj.b, incident_tri),
+            });
+        }
+    }
+
     const SurfaceInfoRecord info{
         static_cast<float>(total_area),
         static_cast<float>(sample_density),
         static_cast<float>(sharp_dihedral_radians),
-        sample_count,
+        static_cast<std::uint32_t>(samples.size()),
     };
 
     std::ofstream out(output_path, std::ios::binary);
@@ -1323,7 +1339,7 @@ void save_surface_cache_3d(
     write_section(kSurfSectionFaceDirU, static_cast<std::uint32_t>(face_dir_u.size()), sizeof(Vec3f), face_dir_u.data());
     write_section(kSurfSectionFaceDirV, static_cast<std::uint32_t>(face_dir_v.size()), sizeof(Vec3f), face_dir_v.data());
     write_section(kSurfSectionSamples, static_cast<std::uint32_t>(samples.size()), sizeof(SurfaceSampleRecord), samples.data());
-    write_section(kSurfSectionSharpEdges, static_cast<std::uint32_t>(sharp_edges.size()), sizeof(SharpEdgeRecord), sharp_edges.data());
+    write_section(kSurfSectionFrontierEdges, static_cast<std::uint32_t>(frontier_edges.size()), sizeof(FrontierEdgeRecord), frontier_edges.data());
 }
 
 void print_usage(const char* argv0) {
