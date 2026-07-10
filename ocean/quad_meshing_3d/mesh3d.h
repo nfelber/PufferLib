@@ -504,6 +504,99 @@ static uint32_t qm3_mesh_vertex_for_sample(
     return graph_vertex;
 }
 
+static int qm3_surface_sample_vertex_id(const Qm3Surface* surface, uint32_t sample_id) {
+    if (sample_id >= surface->sample_count) return -1;
+    const Qm3SurfaceSample* sample = &surface->samples[sample_id];
+    if (sample->tri >= surface->triangle_count) return -1;
+    Qm3Tri tri = surface->triangles[sample->tri];
+    uint32_t vertices[3] = {tri.a, tri.b, tri.c};
+    int best = -1;
+    float best_dist2 = INFINITY;
+    for (int i = 0; i < 3; ++i) {
+        Qm3Vec3 d = qm3_sub(sample->p, surface->vertices[vertices[i]]);
+        float dist2 = qm3_dot(d, d);
+        if (dist2 < best_dist2) {
+            best_dist2 = dist2;
+            best = (int)vertices[i];
+        }
+    }
+    float diag = qm3_surface_diag(surface);
+    float tol = fmaxf(diag * 1e-5f, 1e-6f);
+    return best_dist2 <= tol * tol ? best : -1;
+}
+
+static bool qm3_surface_tri_contains_edge(const Qm3Surface* surface, int tri, int va, int vb) {
+    if (tri < 0 || tri >= (int)surface->triangle_count) return false;
+    Qm3Tri t = surface->triangles[tri];
+    int has_a = ((int)t.a == va || (int)t.b == va || (int)t.c == va);
+    int has_b = ((int)t.a == vb || (int)t.b == vb || (int)t.c == vb);
+    return has_a && has_b;
+}
+
+static bool qm3_surface_tri_contains_vertex(const Qm3Surface* surface, int tri, int v) {
+    if (tri < 0 || tri >= (int)surface->triangle_count) return false;
+    Qm3Tri t = surface->triangles[tri];
+    return (int)t.a == v || (int)t.b == v || (int)t.c == v;
+}
+
+static void qm3_surface_edge_incident_tris_from_vertex_fan(const Qm3Surface* surface, int start_tri, int va, int vb, int out[2], uint32_t* out_count) {
+    *out_count = 0;
+    if (start_tri < 0 || start_tri >= (int)surface->triangle_count) return;
+    if (!qm3_surface_tri_contains_vertex(surface, start_tri, va)) return;
+
+    int* stack = NULL;
+    int stack_count = 0;
+    int stack_cap = 0;
+    int* visited = NULL;
+    int visited_count = 0;
+    int visited_cap = 0;
+
+#define QM3_INT_ARRAY_PUSH(array, count, cap, value) do { \
+    if ((count) == (cap)) { \
+        (cap) = (cap) ? (cap) * 2 : 16; \
+        (array) = (int*)qm3_checked_realloc((array), (size_t)(cap) * sizeof(int)); \
+    } \
+    (array)[(count)++] = (value); \
+} while (0)
+
+    QM3_INT_ARRAY_PUSH(stack, stack_count, stack_cap, start_tri);
+    while (stack_count > 0) {
+        int tri = stack[--stack_count];
+        bool seen = false;
+        for (int i = 0; i < visited_count; ++i) {
+            if (visited[i] == tri) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        QM3_INT_ARRAY_PUSH(visited, visited_count, visited_cap, tri);
+
+        if (qm3_surface_tri_contains_edge(surface, tri, va, vb)) {
+            bool exists = false;
+            for (uint32_t i = 0; i < *out_count; ++i) if (out[i] == tri) exists = true;
+            if (!exists && *out_count < 2) out[(*out_count)++] = tri;
+        }
+
+        Qm3Tri t = surface->triangles[tri];
+        uint32_t vertices[3] = {t.a, t.b, t.c};
+        for (int edge = 0; edge < 3; ++edge) {
+            uint32_t ea = vertices[(edge + 1) % 3];
+            uint32_t eb = vertices[(edge + 2) % 3];
+            if (ea != (uint32_t)va && eb != (uint32_t)va) continue;
+            int neighbor = ((int*)&surface->triangle_neighbors[tri])[edge];
+            if (neighbor >= 0 && qm3_surface_tri_contains_vertex(surface, neighbor, va)) {
+                QM3_INT_ARRAY_PUSH(stack, stack_count, stack_cap, neighbor);
+            }
+        }
+    }
+
+#undef QM3_INT_ARRAY_PUSH
+
+    free(stack);
+    free(visited);
+}
+
 static void qm3_mesh_build_from_frontier_edges(Qm3Mesh* mesh, const Qm3Surface* surface) {
     qm3_mesh_reset(mesh);
     qm3_mesh_reserve_edges(mesh, surface->frontier_edge_count);
@@ -522,10 +615,14 @@ static void qm3_mesh_build_from_frontier_edges(Qm3Mesh* mesh, const Qm3Surface* 
         Qm3Vec3 points[2] = {surface->samples[sample_a].p, surface->samples[sample_b].p};
         Qm3PathSegment segments[2];
         uint32_t segment_count = 0;
-        int tri_a = (int)surface->samples[sample_a].tri;
-        int tri_b = (int)surface->samples[sample_b].tri;
-        if (tri_a >= 0) segments[segment_count++] = (Qm3PathSegment){.tri = tri_a, .a = points[0], .b = points[1]};
-        if (tri_b >= 0 && tri_b != tri_a) segments[segment_count++] = (Qm3PathSegment){.tri = tri_b, .a = points[0], .b = points[1]};
+        int surface_a = qm3_surface_sample_vertex_id(surface, sample_a);
+        int surface_b = qm3_surface_sample_vertex_id(surface, sample_b);
+        int edge_tris[2] = {-1, -1};
+        if (surface_a >= 0 && surface_b >= 0 && surface_a != surface_b) {
+            qm3_surface_edge_incident_tris_from_vertex_fan(surface, (int)surface->samples[sample_a].tri, surface_a, surface_b, edge_tris, &segment_count);
+            if (segment_count == 0) qm3_surface_edge_incident_tris_from_vertex_fan(surface, (int)surface->samples[sample_b].tri, surface_b, surface_a, edge_tris, &segment_count);
+        }
+        for (uint32_t si = 0; si < segment_count; ++si) segments[si] = (Qm3PathSegment){.tri = edge_tris[si], .a = points[0], .b = points[1]};
         qm3_mesh_add_edge_with_path(mesh, a, b, 0, points, 2, segments, segment_count, qm3_distance(points[0], points[1]));
     }
 
