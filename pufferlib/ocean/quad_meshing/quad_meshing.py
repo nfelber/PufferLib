@@ -11,6 +11,8 @@ from pufferlib.ocean.quad_meshing import binding
 
 class QuadMeshing(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
+                 boundary_folder=None,
+                 boundary_names=None,
                  boundary_files=None,
                  random_active_vertex=False,
                  observe_remaining_area=False,
@@ -37,7 +39,10 @@ class QuadMeshing(pufferlib.PufferEnv):
             log_interval: Number of steps between log reports
             buf: Optional pre-allocated observation buffer
             seed: Random seed
-            boundary_files: List of JSON boundary files. If provided, the environment
+            boundary_folder: Folder containing JSON boundary files.
+            boundary_names: Boundary filenames to load from boundary_folder. If an
+                            empty list is provided, all .json files in the folder are loaded.
+            boundary_files: List of JSON boundary file paths. If provided, the environment
                             cycles through these boundaries on every reset.
             random_active_vertex: If True, the active vertex is chosen randomly at each step.
             observe_remaining_area: If True, the agent observes the remaining fraction of area to mesh.
@@ -69,6 +74,8 @@ class QuadMeshing(pufferlib.PufferEnv):
         boundary_vertices_list = None
         if boundary_files is not None and not isinstance(boundary_files, (list, tuple)):
             raise ValueError("boundary_files must be a list of JSON boundary file paths")
+        if boundary_names is not None and not isinstance(boundary_names, (list, tuple)):
+            raise ValueError("boundary_names must be a list of JSON boundary filenames")
 
         def resolve_boundary_path(path):
             boundary_file_path = path
@@ -79,6 +86,16 @@ class QuadMeshing(pufferlib.PufferEnv):
             if not os.path.exists(boundary_file_path):
                 raise FileNotFoundError(f"Boundary file not found: {path}")
             return boundary_file_path
+
+        def resolve_boundary_folder(path):
+            boundary_folder_path = path
+            if not os.path.isabs(boundary_folder_path):
+                if not os.path.isdir(boundary_folder_path):
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    boundary_folder_path = os.path.join(script_dir, path)
+            if not os.path.isdir(boundary_folder_path):
+                raise FileNotFoundError(f"Boundary folder not found: {path}")
+            return boundary_folder_path
 
         def load_boundary_vertices(path):
             boundary_file_path = resolve_boundary_path(path)
@@ -96,6 +113,21 @@ class QuadMeshing(pufferlib.PufferEnv):
                     return boundary_vertices
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid JSON in boundary file: {e}")
+
+        if boundary_names is not None:
+            if boundary_folder is None:
+                raise ValueError("boundary_folder must be provided when using boundary_names")
+            boundary_folder_path = resolve_boundary_folder(boundary_folder)
+            if boundary_names:
+                boundary_files = [os.path.join(boundary_folder_path, name) for name in boundary_names]
+            else:
+                boundary_files = [
+                    os.path.join(boundary_folder_path, name)
+                    for name in sorted(os.listdir(boundary_folder_path))
+                    if name.endswith('.json')
+                ]
+            if not boundary_files:
+                raise ValueError(f"No .json boundary files found in folder: {boundary_folder}")
 
         if boundary_files:
             boundary_vertices_list = [load_boundary_vertices(path) for path in boundary_files]

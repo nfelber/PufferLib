@@ -274,6 +274,7 @@ static void load_starting_boundary(QuadMeshing* env, float* boundary_vertices, i
         perimeter += sqrtf(dx * dx + dy * dy);
     }
     float avg_segment_length = perimeter / env->starting_boundary.vertices.size;
+    env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : avg_segment_length;
     env->target_quad_area = avg_segment_length * avg_segment_length;
 
     // Calculate episode_max_length as 2 * (boundary area) / (target quad area)
@@ -496,7 +497,7 @@ void compute_observations(QuadMeshing* env) {
         Vec2 v0 = env->boundary.vertices.data[env->active_edge_start];
         Vec2 v1 = Polygon2D_neighbor(env->boundary, env->active_edge_start, 1);
         float edge_length = norm2(sub2(v1, v0));
-        env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : edge_length;
+        // env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : edge_length;
         compute_edge_observations(env);
         return;
     }
@@ -505,7 +506,7 @@ void compute_observations(QuadMeshing* env) {
     float radius = 0.5 *
       norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex, -1), env->boundary.vertices.data[env->active_vertex])) +
       norm2(sub2(Polygon2D_neighbor(env->boundary, env->active_vertex,  1), env->boundary.vertices.data[env->active_vertex]));
-    env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : radius;
+    // env->local_radius = env->fixed_local_radius > 0.0f ? env->fixed_local_radius : radius;
     compute_vertex_observations(env);
 }
 
@@ -541,6 +542,22 @@ float compute_reward(QuadMeshing* env, Polygon2D quad) {
     return (1.0 - fabs(A / env->target_quad_area - 1.0)) * eq;
     // return eq * dq;
     // return 0.5 * (eq + dq);
+
+    // float score = 0.0;
+    // float min_alignment = 0.5 * sqrtf(2);
+    // float target_length = sqrtf(env->target_quad_area);
+    // for (int i=quad.vertices.size-1, j=0; j<quad.vertices.size; i=j, ++j) {
+    //     Vec2 edge = sub2(quad.vertices.data[j], quad.vertices.data[i]);
+    //     float edge_length = norm2(edge);
+    //     Vec2 unit_edge = scalmul2(edge, 1 / edge_length);
+    //     float h_alignment = fabs(dot2(unit_edge, (Vec2){1.0, 0.0}));
+    //     float v_alignment = fabs(dot2(unit_edge, (Vec2){0.0, 1.0}));
+    //     float alignment = (fmax(h_alignment, v_alignment) - min_alignment) / (1.0 - min_alignment);
+    //     float length = 1.0 - fabs(edge_length / target_length - 1.0);
+    //     score += alignment * length;
+    // }
+    //
+    // return 0.25 * score;
 }
 
 static void remove_adjacent_pair(QuadMeshing* env, int start_idx) {

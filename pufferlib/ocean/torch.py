@@ -1040,6 +1040,7 @@ class QuadMeshingPolicy(nn.Module):
             continuous_logstd=continuous_logstd
         )
 
+        # hidden = torch.zeros_like(hidden, device=hidden.device) # TODO: debug only
         values = self.value(hidden)
         
         # Return HybridDistribution
