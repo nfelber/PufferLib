@@ -808,6 +808,8 @@ class Utilization(Thread):
 
     def stop(self):
         self.stopped = True
+        if self.is_alive():
+            self.join(timeout=self.delay + 1)
 
 def downsample(data_list, num_points):
     if not data_list or num_points <= 0:
@@ -917,87 +919,105 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop_fn=None):
     args = args or load_config(env_name)
+    pufferl = None
+    closed = False
 
-    # Assume TorchRun DDP is used if LOCAL_RANK is set
-    if 'LOCAL_RANK' in os.environ:
-        world_size = int(os.environ.get('WORLD_SIZE', 1))
-        print("World size", world_size)
-        master_addr = os.environ.get('MASTER_ADDR', 'localhost')
-        master_port = os.environ.get('MASTER_PORT', '29500')
-        local_rank = int(os.environ["LOCAL_RANK"])
-        print(f"rank: {local_rank}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
-        torch.cuda.set_device(local_rank)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+    try:
+        # Assume TorchRun DDP is used if LOCAL_RANK is set
+        if 'LOCAL_RANK' in os.environ:
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            print("World size", world_size)
+            master_addr = os.environ.get('MASTER_ADDR', 'localhost')
+            master_port = os.environ.get('MASTER_PORT', '29500')
+            local_rank = int(os.environ["LOCAL_RANK"])
+            print(f"rank: {local_rank}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
+            torch.cuda.set_device(local_rank)
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
-    vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv, env_name)
+        vecenv = vecenv or load_env(env_name, args)
+        policy = policy or load_policy(args, vecenv, env_name)
 
-    if 'LOCAL_RANK' in os.environ:
-        args['train']['device'] = torch.cuda.current_device()
-        torch.distributed.init_process_group(backend='nccl', world_size=world_size)
-        policy = policy.to(local_rank)
-        model = torch.nn.parallel.DistributedDataParallel(
-            policy, device_ids=[local_rank], output_device=local_rank
-        )
-        if hasattr(policy, 'lstm'):
-            #model.lstm = policy.lstm
-            model.hidden_size = policy.hidden_size
+        if 'LOCAL_RANK' in os.environ:
+            args['train']['device'] = torch.cuda.current_device()
+            torch.distributed.init_process_group(backend='nccl', world_size=world_size)
+            policy = policy.to(local_rank)
+            model = torch.nn.parallel.DistributedDataParallel(
+                policy, device_ids=[local_rank], output_device=local_rank
+            )
+            if hasattr(policy, 'lstm'):
+                #model.lstm = policy.lstm
+                model.hidden_size = policy.hidden_size
 
-        model.forward_eval = policy.forward_eval
-        policy = model.to(local_rank)
+            model.forward_eval = policy.forward_eval
+            policy = model.to(local_rank)
 
-    if args['neptune']:
-        logger = NeptuneLogger(args)
-    elif args['wandb']:
-        logger = WandbLogger(args)
+        if args['neptune']:
+            logger = NeptuneLogger(args)
+        elif args['wandb']:
+            logger = WandbLogger(args)
 
-    train_config = { **args['train'], 'env': env_name }
-    pufferl = PuffeRL(train_config, vecenv, policy, logger)
+        train_config = { **args['train'], 'env': env_name }
+        pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
-    # Sweep needs data for early stopped runs, so send data when steps > 100M
-    logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
-    all_logs = []
+        # Sweep needs data for early stopped runs, so send data when steps > 100M
+        logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
+        all_logs = []
 
-    while pufferl.global_step < train_config['total_timesteps']:
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
-        pufferl.evaluate()
-        if train_config['device'] == 'cuda':
-            torch.compiler.cudagraph_mark_step_begin()
-        logs = pufferl.train()
+        while pufferl.global_step < train_config['total_timesteps']:
+            if train_config['device'] == 'cuda':
+                torch.compiler.cudagraph_mark_step_begin()
+            pufferl.evaluate()
+            if train_config['device'] == 'cuda':
+                torch.compiler.cudagraph_mark_step_begin()
+            logs = pufferl.train()
 
+            if logs is not None:
+                should_stop_early = False
+                if early_stop_fn is not None:
+                    should_stop_early = early_stop_fn(logs)
+                    # This is hacky, but need to see if threshold looks reasonable
+                    if 'early_stop_threshold' in logs:
+                        pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
+
+                if pufferl.global_step > logging_threshold:
+                    all_logs.append(logs)
+
+                if should_stop_early:
+                    model_path = pufferl.close()
+                    closed = True
+                    pufferl.logger.close(model_path, early_stop=True)
+                    return all_logs
+
+        # Final eval. You can reset the env here, but depending on
+        # your env, this can skew data (i.e. you only collect the shortest
+        # rollouts within a fixed number of epochs)
+        for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
+            stats = pufferl.evaluate()
+            if i >= 32 and stats:
+                break
+
+        logs = pufferl.mean_and_log()
         if logs is not None:
-            should_stop_early = False
-            if early_stop_fn is not None:
-                should_stop_early = early_stop_fn(logs)
-                # This is hacky, but need to see if threshold looks reasonable
-                if 'early_stop_threshold' in logs:
-                    pufferl.logger.log({'environment/early_stop_threshold': logs['early_stop_threshold']}, logs['agent_steps'])
+            all_logs.append(logs)
 
-            if pufferl.global_step > logging_threshold:
-                all_logs.append(logs)
-
-            if should_stop_early:
-                model_path = pufferl.close()
-                pufferl.logger.close(model_path, early_stop=True)
-                return all_logs
-
-    # Final eval. You can reset the env here, but depending on
-    # your env, this can skew data (i.e. you only collect the shortest
-    # rollouts within a fixed number of epochs)
-    for i in range(128):  # Run eval for at least 32, but put a hard stop at 128.
-        stats = pufferl.evaluate()
-        if i >= 32 and stats:
-            break
-
-    logs = pufferl.mean_and_log()
-    if logs is not None:
-        all_logs.append(logs)
-
-    pufferl.print_dashboard()
-    model_path = pufferl.close()
-    pufferl.logger.close(model_path, early_stop=False)
-    return all_logs
+        pufferl.print_dashboard()
+        model_path = pufferl.close()
+        closed = True
+        pufferl.logger.close(model_path, early_stop=False)
+        return all_logs
+    finally:
+        if not closed:
+            if pufferl is not None:
+                with contextlib.suppress(Exception):
+                    pufferl.vecenv.close()
+                with contextlib.suppress(Exception):
+                    pufferl.utilization.stop()
+            elif vecenv is not None:
+                with contextlib.suppress(Exception):
+                    vecenv.close()
+            if logger is not None and args.get('wandb'):
+                with contextlib.suppress(Exception):
+                    logger.wandb.finish(exit_code=1)
 
 def eval(env_name, args=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
@@ -1063,6 +1083,12 @@ def sweep(args=None, env_name=None):
     if not args['wandb'] and not args['neptune']:
         raise pufferlib.APIUsageError('Sweeps require either wandb or neptune')
     args['no_model_upload'] = True  # Uploading trained model during sweep crashed wandb
+    if args['vec'].get('backend') == 'Multiprocessing' and args['vec'].get('start_method') == 'fork':
+        # Sweep trials repeatedly start WandB/torch threads and then create env
+        # workers. Forking workers from that process can inherit stale service
+        # finalizers and deadlock during worker startup. Forkserver keeps worker
+        # children clean while preserving multiprocessing rollout performance.
+        args['vec']['start_method'] = 'forkserver'
 
     method = args['sweep'].pop('method')
     try:

@@ -237,7 +237,8 @@ class Multiprocessing:
  
     def __init__(self, env_creators, env_args, env_kwargs,
             num_envs, num_workers=None, batch_size=None,
-            zero_copy=True, sync_traj=True, overwork=False, seed=0, **kwargs):
+            zero_copy=True, sync_traj=True, overwork=False, seed=0,
+            start_method='fork', **kwargs):
         if batch_size is None:
             batch_size = num_envs
         if num_workers is None:
@@ -294,18 +295,17 @@ class Multiprocessing:
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.agents_per_batch)
         self.agent_ids = np.arange(num_agents).reshape(num_workers, agents_per_worker)
 
-        from multiprocessing import RawArray, set_start_method
-        # Mac breaks without setting fork... but setting it breaks sweeps on 2nd run
-        #set_start_method('fork')
+        import multiprocessing as mp
+        ctx = mp.get_context(start_method)
         self.shm = dict(
-            observations=RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
-            actions=RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
-            rewards=RawArray('f', num_agents),
-            terminals=RawArray('b', num_agents),
-            truncateds=RawArray('b', num_agents),
-            masks=RawArray('b', num_agents),
-            semaphores=RawArray('c', num_workers),
-            notify=RawArray('b', num_workers),
+            observations=ctx.RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
+            actions=ctx.RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
+            rewards=ctx.RawArray('f', num_agents),
+            terminals=ctx.RawArray('b', num_agents),
+            truncateds=ctx.RawArray('b', num_agents),
+            masks=ctx.RawArray('b', num_agents),
+            semaphores=ctx.RawArray('c', num_workers),
+            notify=ctx.RawArray('b', num_workers),
         )
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -324,9 +324,8 @@ class Multiprocessing:
         )
         self.buf['semaphores'][:] = MAIN 
 
-        from multiprocessing import Pipe, Process
-        self.send_pipes, w_recv_pipes = zip(*[Pipe() for _ in range(num_workers)])
-        w_send_pipes, self.recv_pipes = zip(*[Pipe() for _ in range(num_workers)])
+        self.send_pipes, w_recv_pipes = zip(*[ctx.Pipe() for _ in range(num_workers)])
+        w_send_pipes, self.recv_pipes = zip(*[ctx.Pipe() for _ in range(num_workers)])
         self.recv_pipe_dict = {p: i for i, p in enumerate(self.recv_pipes)}
 
         self.processes = []
@@ -334,7 +333,7 @@ class Multiprocessing:
             start = i * envs_per_worker
             end = start + envs_per_worker
             seed_i = seed + i if seed is not None else None
-            p = Process(
+            p = ctx.Process(
                 target=_worker_process,
                 args=(env_creators[start:end], env_args[start:end],
                     env_kwargs[start:end], obs_shape, obs_dtype,
@@ -484,8 +483,23 @@ class Multiprocessing:
 
     def close(self):
         self.driver_env.close()
+        self.buf['notify'][:] = False
+        self.buf['semaphores'][:] = CLOSE
+
+        for pipe in self.recv_pipes:
+            if pipe.poll(2.0):
+                pipe.recv()
+
         for p in self.processes:
-            p.terminate()
+            p.join(timeout=2.0)
+
+        for p in self.processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2.0)
+
+        for pipe in (*self.send_pipes, *self.recv_pipes):
+            pipe.close()
 
 class Ray():
     '''Runs environments in parallel on multiple processes using Ray
@@ -700,7 +714,7 @@ def make(env_creator_or_creators, env_args=None, env_kwargs=None, backend=Puffer
 
     # Sanity check args
     for k in kwargs:
-        if k not in ['num_workers', 'batch_size', 'zero_copy', 'overwork', 'backend']:
+        if k not in ['num_workers', 'batch_size', 'zero_copy', 'overwork', 'backend', 'start_method']:
             raise pufferlib.APIUsageError(f'Invalid argument: {k}')
 
     # TODO: First step action space check
