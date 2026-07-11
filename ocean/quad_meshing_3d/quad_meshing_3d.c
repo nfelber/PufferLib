@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
     env.candidate_radius_ratio = 0.05f;
     env.geodesic_steiner_spacing_ratio = 0.005f;
     env.target_edge_length_ratio = 1.0f;
+    env.episode_max_length_ratio = 1.5f;
+    env.prevent_triangles = true;
     env.reward_invalid = -0.05f;
     env.reward_incomplete = -1.0f;
     env.reward_triangle = -0.5f;

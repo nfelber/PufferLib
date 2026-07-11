@@ -767,6 +767,29 @@ class CandidateTargets:
     target_frontier_parity: torch.Tensor # [Q] parity of hop distance from source; new candidates are odd
 
 
+@dataclass
+class QuadMesh3DGraph:
+    vertices: torch.Tensor       # [N, 3] vertex positions
+    normals: torch.Tensor        # [N, 3] vertex normals
+    batch_offsets: torch.Tensor  # [B + 1] vertex offsets per batch
+    edges: torch.Tensor          # [2, E] directed edge indices
+    edge_features: torch.Tensor  # [E, f] reserved for future 3D edge features
+    edge_ptr: torch.Tensor       # [N + 1] CSR pointer for outgoing edges
+    target_edge_length: torch.Tensor  # [B] per-batch target edge length
+    suggested_vertex_idx: Optional[torch.Tensor] = None  # [B] local suggested source vertex index
+
+
+@dataclass
+class QuadMesh3DTargets:
+    source_idx: torch.Tensor            # [B] local source vertex index per batch item
+    target_batch_offsets: torch.Tensor  # [B + 1] target offsets per batch
+    target_batches: torch.Tensor        # [Q] batch index per target
+    target_positions: torch.Tensor      # [Q, 3]
+    target_normals: torch.Tensor        # [Q, 3]
+    path_lengths: torch.Tensor          # [Q]
+    target_kind: torch.Tensor           # [Q], 0=new sample, 1=frontier
+
+
 # =============================================================================
 # Triton kernels
 # =============================================================================
@@ -1216,6 +1239,233 @@ def _cand_scatter_new_targets_kernel(
 def _pow2_at_least_1(x: int) -> int:
     x = max(int(x), 1)
     return 1 << (x - 1).bit_length()
+
+
+@triton.jit
+def _load_f32_le(obs, pos, mask):
+    bits = (
+        tl.load(obs + pos + 0, mask=mask, other=0).to(tl.uint32)
+        | (tl.load(obs + pos + 1, mask=mask, other=0).to(tl.uint32) << 8)
+        | (tl.load(obs + pos + 2, mask=mask, other=0).to(tl.uint32) << 16)
+        | (tl.load(obs + pos + 3, mask=mask, other=0).to(tl.uint32) << 24)
+    )
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _qm3_decode_header_kernel(
+    obs,
+    valid_batch_idx,
+    frontier_size_out,
+    target_edge_length_out,
+    suggested_vertex_idx_out,
+    source_idx_out,
+    target_count_out,
+    OBS_SIZE: tl.constexpr,
+    F_CAP: tl.constexpr,
+    D: tl.constexpr,
+    B: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    off = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask = off < B
+    physical_b = tl.load(valid_batch_idx + off, mask=mask, other=0)
+    row = physical_b * OBS_SIZE
+
+    target_edge_length = _load_f32_le(obs, row + 1, mask)
+    f_lo = tl.load(obs + row + 5, mask=mask, other=0).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6, mask=mask, other=0).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    suggested_pos = row + 9 + F_CAP * 24 + F_CAP * D * 2
+    s_lo = tl.load(obs + suggested_pos + 0, mask=mask, other=255).to(tl.uint32)
+    s_hi = tl.load(obs + suggested_pos + 1, mask=mask, other=255).to(tl.uint32)
+    suggested = s_lo | (s_hi << 8)
+
+    source_pos = suggested_pos + 2
+    src_lo = tl.load(obs + source_pos + 0, mask=mask, other=255).to(tl.uint32)
+    src_hi = tl.load(obs + source_pos + 1, mask=mask, other=255).to(tl.uint32)
+    source_idx = src_lo | (src_hi << 8)
+
+    target_count_pos = source_pos + 2
+    tc_lo = tl.load(obs + target_count_pos + 0, mask=mask, other=0).to(tl.uint32)
+    tc_hi = tl.load(obs + target_count_pos + 1, mask=mask, other=0).to(tl.uint32)
+    target_count = tc_lo | (tc_hi << 8)
+
+    tl.store(frontier_size_out + off, frontier_size.to(tl.int64), mask=mask)
+    tl.store(target_edge_length_out + off, target_edge_length, mask=mask)
+    tl.store(suggested_vertex_idx_out + off, suggested.to(tl.int64), mask=mask)
+    tl.store(source_idx_out + off, source_idx.to(tl.int64), mask=mask)
+    tl.store(target_count_out + off, target_count.to(tl.int64), mask=mask)
+
+
+@triton.jit
+def _qm3_decode_vertices_kernel(
+    obs,
+    vertices,
+    normals,
+    vertex_batch_offsets,
+    valid_batch_idx,
+    OBS_SIZE: tl.constexpr,
+    F_CAP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
+    i = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+    valid = i < frontier_size
+    global_i = tl.load(vertex_batch_offsets + b) + i
+
+    base = row + 9 + i * 24
+    px = _load_f32_le(obs, base + 0, valid)
+    py = _load_f32_le(obs, base + 4, valid)
+    pz = _load_f32_le(obs, base + 8, valid)
+    nx = _load_f32_le(obs, base + 12, valid)
+    ny = _load_f32_le(obs, base + 16, valid)
+    nz = _load_f32_le(obs, base + 20, valid)
+
+    tl.store(vertices + global_i * 3 + 0, px, mask=valid)
+    tl.store(vertices + global_i * 3 + 1, py, mask=valid)
+    tl.store(vertices + global_i * 3 + 2, pz, mask=valid)
+    tl.store(normals + global_i * 3 + 0, nx, mask=valid)
+    tl.store(normals + global_i * 3 + 1, ny, mask=valid)
+    tl.store(normals + global_i * 3 + 2, nz, mask=valid)
+
+
+@triton.jit
+def _qm3_count_neighbors_kernel(
+    obs,
+    neighbor_count,
+    vertex_batch_offsets,
+    valid_batch_idx,
+    OBS_SIZE: tl.constexpr,
+    F_CAP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
+    i = block_i * BLOCK_N + tl.arange(0, BLOCK_N)[:, None]
+    d = tl.arange(0, BLOCK_D)[None, :]
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+
+    neighbor_base = row + 9 + F_CAP * 24
+    nb = neighbor_base + (i * D + d) * 2
+    mask = (i < frontier_size) & (i < F_CAP) & (d < D)
+    lo = tl.load(obs + nb + 0, mask=mask, other=255).to(tl.uint32)
+    hi = tl.load(obs + nb + 1, mask=mask, other=255).to(tl.uint32)
+    local_neighbor = lo | (hi << 8)
+    valid_edge = mask & (local_neighbor != 65535)
+    count = tl.sum(valid_edge.to(tl.int64), axis=1)
+
+    ii = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
+    global_i = tl.load(vertex_batch_offsets + b) + ii
+    tl.store(neighbor_count + global_i, count, mask=ii < frontier_size)
+
+
+@triton.jit
+def _qm3_scatter_edges_kernel(
+    obs,
+    edges_flat,
+    edge_ptr,
+    vertex_batch_offsets,
+    sizes_dev,
+    valid_batch_idx,
+    OBS_SIZE: tl.constexpr,
+    F_CAP: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_i = tl.program_id(1)
+    ii = block_i * BLOCK_N + tl.arange(0, BLOCK_N)
+    dd = tl.arange(0, BLOCK_D)
+    i = ii[:, None]
+    d = dd[None, :]
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+    f_lo = tl.load(obs + row + 5).to(tl.uint32)
+    f_hi = tl.load(obs + row + 6).to(tl.uint32)
+    frontier_size = f_lo | (f_hi << 8)
+    vertex_batch_offset = tl.load(vertex_batch_offsets + b)
+
+    neighbor_base = row + 9 + F_CAP * 24
+    nb = neighbor_base + (i * D + d) * 2
+    mask = (i < frontier_size) & (i < F_CAP) & (d < D)
+    lo = tl.load(obs + nb + 0, mask=mask, other=255).to(tl.uint32)
+    hi = tl.load(obs + nb + 1, mask=mask, other=255).to(tl.uint32)
+    local_neighbor = lo | (hi << 8)
+    valid_edge = mask & (local_neighbor != 65535)
+    rank = tl.cumsum(valid_edge.to(tl.int64), axis=1) - 1
+
+    global_src_vec = vertex_batch_offset + ii
+    out_base = tl.load(edge_ptr + global_src_vec, mask=ii < frontier_size, other=0)
+    out = out_base[:, None] + rank
+    global_src = global_src_vec[:, None]
+    global_dst = vertex_batch_offset + local_neighbor.to(tl.int64)
+    E_actual = tl.load(sizes_dev + 1)
+
+    tl.store(edges_flat + out, global_src, mask=valid_edge)
+    tl.store(edges_flat + E_actual + out, global_dst, mask=valid_edge)
+
+
+@triton.jit
+def _qm3_scatter_targets_kernel(
+    obs,
+    valid_batch_idx,
+    target_batch_offsets,
+    target_count,
+    target_positions,
+    target_normals,
+    path_lengths,
+    target_kind,
+    target_batches,
+    OBS_SIZE: tl.constexpr,
+    F_CAP: tl.constexpr,
+    D: tl.constexpr,
+    T_CAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    b = tl.program_id(0)
+    block_j = tl.program_id(1)
+    j = block_j * BLOCK_T + tl.arange(0, BLOCK_T)
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+    count = tl.load(target_count + b)
+    valid = (j < count) & (j < T_CAP)
+    out = tl.load(target_batch_offsets + b) + j
+
+    targets_base = row + 9 + F_CAP * 24 + F_CAP * D * 2 + 2 + 2 + 2
+    base = targets_base + j * 29
+    px = _load_f32_le(obs, base + 0, valid)
+    py = _load_f32_le(obs, base + 4, valid)
+    pz = _load_f32_le(obs, base + 8, valid)
+    nx = _load_f32_le(obs, base + 12, valid)
+    ny = _load_f32_le(obs, base + 16, valid)
+    nz = _load_f32_le(obs, base + 20, valid)
+    path = _load_f32_le(obs, base + 24, valid)
+    kind = tl.load(obs + base + 28, mask=valid, other=0).to(tl.int64)
+
+    tl.store(target_positions + out * 3 + 0, px, mask=valid)
+    tl.store(target_positions + out * 3 + 1, py, mask=valid)
+    tl.store(target_positions + out * 3 + 2, pz, mask=valid)
+    tl.store(target_normals + out * 3 + 0, nx, mask=valid)
+    tl.store(target_normals + out * 3 + 1, ny, mask=valid)
+    tl.store(target_normals + out * 3 + 2, nz, mask=valid)
+    tl.store(path_lengths + out, path, mask=valid)
+    tl.store(target_kind + out, kind, mask=valid)
+    tl.store(target_batches + out, b, mask=valid)
 
 
 def _assert_same_cuda_buffer(name, x, static):
@@ -1730,7 +1980,268 @@ class CUDAGraphObservationDeserializer:
         return graph
 
 
+class QuadMesh3DObservationDeserializer:
+    def __init__(
+        self,
+        obs_example: torch.Tensor,
+        valid_batch_idx_example: torch.Tensor,
+        D: int,
+        F_CAP: int,
+        T_CAP: int,
+        decode_targets: bool = False,
+        exact_output: bool = True,
+        copy_obs: bool = True,
+        use_cuda_graph: bool = True,
+        warmup_iters: int = 3,
+    ):
+        assert obs_example.dtype == torch.uint8
+        assert obs_example.is_cuda
+        assert valid_batch_idx_example.dtype == torch.long
+        assert valid_batch_idx_example.is_cuda
+
+        self.device = obs_example.device
+        self.B_full, self.obs_size = obs_example.shape
+        self.B = int(valid_batch_idx_example.numel())
+        self.D = int(D)
+        self.F_CAP = int(F_CAP)
+        self.T_CAP = int(T_CAP)
+        self.decode_targets = bool(decode_targets)
+        self.exact_output = bool(exact_output)
+        self.copy_obs = bool(copy_obs)
+        self.use_cuda_graph = bool(use_cuda_graph)
+
+        self.BLOCK_B = 128
+        self.BLOCK_D = _pow2_at_least_1(self.D)
+        self.BLOCK_T = 128
+        self.N_CAP = max(self.B * self.F_CAP, 1)
+        self.E_CAP = max(self.N_CAP * self.D, 1)
+        self.Q_CAP = max(self.B * self.T_CAP, 1)
+
+        with torch.cuda.device(self.device):
+            if self.copy_obs:
+                self.obs_static = torch.empty_like(obs_example)
+                self.valid_batch_idx_static = torch.empty_like(valid_batch_idx_example)
+            else:
+                self.obs_static = obs_example
+                self.valid_batch_idx_static = valid_batch_idx_example
+
+            self.frontier_size = torch.empty((self.B,), dtype=torch.long, device=self.device)
+            self.target_edge_length = torch.empty((self.B,), dtype=torch.float32, device=self.device)
+            self.suggested_vertex_idx = torch.empty((self.B,), dtype=torch.long, device=self.device)
+            self.source_idx = torch.empty((self.B,), dtype=torch.long, device=self.device)
+            self.target_count = torch.empty((self.B,), dtype=torch.long, device=self.device)
+            self.vertex_batch_offsets = torch.empty((self.B + 1,), dtype=torch.long, device=self.device)
+            self.vertices = torch.empty((self.N_CAP, 3), dtype=torch.float32, device=self.device)
+            self.normals = torch.empty((self.N_CAP, 3), dtype=torch.float32, device=self.device)
+            self.neighbor_count = torch.empty((self.N_CAP,), dtype=torch.long, device=self.device)
+            self.edge_ptr = torch.empty((self.N_CAP + 1,), dtype=torch.long, device=self.device)
+            self.edges_flat = torch.empty((2 * self.E_CAP,), dtype=torch.long, device=self.device)
+            self.edge_features = torch.empty((self.E_CAP, 0), dtype=torch.bool, device=self.device)
+            self.sizes_dev = torch.empty((3,), dtype=torch.long, device=self.device)
+            self.sizes_host = torch.empty((3,), dtype=torch.long, pin_memory=True)
+
+            self.target_batch_offsets = torch.empty((self.B + 1,), dtype=torch.long, device=self.device)
+            self.target_positions = torch.empty((self.Q_CAP, 3), dtype=torch.float32, device=self.device)
+            self.target_normals = torch.empty((self.Q_CAP, 3), dtype=torch.float32, device=self.device)
+            self.path_lengths = torch.empty((self.Q_CAP,), dtype=torch.float32, device=self.device)
+            self.target_kind = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
+            self.target_batches = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
+
+            self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
+            self.edge_ptr_tail = self.edge_ptr[1:]
+            self.target_batch_offsets_tail = self.target_batch_offsets[1:]
+
+            if self.copy_obs:
+                self.obs_static.copy_(obs_example, non_blocking=True)
+                self.valid_batch_idx_static.copy_(valid_batch_idx_example, non_blocking=True)
+
+            if self.use_cuda_graph:
+                self.graph = torch.cuda.CUDAGraph()
+                cur_stream = torch.cuda.current_stream(self.device)
+                warmup_stream = torch.cuda.Stream(device=self.device)
+                warmup_stream.wait_stream(cur_stream)
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(int(warmup_iters)):
+                        self._run_static_pipeline()
+                cur_stream.wait_stream(warmup_stream)
+                cur_stream.synchronize()
+                with torch.cuda.graph(self.graph):
+                    self._run_static_pipeline()
+            else:
+                self.graph = None
+
+    def _run_static_pipeline(self):
+        _gf_init_offsets_kernel[(1,)](
+            self.vertex_batch_offsets,
+            self.edge_ptr,
+            num_warps=1,
+        )
+
+        _qm3_decode_header_kernel[(triton.cdiv(self.B, self.BLOCK_B),)](
+            self.obs_static,
+            self.valid_batch_idx_static,
+            self.frontier_size,
+            self.target_edge_length,
+            self.suggested_vertex_idx,
+            self.source_idx,
+            self.target_count,
+            OBS_SIZE=self.obs_size,
+            F_CAP=self.F_CAP,
+            D=self.D,
+            B=self.B,
+            BLOCK_B=self.BLOCK_B,
+            num_warps=4,
+        )
+
+        torch.cumsum(self.frontier_size, dim=0, out=self.vertex_batch_offsets_tail)
+        self.neighbor_count.zero_()
+        BLOCK_N = 128
+        _qm3_decode_vertices_kernel[(self.B, triton.cdiv(self.F_CAP, BLOCK_N))](
+            self.obs_static,
+            self.vertices,
+            self.normals,
+            self.vertex_batch_offsets,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            F_CAP=self.F_CAP,
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+        )
+
+        BLOCK_COUNT_N = 16
+        _qm3_count_neighbors_kernel[(self.B, triton.cdiv(self.F_CAP, BLOCK_COUNT_N))](
+            self.obs_static,
+            self.neighbor_count,
+            self.vertex_batch_offsets,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            F_CAP=self.F_CAP,
+            D=self.D,
+            BLOCK_N=BLOCK_COUNT_N,
+            BLOCK_D=self.BLOCK_D,
+            num_warps=1,
+        )
+
+        torch.cumsum(self.neighbor_count, dim=0, out=self.edge_ptr_tail)
+        _gf_write_sizes_kernel[(1,)](
+            self.vertex_batch_offsets,
+            self.edge_ptr,
+            self.sizes_dev,
+            B=self.B,
+            num_warps=1,
+        )
+
+        _qm3_scatter_edges_kernel[(self.B, triton.cdiv(self.F_CAP, BLOCK_COUNT_N))](
+            self.obs_static,
+            self.edges_flat,
+            self.edge_ptr,
+            self.vertex_batch_offsets,
+            self.sizes_dev,
+            self.valid_batch_idx_static,
+            OBS_SIZE=self.obs_size,
+            F_CAP=self.F_CAP,
+            D=self.D,
+            BLOCK_N=BLOCK_COUNT_N,
+            BLOCK_D=self.BLOCK_D,
+            num_warps=1,
+        )
+
+        if self.decode_targets:
+            _cand_init_offsets_kernel[(1,)](self.target_batch_offsets, num_warps=1)
+            torch.cumsum(self.target_count, dim=0, out=self.target_batch_offsets_tail)
+            _cand_write_target_size_kernel[(1,)](
+                self.target_batch_offsets,
+                self.sizes_dev,
+                B=self.B,
+                num_warps=1,
+            )
+            _qm3_scatter_targets_kernel[(self.B, triton.cdiv(max(self.T_CAP, 1), self.BLOCK_T))](
+                self.obs_static,
+                self.valid_batch_idx_static,
+                self.target_batch_offsets,
+                self.target_count,
+                self.target_positions,
+                self.target_normals,
+                self.path_lengths,
+                self.target_kind,
+                self.target_batches,
+                OBS_SIZE=self.obs_size,
+                F_CAP=self.F_CAP,
+                D=self.D,
+                T_CAP=max(self.T_CAP, 1),
+                BLOCK_T=self.BLOCK_T,
+                num_warps=4,
+            )
+        else:
+            self.sizes_dev[2].zero_()
+
+    def _graph(self, N: int | None = None, E: int | None = None) -> QuadMesh3DGraph:
+        if N is None:
+            N = self.N_CAP
+            E = self.E_CAP
+        return QuadMesh3DGraph(
+            vertices=self.vertices[:N],
+            normals=self.normals[:N],
+            batch_offsets=self.vertex_batch_offsets,
+            edges=self.edges_flat[: 2 * E].view(2, E),
+            edge_features=self.edge_features[:E],
+            edge_ptr=self.edge_ptr[: N + 1],
+            target_edge_length=self.target_edge_length,
+            suggested_vertex_idx=self.suggested_vertex_idx,
+        )
+
+    def _targets(self, Q: int | None = None) -> QuadMesh3DTargets:
+        if Q is None:
+            Q = self.Q_CAP
+        return QuadMesh3DTargets(
+            source_idx=self.source_idx,
+            target_batch_offsets=self.target_batch_offsets,
+            target_batches=self.target_batches[:Q],
+            target_positions=self.target_positions[:Q],
+            target_normals=self.target_normals[:Q],
+            path_lengths=self.path_lengths[:Q],
+            target_kind=self.target_kind[:Q],
+        )
+
+    @torch.no_grad()
+    def __call__(self, obs: torch.Tensor, valid_batch_idx: torch.Tensor):
+        assert obs.dtype == torch.uint8
+        assert obs.is_cuda
+        assert valid_batch_idx.dtype == torch.long
+        assert valid_batch_idx.is_cuda
+        assert obs.shape == (self.B_full, self.obs_size)
+        assert valid_batch_idx.numel() == self.B
+
+        self.valid_batch_idx_static.copy_(valid_batch_idx, non_blocking=True)
+        if self.copy_obs:
+            self.obs_static.copy_(obs, non_blocking=True)
+        else:
+            _assert_same_cuda_buffer("obs", obs, self.obs_static)
+
+        if self.use_cuda_graph:
+            self.graph.replay()
+        else:
+            self._run_static_pipeline()
+
+        if not self.exact_output:
+            graph = self._graph()
+            if self.decode_targets:
+                return graph, self._targets()
+            return graph
+
+        self.sizes_host.copy_(self.sizes_dev, non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+        N = int(self.sizes_host[0].item())
+        E = int(self.sizes_host[1].item())
+        Q = int(self.sizes_host[2].item()) if self.decode_targets else 0
+        graph = self._graph(N, E)
+        if self.decode_targets:
+            return graph, self._targets(Q)
+        return graph
+
+
 _DESERIALIZE_OBSERVATION_CACHE = {}
+_DESERIALIZE_OBSERVATION_3D_CACHE = {}
 
 
 @torch.no_grad()
@@ -1794,6 +2305,54 @@ def deserialize_observation(
         )
         _DESERIALIZE_OBSERVATION_CACHE[key] = deser
 
+    return deser(obs, valid_batch_idx)
+
+
+@torch.no_grad()
+def deserialize_observation_3d(
+    obs: torch.Tensor,
+    valid_batch_idx: torch.Tensor,
+    D: int = 16,
+    F_CAP: int = 2048,
+    T_CAP: int = 2048,
+    deserialize_targets: bool = False,
+    exact_output: bool = True,
+    copy_obs: bool = True,
+    use_cuda_graph: bool = True,
+) -> QuadMesh3DGraph | tuple[QuadMesh3DGraph, QuadMesh3DTargets]:
+    """Deserialize quad_meshing_3d observations from the fixed byte layout."""
+    assert obs.dtype == torch.uint8
+    assert obs.is_cuda
+    assert valid_batch_idx.dtype == torch.long
+    assert valid_batch_idx.is_cuda
+
+    key = (
+        obs.device.type,
+        obs.device.index,
+        tuple(obs.shape),
+        int(valid_batch_idx.numel()),
+        int(D),
+        int(F_CAP),
+        int(T_CAP),
+        bool(deserialize_targets),
+        bool(exact_output),
+        bool(copy_obs),
+        bool(use_cuda_graph),
+    )
+    deser = _DESERIALIZE_OBSERVATION_3D_CACHE.get(key)
+    if deser is None:
+        deser = QuadMesh3DObservationDeserializer(
+            obs,
+            valid_batch_idx,
+            D=D,
+            F_CAP=F_CAP,
+            T_CAP=T_CAP,
+            decode_targets=deserialize_targets,
+            exact_output=exact_output,
+            copy_obs=copy_obs,
+            use_cuda_graph=use_cuda_graph,
+        )
+        _DESERIALIZE_OBSERVATION_3D_CACHE[key] = deser
     return deser(obs, valid_batch_idx)
 
 
@@ -2394,6 +2953,12 @@ class TargetInitStage(nn.Module):
             with nvtx_range("target_ring_pos_encoder"):
                 parts.append(self.pos_encoder(positions_local))
 
+        if self.include_target_length:
+            parts.append(target_length)
+
+        if self.include_target_log_length:
+            parts.append(torch.log(target_length_safe))
+
         if self.include_distance:
             with nvtx_range("target_distances"):
                 distances = distance_to_graph_edges(
@@ -2404,12 +2969,6 @@ class TargetInitStage(nn.Module):
                     block_e=64,
                 )
             parts.append(distances.unsqueeze(-1))
-
-        if self.include_target_length:
-            parts.append(target_length)
-
-        if self.include_target_log_length:
-            parts.append(torch.log(target_length_safe))
 
         if self.include_relative_distance:
             if distances is None:

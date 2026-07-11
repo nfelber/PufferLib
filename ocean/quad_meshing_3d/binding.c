@@ -1,12 +1,38 @@
+#define NUM_ATNS 1
+#define ACT_SIZES {1}
+#define OBS_TENSOR_T ByteTensor
+
+// OBSERVATION BUFFER (in bytes)
+// - phase [1]
+// - target edge length [4]
+// - frontier count [2]
+// - max degree [2]
+// - frontier vertices: position xyz + normal xyz [MAX_FRONTIER_SIZE * 24]
+// - frontier neighbors [MAX_FRONTIER_SIZE * MAX_DEGREE * 2]
+// - suggested source frontier index [2]
+// - selected source frontier index [2]
+// - valid target count [2]
+// - valid targets: position xyz + normal xyz + path length + kind [MAX_TARGETS * 29]
+#define MAX_FRONTIER_SIZE 2048
+#define MAX_DEGREE 16
+#define MAX_TARGETS 2048
+#define OBS_SIZE ( \
+  1 + \
+  4 + \
+  2 + \
+  2 + \
+  MAX_FRONTIER_SIZE * 24 + \
+  MAX_FRONTIER_SIZE * MAX_DEGREE * 2 + \
+  2 + \
+  2 + \
+  2 + \
+  MAX_TARGETS * 29 \
+)
+
 #include "quad_meshing_3d.h"
 
 #include <dirent.h>
 #include <string.h>
-
-#define NUM_ATNS 1
-#define ACT_SIZES {1}
-#define OBS_TENSOR_T ByteTensor
-#define OBS_SIZE 1
 
 #define Env QuadMeshing3DEnv
 
