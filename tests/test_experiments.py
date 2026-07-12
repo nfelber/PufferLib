@@ -1,4 +1,5 @@
 import textwrap
+import json
 
 import pytest
 
@@ -48,6 +49,21 @@ def test_manifest_rejects_duplicate_names(tmp_path):
     manifest.write_text(path)
     with pytest.raises(ValueError, match='unique'):
         load_manifest(manifest)
+
+
+def test_manifest_explains_toml_boolean_syntax(tmp_path):
+    path = write_manifest(tmp_path)
+    path.write_text(path.read_text() + '\ninvalid = False\n')
+    with pytest.raises(ValueError, match='booleans must be lowercase'):
+        load_manifest(path)
+
+
+def test_json_manifest_does_not_require_toml_parser(tmp_path):
+    _, manifest = load_manifest(write_manifest(tmp_path))
+    path = tmp_path / 'experiments.json'
+    path.write_text(json.dumps(manifest))
+    _, loaded = load_manifest(path)
+    assert loaded == manifest
 
 
 def test_merge_overrides_is_recursive_and_validated():

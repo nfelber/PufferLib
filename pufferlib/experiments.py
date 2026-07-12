@@ -1,11 +1,15 @@
 import argparse
+import json
 from copy import deepcopy
 from pathlib import Path
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 
 _BATCH_KEYS = {'env', 'group', 'project', 'seeds', 'slowly', 'tag', 'wandb'}
@@ -13,8 +17,23 @@ _BATCH_KEYS = {'env', 'group', 'project', 'seeds', 'slowly', 'tag', 'wandb'}
 
 def load_manifest(path):
     path = Path(path).expanduser().resolve()
-    with path.open('rb') as f:
-        manifest = tomllib.load(f)
+    if path.suffix == '.json':
+        with path.open() as f:
+            manifest = json.load(f)
+    elif tomllib is None:
+        raise RuntimeError(
+            'Reading TOML requires Python 3.11+ or tomli. Use the submission '
+            'helper, which converts TOML to JSON before container execution.'
+        )
+    else:
+        try:
+            with path.open('rb') as f:
+                manifest = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(
+                f'Invalid TOML in {path}: {e}. TOML booleans must be lowercase '
+                '`true` or `false` (unlike the INI files).'
+            ) from e
 
     unknown = set(manifest) - {'batch', 'defaults', 'experiments'}
     if unknown:
@@ -133,6 +152,9 @@ def main(argv=None):
     count_parser.add_argument('manifest')
     env_parser = subparsers.add_parser('env', help='Print the manifest environment')
     env_parser.add_argument('manifest')
+    export_parser = subparsers.add_parser('export-json', help='Export validated manifest as JSON')
+    export_parser.add_argument('manifest')
+    export_parser.add_argument('output')
     run_parser = subparsers.add_parser('run', help='Run one expanded task')
     run_parser.add_argument('manifest')
     run_parser.add_argument('--index', type=int, required=True)
@@ -145,6 +167,11 @@ def main(argv=None):
         return
     if cli.command == 'env':
         print(manifest['batch']['env'])
+        return
+    if cli.command == 'export-json':
+        output = Path(cli.output).expanduser().resolve()
+        with output.open('w') as f:
+            json.dump(manifest, f, indent=2)
         return
 
     experiment, seed = select_task(manifest, cli.index)

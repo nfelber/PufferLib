@@ -47,6 +47,8 @@ OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
 
 TASK_COUNT=$(python -m pufferlib.experiments count "$MANIFEST")
 ENV_NAME=$(python -m pufferlib.experiments env "$MANIFEST")
+RUNTIME_MANIFEST="$OUTPUT_DIR/manifest.json"
+python -m pufferlib.experiments export-json "$MANIFEST" "$RUNTIME_MANIFEST"
 if ! [[ "$MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
     printf 'Invalid --max-concurrent value: %s\n' "$MAX_CONCURRENT" >&2
     exit 1
@@ -67,7 +69,7 @@ ARRAY_JOB=$(sbatch --parsable \
     --output="$OUTPUT_DIR/slurm-%x-%A_%a.out" \
     "${DEPENDENCY[@]}" \
     "$SCRIPT_DIR/slurm/dev_experiments.run" \
-    "$MANIFEST" "$SOURCE_DIR" "$OUTPUT_DIR" "$IMAGE")
+    "$RUNTIME_MANIFEST" "$SOURCE_DIR" "$OUTPUT_DIR" "$IMAGE")
 
 printf 'Submitted experiment array %s: %s tasks, up to %s concurrent\n' \
     "$ARRAY_JOB" "$TASK_COUNT" "$MAX_CONCURRENT"

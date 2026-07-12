@@ -273,6 +273,10 @@ array depend on it. Omit it when the mounted checkout already contains the
 correct float backend. Array tasks never build, so tasks from one array can run
 concurrently without racing on `pufferlib/_C*.so`.
 
+The submission helper validates the TOML on the host and writes a JSON runtime
+manifest into the output directory. Consequently, the container does not need
+Python 3.11 or the optional `tomli` package.
+
 The default output directory is
 `cluster_runs/experiments/<manifest-name>`. Override it with `--output-dir`.
 Each array task requests one GPU, and `--max-concurrent` controls the Slurm
