@@ -63,8 +63,9 @@ typedef struct {
     CrossField cross_field;
     int episode_length;
     float episode_return;
-    int source_frontier_idx;
+    float total_quad_quality;
     int num_quads;
+    int source_frontier_idx;
 
     // Env settings
     float episode_max_length_ratio;
@@ -169,8 +170,8 @@ void quad_meshing_init(QuadMeshingEnv* env)
 
 void add_log(QuadMeshingEnv* env) {
     const float area_scale = env->cache.target_quad_area / env->cache.starting_boundary_area;
-    env->log.perf += env->episode_return * area_scale;
-    env->log.score += env->episode_return;
+    env->log.perf += env->total_quad_quality / env->num_quads;
+    env->log.score += env->total_quad_quality / env->num_quads;
     env->log.episode_length += env->episode_length;
     env->log.episode_length_ratio += (float)env->episode_length / env->cache.episode_max_length;
     env->log.episode_return += env->episode_return;
@@ -750,8 +751,9 @@ static float compute_frontier_potential(QuadMeshingEnv* env) {
         - env->degree_pressure_weight * compute_degree_pressure(env);
 }
 
-static float compute_quad_reward(QuadMeshingEnv* env, const Vec2* quad) {
-    float quad_reward = compute_quad_quality(env, quad);
+static float compute_quad_reward(QuadMeshingEnv* env, const Vec2* quad, float* quality) {
+    *quality = compute_quad_quality(env, quad);
+    float quad_reward = *quality;
     if (env->reward_cross_field) {
         quad_reward *= compute_quad_cross_field_alignment(env, quad);
     }
@@ -762,6 +764,7 @@ static float compute_quad_reward(QuadMeshingEnv* env, const Vec2* quad) {
 void c_reset(QuadMeshingEnv* env) {
     env->episode_length = 0;
     env->episode_return = 0.0;
+    env->total_quad_quality = 0.0;
     env->num_quads = 0;
     env->source_frontier_idx = -1;
 
@@ -877,7 +880,9 @@ void c_step(QuadMeshingEnv* env) {
         if (mesh_register_face(&env->mesh, verts, 4)) {
             Vec2 face[4];
             for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
-            env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+            float quality = 0.0;
+            env->rewards[0] += 0.5 * compute_quad_reward(env, face, &quality);
+            env->total_quad_quality += quality;
             ++env->num_quads;
             mesh_disable_edges_inside_face(&env->mesh, verts, 4);
         }
@@ -899,7 +904,9 @@ void c_step(QuadMeshingEnv* env) {
             int* verts = &cycles[i * 4];
             if (mesh_register_face(&env->mesh, verts, 4)) {
                 for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
-                env->rewards[0] += 0.5 * compute_quad_reward(env, face);
+                float quality = 0.0;
+                env->rewards[0] += 0.5 * compute_quad_reward(env, face, &quality);
+                env->total_quad_quality += quality;
                 ++env->num_quads;
                 ++new_face_count;
                 mesh_disable_edges_inside_face(&env->mesh, verts, 4);

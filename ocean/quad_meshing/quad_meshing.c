@@ -9,7 +9,7 @@ int main() {
     QuadMeshingEnv env = {0};
     env.episode_max_length_ratio = 1.5;
     static const char* shape_paths[] = {
-      "resources/quad_meshing/shapes/dolphin.qmshape"
+      "resources/quad_meshing/shapes/test/dolphin.qmshape"
     };
     env.shape_paths = shape_paths;
     env.shape_count = (int)(sizeof(shape_paths) / sizeof(shape_paths[0]));
@@ -17,11 +17,11 @@ int main() {
     env.prevent_triangles = true;
     env.export_obj = false;
     env.export_obj_path = "quad_meshing.obj";
-    env.candidate_rings = 10;
-    env.candidate_angles = 64;
+    env.candidate_rings = 7;
+    env.candidate_angles = 48;
     env.target_edge_length_ratio = 1.0;
     env.candidate_radius_min_ratio = 0.5;
-    env.candidate_radius_max_ratio = 2.0;
+    env.candidate_radius_max_ratio = 1.5;
     env.reward_cross_field = true;
     env.reward_invalid = -0.05;
     env.reward_incomplete = -1.0;
