@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -86,6 +87,11 @@ struct SurfaceSampleRecord {
 struct FrontierEdgeRecord {
     std::uint32_t a;
     std::uint32_t b;
+};
+
+enum class SurfaceSampleMethod {
+    Random,
+    Stratified,
 };
 
 struct CrossFieldFaceRecord {
@@ -573,6 +579,42 @@ Vec3f mix3(Vec3f a, Vec3f b, Vec3f c, double wa, double wb, double wc) {
         static_cast<float>(wa * a.y + wb * b.y + wc * c.y),
         static_cast<float>(wa * a.z + wb * b.z + wc * c.z),
     };
+}
+
+std::uint32_t hash_u32(std::uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+double unit_from_u32(std::uint32_t x) {
+    return (static_cast<double>(x) + 0.5) / 4294967296.0;
+}
+
+double radical_inverse_base2(std::uint32_t bits) {
+    bits = (bits << 16) | (bits >> 16);
+    bits = ((bits & 0x55555555u) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
+    bits = ((bits & 0x33333333u) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
+    bits = ((bits & 0x0F0F0F0Fu) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
+    bits = ((bits & 0x00FF00FFu) << 8) | ((bits & 0xFF00FF00u) >> 8);
+    return static_cast<double>(bits) * 2.3283064365386963e-10;
+}
+
+const char* surface_sample_method_name(SurfaceSampleMethod method) {
+    switch (method) {
+        case SurfaceSampleMethod::Random: return "random";
+        case SurfaceSampleMethod::Stratified: return "stratified";
+    }
+    return "unknown";
+}
+
+SurfaceSampleMethod parse_surface_sample_method(const std::string& value) {
+    if (value == "random") return SurfaceSampleMethod::Random;
+    if (value == "stratified") return SurfaceSampleMethod::Stratified;
+    throw std::runtime_error("Unknown sample method: " + value + " (expected random or stratified).");
 }
 
 std::uint64_t edge_key(std::uint32_t a, std::uint32_t b) {
@@ -1148,6 +1190,7 @@ void save_surface_cache_3d(
     const Eigen::MatrixXd& dir_u,
     const Eigen::MatrixXd& dir_v,
     double sample_density,
+    SurfaceSampleMethod sample_method,
     double sharp_dihedral_radians,
     std::uint32_t sample_seed
 ) {
@@ -1227,35 +1270,87 @@ void save_surface_cache_3d(
         face_dir_v.push_back(normalize_vec3f(row_to_vec3f(dir_v.row(f))));
     }
 
-    const std::uint32_t random_sample_count = static_cast<std::uint32_t>(std::ceil(total_area * sample_density));
+    const std::uint32_t surface_sample_count = static_cast<std::uint32_t>(std::ceil(total_area * sample_density));
     std::vector<SurfaceSampleRecord> samples;
-    samples.reserve(random_sample_count);
-    std::mt19937 rng(sample_seed);
-    std::uniform_real_distribution<double> unit(0.0, 1.0);
-    for (std::uint32_t i = 0; i < random_sample_count; ++i) {
-        const double pick = unit(rng) * total_area;
-        const size_t tri_idx = static_cast<size_t>(
-            std::lower_bound(face_cdf.begin(), face_cdf.end(), pick) - face_cdf.begin()
-        );
-        const Tri3u32& tri = triangles[std::min(tri_idx, triangles.size() - 1)];
+    samples.reserve(surface_sample_count);
 
-        double r1 = unit(rng);
-        double r2 = unit(rng);
-        if (r1 + r2 > 1.0) {
-            r1 = 1.0 - r1;
-            r2 = 1.0 - r2;
-        }
-        const double wa = 1.0 - r1 - r2;
-        const double wb = r1;
-        const double wc = r2;
-        Vec3f p = mix3(vertices[tri.a], vertices[tri.b], vertices[tri.c], wa, wb, wc);
-        Vec3f n = normalize_vec3f(mix3(vertex_normals[tri.a], vertex_normals[tri.b], vertex_normals[tri.c], wa, wb, wc));
+    const auto append_sample = [&](size_t tri_idx, double wa, double wb, double wc) {
+        const Tri3u32& tri = triangles[tri_idx];
+        const Vec3f p = mix3(vertices[tri.a], vertices[tri.b], vertices[tri.c], wa, wb, wc);
+        const Vec3f n = normalize_vec3f(mix3(vertex_normals[tri.a], vertex_normals[tri.b], vertex_normals[tri.c], wa, wb, wc));
         samples.push_back(SurfaceSampleRecord{
             p,
             n,
-            static_cast<std::uint32_t>(std::min(tri_idx, triangles.size() - 1)),
+            static_cast<std::uint32_t>(tri_idx),
             0,
         });
+    };
+
+    if (sample_method == SurfaceSampleMethod::Random) {
+        std::mt19937 rng(sample_seed);
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        for (std::uint32_t i = 0; i < surface_sample_count; ++i) {
+            const double pick = unit(rng) * total_area;
+            const size_t tri_idx = std::min(
+                static_cast<size_t>(std::lower_bound(face_cdf.begin(), face_cdf.end(), pick) - face_cdf.begin()),
+                triangles.size() - 1
+            );
+
+            double r1 = unit(rng);
+            double r2 = unit(rng);
+            if (r1 + r2 > 1.0) {
+                r1 = 1.0 - r1;
+                r2 = 1.0 - r2;
+            }
+            append_sample(tri_idx, 1.0 - r1 - r2, r1, r2);
+        }
+    } else if (sample_method == SurfaceSampleMethod::Stratified) {
+        std::vector<std::uint32_t> face_sample_counts(face_areas.size(), 0);
+        std::vector<std::pair<double, std::uint32_t>> remainders;
+        remainders.reserve(face_areas.size());
+
+        std::uint64_t assigned = 0;
+        for (std::uint32_t f = 0; f < face_areas.size(); ++f) {
+            const double expected = face_areas[f] * sample_density;
+            const std::uint32_t count = static_cast<std::uint32_t>(std::floor(expected));
+            face_sample_counts[f] = count;
+            assigned += count;
+            remainders.push_back({expected - static_cast<double>(count), f});
+        }
+
+        std::sort(
+            remainders.begin(),
+            remainders.end(),
+            [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                return lhs.second < rhs.second;
+            }
+        );
+
+        const std::uint64_t target = surface_sample_count;
+        const std::uint64_t extra = target > assigned ? target - assigned : 0;
+        for (std::uint64_t i = 0; i < extra && i < remainders.size(); ++i) {
+            ++face_sample_counts[remainders[static_cast<size_t>(i)].second];
+        }
+
+        for (std::uint32_t f = 0; f < face_sample_counts.size(); ++f) {
+            const std::uint32_t count = face_sample_counts[f];
+            if (count == 0) continue;
+
+            const double u_shift = unit_from_u32(hash_u32(sample_seed ^ hash_u32(f + 0x9E3779B9u)));
+            const double v_shift = unit_from_u32(hash_u32(sample_seed ^ hash_u32(f + 0xBB67AE85u)));
+            for (std::uint32_t j = 0; j < count; ++j) {
+                const double u = std::fmod((static_cast<double>(j) + 0.5) / count + u_shift, 1.0);
+                const double v = std::fmod(radical_inverse_base2(j) + v_shift, 1.0);
+                const double su = std::sqrt(u);
+                append_sample(
+                    f,
+                    1.0 - su,
+                    su * (1.0 - v),
+                    su * v
+                );
+            }
+        }
     }
 
     std::vector<FrontierEdgeRecord> frontier_edges;
@@ -1346,7 +1441,7 @@ void print_usage(const char* argv0) {
     std::cerr
         << "Usage:\n"
         << "  " << argv0 << " input.obj output.qmshape [--boundary boundary.json] [--npz debug.npz] [--no-boundary-constraints]\n"
-        << "  " << argv0 << " input.obj output.qmsurf [--3d] [--sample-density N] [--sharp-dihedral-deg D] [--sample-seed S] [--npz debug.npz]\n\n"
+        << "  " << argv0 << " input.obj output.qmsurf [--3d] [--sample-density N] [--sample-method random|stratified] [--sharp-dihedral-deg D] [--sample-seed S] [--npz debug.npz]\n\n"
         << "Primary output:\n"
         << "  .qmshape          binary normalized boundary + face cross-field cache\n\n"
         << "  .qmsurf           binary normalized 3D surface + normals + cross-field + samples\n\n"
@@ -1355,6 +1450,7 @@ void print_usage(const char* argv0) {
         << "  --npz PATH        additionally write a debug .npz cache\n\n"
         << "  --3d             write QMSURF3D cache instead of the 2D boundary cache\n"
         << "  --sample-density N       uniform candidate samples per normalized surface-area unit; default 1000\n"
+        << "  --sample-method METHOD   surface candidate sampler: random or stratified; default random\n"
         << "  --sharp-dihedral-deg D   starting frontier feature threshold; default 45\n"
         << "  --sample-seed S          deterministic candidate sampling seed; default 1\n\n"
         << "Output arrays:\n"
@@ -1386,6 +1482,7 @@ int main(int argc, char** argv) {
         std::string output_npz;
         std::string input_boundary_json;
         double sample_density = 1000.0;
+        SurfaceSampleMethod sample_method = SurfaceSampleMethod::Random;
         double sharp_dihedral_deg = 45.0;
         std::uint32_t sample_seed = 1;
 
@@ -1417,6 +1514,13 @@ int main(int argc, char** argv) {
                     return EXIT_FAILURE;
                 }
                 sample_density = std::stod(argv[++i]);
+            } else if (arg == "--sample-method") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value after --sample-method\n";
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                sample_method = parse_surface_sample_method(argv[++i]);
             } else if (arg == "--sharp-dihedral-deg") {
                 if (i + 1 >= argc) {
                     std::cerr << "Missing value after --sharp-dihedral-deg\n";
@@ -1485,6 +1589,7 @@ int main(int argc, char** argv) {
 
             std::cout << "Sharp feature constraints: " << const_spaces.size()
                       << " faces at threshold " << sharp_dihedral_deg << " deg\n";
+            std::cout << "Surface sampling method: " << surface_sample_method_name(sample_method) << "\n";
             if (const_spaces.size() == 0) {
                 std::cout
                     << "No sharp feature constraints found. Computing unconstrained field; "
@@ -1572,6 +1677,7 @@ int main(int argc, char** argv) {
                 dir_u,
                 dir_v,
                 sample_density,
+                sample_method,
                 sharp_dihedral_radians,
                 sample_seed
             );

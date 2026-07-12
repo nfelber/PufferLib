@@ -12,10 +12,10 @@
 // - suggested source frontier index [2]
 // - selected source frontier index [2]
 // - valid target count [2]
-// - valid targets: position xyz + normal xyz + path length + kind [MAX_TARGETS * 29]
-#define MAX_FRONTIER_SIZE 2048
-#define MAX_DEGREE 16
-#define MAX_TARGETS 2048
+// - valid targets: position xyz + normal xyz + path length + kind + parity [MAX_TARGETS * 30]
+#define MAX_FRONTIER_SIZE 256
+#define MAX_DEGREE 8
+#define MAX_TARGETS 768
 #define OBS_SIZE ( \
   1 + \
   4 + \
@@ -26,7 +26,7 @@
   2 + \
   2 + \
   2 + \
-  MAX_TARGETS * 29 \
+  MAX_TARGETS * 30 \
 )
 
 #include "quad_meshing_3d.h"
@@ -111,12 +111,22 @@ static void load_surface_paths_from_folder(Env* env, Dict* kwargs) {
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->rng ^= (unsigned int)dict_get(kwargs, "seed")->value;
+    env->max_frontier = (int)dict_get(kwargs, "max_frontier")->value;
+    env->max_candidates = (int)dict_get(kwargs, "max_candidates")->value;
     env->max_degree = (int)dict_get(kwargs, "max_degree")->value;
-    env->candidate_radius_ratio = (float)dict_get(kwargs, "candidate_radius_ratio")->value;
+    QM3_ASSERT(env->max_frontier > 0 && env->max_frontier <= MAX_FRONTIER_SIZE);
+    QM3_ASSERT(env->max_candidates > 0 && env->max_candidates <= MAX_TARGETS);
+    QM3_ASSERT(env->max_degree > 0 && env->max_degree <= MAX_DEGREE);
+    env->candidate_radius_min_ratio = (float)dict_get(kwargs, "candidate_radius_min_ratio")->value;
+    env->candidate_radius_max_ratio = (float)dict_get(kwargs, "candidate_radius_max_ratio")->value;
     env->geodesic_steiner_spacing_ratio = (float)dict_get(kwargs, "geodesic_steiner_spacing_ratio")->value;
     env->target_edge_length_ratio = (float)dict_get(kwargs, "target_edge_length_ratio")->value;
     env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
     env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
+    env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
+    DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
+    QM3_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
+    env->export_obj_path = (const char*)export_obj_path_item->ptr;
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
     env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;

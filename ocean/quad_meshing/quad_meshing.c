@@ -22,6 +22,7 @@ int main() {
     env.target_edge_length_ratio = 1.0;
     env.candidate_radius_min_ratio = 0.5;
     env.candidate_radius_max_ratio = 2.0;
+    env.reward_cross_field = true;
     env.reward_invalid = -0.05;
     env.reward_incomplete = -1.0;
     env.reward_triangle = -0.5;

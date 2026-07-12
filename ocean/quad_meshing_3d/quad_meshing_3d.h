@@ -13,33 +13,6 @@
 #include <stdlib.h>
 #include <sys/time.h>
 
-#ifndef MAX_FRONTIER_SIZE
-#define MAX_FRONTIER_SIZE 2048
-#endif
-
-#ifndef MAX_DEGREE
-#define MAX_DEGREE 16
-#endif
-
-#ifndef MAX_TARGETS
-#define MAX_TARGETS 2048
-#endif
-
-#ifndef OBS_SIZE
-#define OBS_SIZE ( \
-  1 + \
-  4 + \
-  2 + \
-  2 + \
-  MAX_FRONTIER_SIZE * 24 + \
-  MAX_FRONTIER_SIZE * MAX_DEGREE * 2 + \
-  2 + \
-  2 + \
-  2 + \
-  MAX_TARGETS * 29 \
-)
-#endif
-
 typedef struct {
     float perf;
     float score;
@@ -205,8 +178,11 @@ typedef struct {
     const char** shape_paths;
     int shape_count;
     int loaded_shape;
+    int max_frontier;
+    int max_candidates;
     int max_degree;
-    float candidate_radius_ratio;
+    float candidate_radius_min_ratio;
+    float candidate_radius_max_ratio;
     float candidate_radius;
     float geodesic_steiner_spacing_ratio;
     float target_edge_length_ratio;
@@ -215,6 +191,8 @@ typedef struct {
     float starting_frontier_edge_length;
     float episode_max_length_ratio;
     bool prevent_triangles;
+    bool export_obj;
+    const char* export_obj_path;
 
     float reward_invalid;
     float reward_incomplete;
@@ -333,6 +311,18 @@ static const char* qm3_action_result_str(Qm3ActionResult result) {
         case QM3_ACTION_NO_VALID_TARGET: return "no_valid_target";
         default: return "unknown";
     }
+}
+
+static float qm3_candidate_radius_min(const QuadMeshing3DEnv* env) {
+    return fmaxf(env->target_edge_length * env->candidate_radius_min_ratio, 0.0f);
+}
+
+static float qm3_candidate_radius_max(const QuadMeshing3DEnv* env) {
+    return fmaxf(env->target_edge_length * env->candidate_radius_max_ratio, 1e-6f);
+}
+
+static void qm3_maybe_export_obj(QuadMeshing3DEnv* env) {
+    if (env->export_obj) qm3_mesh_dump_obj(&env->mesh, env->export_obj_path);
 }
 
 static const char* qm3_loop_debug_mode_str(int mode) {
@@ -1358,6 +1348,22 @@ static void qm3_reset_sample_disabled(QuadMeshing3DEnv* env) {
     QM3_ASSERT(env->sample_disabled != NULL);
 }
 
+static void qm3_mark_vertex_frontier_dirty(QuadMeshing3DEnv* env, uint32_t vidx) {
+    if (vidx < env->mesh.vertex_count) env->mesh.vertices[vidx].frontier_quality_dirty = true;
+}
+
+static void qm3_mark_edge_frontier_dirty(QuadMeshing3DEnv* env, uint32_t eidx) {
+    if (eidx >= env->mesh.edge_count) return;
+    Qm3MeshEdge* edge = &env->mesh.edges[eidx];
+    qm3_mark_vertex_frontier_dirty(env, edge->a);
+    qm3_mark_vertex_frontier_dirty(env, edge->b);
+}
+
+static void qm3_mark_face_frontier_dirty(QuadMeshing3DEnv* env, const Qm3MeshFace* face) {
+    if (!face) return;
+    for (uint32_t i = 0; i < face->n; ++i) qm3_mark_vertex_frontier_dirty(env, face->vertices[i]);
+}
+
 static void qm3_build_face_loop_segments(const Qm3Mesh* mesh, const Qm3MeshFace* face, Qm3PathSegmentArray* out) {
     qm3_path_segment_clear(out);
     if (!face || face->disabled) return;
@@ -1493,7 +1499,10 @@ static void qm3_prune_graph_after_loop_removal(QuadMeshing3DEnv* env, const Qm3M
     for (uint32_t ei = 0; ei < env->mesh.edge_count; ++ei) {
         Qm3MeshEdge* e = &env->mesh.edges[ei];
         if (e->disabled || qm3_mesh_edge_is_face_boundary(face, ei)) continue;
-        if (env->mesh.vertices[e->a].disabled || env->mesh.vertices[e->b].disabled) qm3_mesh_disable_edge(&env->mesh, ei);
+        if (env->mesh.vertices[e->a].disabled || env->mesh.vertices[e->b].disabled) {
+            qm3_mark_edge_frontier_dirty(env, ei);
+            qm3_mesh_disable_edge(&env->mesh, ei);
+        }
     }
     for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) qm3_mesh_update_frontier_vertex(&env->mesh, vi);
 }
@@ -1793,12 +1802,10 @@ static void qm3_compute_source_candidates(QuadMeshing3DEnv* env) {
     Qm3Vec3 source_pos = source_vertex->pos;
     float radius = env->candidate_radius;
     if (radius <= 0.0f) {
-        float diag = qm3_surface_diag(&env->surface);
-        if (diag <= 1e-8f) diag = 1.0f;
-        float ratio = env->candidate_radius_ratio > 0.0f ? env->candidate_radius_ratio : 0.05f;
-        radius = diag * ratio;
+        radius = qm3_candidate_radius_max(env);
         env->candidate_radius = radius;
     }
+    float min_radius = fminf(qm3_candidate_radius_min(env), radius);
 
     if (!env->geodesic_ready) return;
     double query_start = qm3_time_ms();
@@ -1834,6 +1841,9 @@ static void qm3_compute_source_candidates(QuadMeshing3DEnv* env) {
         if (sample_id >= env->surface.sample_count) continue;
         if (env->sample_disabled && env->sample_disabled[sample_id]) continue;
         if (env->sample_to_graph && env->sample_to_graph[sample_id] >= 0) continue;
+        float distance = INFINITY;
+        qm3_best_sample_prop_node(&env->surface, &env->prop_graph, &env->fmm, sample_id, &distance);
+        if (distance < min_radius) continue;
         Qm3CandidateValidity validity = QM3_CANDIDATE_VALID;
         if (source_vertex->disabled) validity = QM3_CANDIDATE_DISABLED;
         else if (source_vertex->degree >= env->mesh.max_degree) validity = QM3_CANDIDATE_MAX_DEGREE;
@@ -1988,6 +1998,7 @@ static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidat
         candidate->path_length
     );
     if (env->mesh.edge_count > before_edges) {
+        qm3_mark_edge_frontier_dirty(env, edge_idx);
         qm3_insert_graph_tri_edge_segments(env, edge_idx);
         if (inserted_vertex) qm3_insert_graph_tri_vertex(env, target_vidx);
 
@@ -2001,6 +2012,7 @@ static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidat
                 registered++;
                 double loop_start = qm3_time_ms();
                 Qm3MeshFace* face = &env->mesh.faces[before_faces];
+                qm3_mark_face_frontier_dirty(env, face);
                 qm3_add_reward(env, 0.5f * qm3_compute_face_reward(env, face));
                 qm3_build_face_loop_segments(&env->mesh, face, &loop_segments);
                 env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments);
@@ -2015,6 +2027,7 @@ static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidat
                 registered++;
                 double loop_start = qm3_time_ms();
                 Qm3MeshFace* face = &env->mesh.faces[before_faces];
+                qm3_mark_face_frontier_dirty(env, face);
                 qm3_add_reward(env, qm3_compute_face_reward(env, face));
                 qm3_build_face_loop_segments(&env->mesh, face, &loop_segments);
                 env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments);
@@ -2051,8 +2064,15 @@ static void qm3_select_source_frontier(QuadMeshing3DEnv* env, int32_t source_fro
 }
 
 static void quad_meshing_3d_init(QuadMeshing3DEnv* env) {
+    if (env->max_frontier <= 0) env->max_frontier = 4096;
+    if (env->max_candidates <= 0) env->max_candidates = 768;
+    if (env->max_degree <= 0) env->max_degree = 8;
+    if (env->candidate_radius_min_ratio <= 0.0f) env->candidate_radius_min_ratio = 0.5f;
+    if (env->candidate_radius_max_ratio <= 0.0f) env->candidate_radius_max_ratio = 2.0f;
+    if (env->geodesic_steiner_spacing_ratio <= 0.0f) env->geodesic_steiner_spacing_ratio = 0.005f;
+    if (env->export_obj_path == NULL) env->export_obj_path = "quad_meshing_3d.obj";
     qm3_surface_init(&env->surface);
-    qm3_mesh_init(&env->mesh, env->max_degree > 0 ? (uint32_t)env->max_degree : 16);
+    qm3_mesh_init(&env->mesh, (uint32_t)env->max_degree);
     env->loaded_shape = -1;
     env->source_frontier_idx = -1;
     env->target_candidate_idx = -1;
@@ -2063,10 +2083,9 @@ static void quad_meshing_3d_init(QuadMeshing3DEnv* env) {
 }
 
 static void qm3_update_episode_max_length(QuadMeshing3DEnv* env) {
-    float target_area = fmaxf(env->target_quad_area, 1e-12f);
-    float ratio = env->episode_max_length_ratio > 0.0f ? env->episode_max_length_ratio : 1.5f;
-    env->episode_max_length = (int)ceilf((env->surface.info.total_area / target_area) * ratio);
-    if (env->episode_max_length < 1) env->episode_max_length = 1;
+    const float ideal_n_quads = env->surface.info.total_area / env->target_quad_area;
+    const float ideal_episode_length = 2 * ideal_n_quads - env->mesh.frontier_count;
+    env->episode_max_length = (int)ceilf(ideal_episode_length * env->episode_max_length_ratio);
 }
 
 static void qm3_update_target_scale(QuadMeshing3DEnv* env) {
@@ -2081,7 +2100,7 @@ static void qm3_update_target_scale(QuadMeshing3DEnv* env) {
     float avg = count > 0 ? total / (float)count : sqrtf(fmaxf(env->surface.info.total_area, 1e-12f));
     env->starting_frontier_edge_length = avg;
     float ratio = env->target_edge_length_ratio > 0.0f ? env->target_edge_length_ratio : 1.0f;
-    env->target_edge_length = fmaxf(avg * ratio, 1e-6f);
+    env->target_edge_length = avg * ratio;
     env->target_quad_area = env->target_edge_length * env->target_edge_length;
 }
 
@@ -2408,7 +2427,8 @@ static uint16_t qm3_u16_or_max(uint32_t value) {
 
 static uint32_t qm3_valid_target_count_capped(const QuadMeshing3DEnv* env) {
     uint32_t count = 0;
-    for (uint32_t i = 0; i < env->candidate_count && count < MAX_TARGETS; ++i) {
+    uint32_t cap = env->max_candidates;
+    for (uint32_t i = 0; i < env->candidate_count && count < cap; ++i) {
         if (env->candidates[i].path_ok) count++;
     }
     return count;
@@ -2420,9 +2440,11 @@ static int qm3_rand_range(unsigned int* rng, int max_exclusive) {
 
 static void qm3_compute_observations(QuadMeshing3DEnv* env) {
     if (!env->observations) return;
-    memset(env->observations, 0, OBS_SIZE);
-    QM3_ASSERT(env->mesh.frontier_count <= MAX_FRONTIER_SIZE);
-    QM3_ASSERT(env->mesh.max_degree <= MAX_DEGREE);
+    uint32_t max_frontier = env->max_frontier;
+    uint32_t max_degree = env->max_degree;
+    uint32_t max_targets = env->max_candidates;
+    QM3_ASSERT(env->mesh.frontier_count <= max_frontier);
+    QM3_ASSERT(env->mesh.max_degree <= max_degree);
 
     Qm3SerialObsBuffer obs = {.sb = {.data = env->observations, .pos = 0}};
     SerialBuffer* sb = &obs.sb;
@@ -2432,7 +2454,7 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
     serialize_u16(sb, qm3_u16_or_max(env->mesh.frontier_count));
     serialize_u16(sb, qm3_u16_or_max(env->mesh.max_degree));
 
-    for (uint32_t i = 0; i < MAX_FRONTIER_SIZE; ++i) {
+    for (uint32_t i = 0; i < max_frontier; ++i) {
         if (i < env->mesh.frontier_count) {
             uint32_t vidx = env->mesh.frontier[i];
             const Qm3MeshVertex* v = &env->mesh.vertices[vidx];
@@ -2444,12 +2466,12 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
         }
     }
 
-    for (uint32_t i = 0; i < MAX_FRONTIER_SIZE; ++i) {
+    for (uint32_t i = 0; i < max_frontier; ++i) {
         uint32_t written = 0;
         if (i < env->mesh.frontier_count) {
             uint32_t vidx = env->mesh.frontier[i];
             const Qm3MeshVertex* v = &env->mesh.vertices[vidx];
-            for (uint32_t j = 0; j < v->degree && written < MAX_DEGREE; ++j) {
+            for (uint32_t j = 0; j < v->degree && written < max_degree; ++j) {
                 size_t nidx = (size_t)vidx * env->mesh.max_degree + j;
                 int32_t nvidx = env->mesh.neighbors[nidx];
                 int32_t eidx = env->mesh.neighbor_edges[nidx];
@@ -2461,7 +2483,7 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
                 written++;
             }
         }
-        for (; written < MAX_DEGREE; ++written) serialize_u16(sb, UINT16_MAX);
+        for (; written < max_degree; ++written) serialize_u16(sb, UINT16_MAX);
     }
 
     uint16_t suggested = env->mesh.frontier_count > 0
@@ -2476,7 +2498,18 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
     }
 
     uint32_t target_count = qm3_valid_target_count_capped(env);
+    QM3_ASSERT(target_count <= max_targets);
     serialize_u16(sb, qm3_u16_or_max(target_count));
+
+    int* frontier_hop_distance = NULL;
+    int* frontier_hop_queue = NULL;
+    if (env->source_frontier_idx >= 0 && (uint32_t)env->source_frontier_idx < env->mesh.frontier_count) {
+        frontier_hop_distance = (int*)malloc((size_t)env->mesh.frontier_count * sizeof(int));
+        frontier_hop_queue = (int*)malloc((size_t)env->mesh.frontier_count * sizeof(int));
+        QM3_ASSERT(frontier_hop_distance != NULL && frontier_hop_queue != NULL);
+        qm3_compute_frontier_hop_distances(env, env->source_frontier_idx, frontier_hop_distance, frontier_hop_queue);
+    }
+
     uint32_t written = 0;
     for (uint32_t i = 0; i < env->candidate_count && written < target_count; ++i) {
         const Qm3TargetCandidate* candidate = &env->candidates[i];
@@ -2485,38 +2518,71 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
         qm3_serialize_vec3(sb, qm3_candidate_target_normal(env, candidate));
         serialize_float(sb, candidate->path_length);
         serialize_u8(sb, (uint8_t)candidate->kind);
+        uint8_t parity = 1;
+        if (candidate->kind == QM3_TARGET_EXISTING_FRONTIER && candidate->graph_vertex < env->mesh.vertex_count) {
+            int32_t fidx = env->mesh.vertices[candidate->graph_vertex].frontier_index;
+            parity = (frontier_hop_distance && fidx >= 0 && (uint32_t)fidx < env->mesh.frontier_count)
+                ? (uint8_t)(frontier_hop_distance[fidx] >= 0 ? (frontier_hop_distance[fidx] & 1) : 0)
+                : 0;
+        }
+        serialize_u8(sb, parity);
         written++;
     }
+    free(frontier_hop_distance);
+    free(frontier_hop_queue);
 }
 
-static float qm3_compute_frontier_potential(QuadMeshing3DEnv* env) {
-    if (env->mesh.frontier_count == 0) return 0.0f;
+static void qm3_update_vertex_frontier_cache(QuadMeshing3DEnv* env, uint32_t vidx) {
+    if (vidx >= env->mesh.vertex_count) return;
+    Qm3Mesh* mesh = &env->mesh;
+    Qm3MeshVertex* vertex = &mesh->vertices[vidx];
     float edge_length_cost = 0.0f;
     float alignment_cost = 0.0f;
-    float angle_cost = 0.0f;
-    uint32_t open_edges = 0;
-    for (uint32_t ei = 0; ei < env->mesh.edge_count; ++ei) {
-        Qm3MeshEdge* edge = &env->mesh.edges[ei];
+    for (uint32_t i = 0; i < vertex->degree; ++i) {
+        size_t nidx = (size_t)vidx * mesh->max_degree + i;
+        int32_t eidx = mesh->neighbor_edges[nidx];
+        if (eidx < 0) continue;
+        Qm3MeshEdge* edge = &mesh->edges[eidx];
         if (edge->disabled || edge->face_count >= 2) continue;
-        float chord = qm3_edge_chord_length(&env->mesh, edge);
+        float chord = qm3_edge_chord_length(mesh, edge);
         float path = edge->path_length > 0.0f ? edge->path_length : chord;
         edge_length_cost += qm3_open_edge_length_cost_from_chord(chord, env->target_edge_length);
         edge_length_cost += qm3_path_chord_cost(path, chord, env->target_edge_length);
         alignment_cost += qm3_open_edge_alignment_cost(env, edge);
-        open_edges++;
     }
-    for (uint32_t fi = 0; fi < env->mesh.frontier_count; ++fi) {
-        angle_cost += qm3_vertex_open_angle_cost(env, env->mesh.frontier[fi]);
-    }
+    vertex->frontier_edge_length_cost = edge_length_cost;
+    vertex->frontier_alignment_cost = alignment_cost;
+    vertex->frontier_angle_cost = qm3_vertex_open_angle_cost(env, vidx);
+    vertex->frontier_quality_dirty = false;
+}
 
-    float edge_term = open_edges > 0 ? edge_length_cost / (2.0f * (float)open_edges) : 0.0f;
-    float alignment_term = open_edges > 0 ? alignment_cost / (float)open_edges : 0.0f;
-    float angle_term = angle_cost / (float)env->mesh.frontier_count;
+static const Qm3MeshVertex* qm3_get_vertex_frontier_cache(QuadMeshing3DEnv* env, uint32_t vidx) {
+    if (vidx >= env->mesh.vertex_count) return NULL;
+    Qm3MeshVertex* vertex = &env->mesh.vertices[vidx];
+    if (vertex->frontier_quality_dirty) qm3_update_vertex_frontier_cache(env, vidx);
+    return vertex;
+}
+
+static float qm3_compute_frontier_potential(QuadMeshing3DEnv* env) {
+    if (env->mesh.frontier_count == 0) return 0.0f;
+    float frontier_cost = 0.0f;
     float weight_sum = env->frontier_edge_length_weight + env->frontier_alignment_weight + env->frontier_angle_weight;
-    float frontier_cost = weight_sum > 0.0f
-        ? (env->frontier_edge_length_weight * edge_term + env->frontier_alignment_weight * alignment_term + env->frontier_angle_weight * angle_term) / weight_sum
-        : 0.0f;
-    float max_frontier = fmaxf((float)(env->surface.sample_count > 0 ? env->surface.sample_count : env->mesh.frontier_count), 1.0f);
+    float max_degree = fmaxf((float)env->mesh.max_degree, 1.0f);
+    for (uint32_t fi = 0; fi < env->mesh.frontier_count; ++fi) {
+        const Qm3MeshVertex* vertex = qm3_get_vertex_frontier_cache(env, env->mesh.frontier[fi]);
+        if (!vertex) continue;
+        float edge_term = vertex->frontier_edge_length_cost / (2.0f * max_degree);
+        float alignment_term = vertex->frontier_alignment_cost / max_degree;
+        float angle_term = vertex->frontier_angle_cost;
+        if (weight_sum > 0.0f) {
+            frontier_cost += (
+                env->frontier_edge_length_weight * edge_term
+                + env->frontier_alignment_weight * alignment_term
+                + env->frontier_angle_weight * angle_term
+            ) / weight_sum;
+        }
+    }
+    float max_frontier = fmaxf((float)env->max_frontier, 1.0f);
     float highest_degree = 0.0f;
     for (uint32_t i = 0; i < env->mesh.vertex_count; ++i) highest_degree = fmaxf(highest_degree, (float)env->mesh.vertices[i].degree);
 
@@ -2543,7 +2609,7 @@ static void qm3_build_geodesic_state(QuadMeshing3DEnv* env) {
     qm3_free_geodesic_state(env);
     float diag = qm3_surface_diag(&env->surface);
     if (diag <= 1e-8f) diag = 1.0f;
-    float radius_ratio = env->candidate_radius_ratio > 0.0f ? env->candidate_radius_ratio : 0.05f;
+    float radius_ratio = env->candidate_radius_max_ratio > 0.0f ? env->candidate_radius_max_ratio : 2.0f;
     float spacing_ratio = env->geodesic_steiner_spacing_ratio > 0.0f ? env->geodesic_steiner_spacing_ratio : radius_ratio / 10.0f;
     float spacing = fmaxf(diag * spacing_ratio, 1e-4f);
     env->surface_topo = qm3_surface_topo_build(&env->surface);
@@ -2629,12 +2695,14 @@ void c_step(QuadMeshing3DEnv* env) {
         }
     }
 
-    bool terminal = env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0;
+    bool frontier_over_cap = env->mesh.frontier_count > env->max_frontier;
+    bool terminal = env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0 || frontier_over_cap;
     if (terminal) {
         float reward = env->rewards ? env->rewards[0] : env->last_reward;
         if (env->mesh.frontier_count != 0) reward = env->reward_incomplete;
         env->episode_return += reward;
         qm3_add_log(env);
+        qm3_maybe_export_obj(env);
         c_reset(env);
         if (env->rewards) env->rewards[0] = reward;
         if (env->terminals) env->terminals[0] = 1.0f;
@@ -2688,8 +2756,9 @@ void c_render(QuadMeshing3DEnv* env) {
         env->last_reward = 0.0f;
         qm3_commit_target_candidate(env, (uint32_t)env->target_candidate_idx);
         env->episode_return += env->last_reward;
-        if (env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0) {
+        if (env->episode_length >= env->episode_max_length || env->mesh.frontier_count == 0 || env->mesh.frontier_count > env->max_frontier) {
             qm3_add_log(env);
+            qm3_maybe_export_obj(env);
             c_reset(env);
         }
     }

@@ -21,7 +21,7 @@
 #define OBS_TENSOR_T ByteTensor // Pack observations in raw bytes buffer
 #define MAX_FRONTIER_SIZE 512 // Assume less than 2^16
 #define MAX_DEGREE 8
-#define MAX_NEW_CANDIDATES 768 // Assume less than 2^16
+#define MAX_NEW_CANDIDATES 336 // Assume less than 2^16
 
 #define OBS_SIZE ( \
   1 + \
@@ -82,7 +82,8 @@ void my_init(Env* env, Dict* kwargs) {
     DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
     QM_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
     env->export_obj_path = (const char*)export_obj_path_item->ptr;
-    env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
+    env->reward_cross_field = (float)dict_get(kwargs, "reward_cross_field")->value;
+    env->reward_invalid = dict_get(kwargs, "reward_invalid")->value > 0.5;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
     env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
     env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;

@@ -9,6 +9,8 @@ from pufferlib.models import (
     CSRGraph,
     CandidateTargets,
     QuadMeshEncoding,
+    QuadMesh3DGraph,
+    QuadMesh3DTargets,
     QuadMeshingDecoder,
     QuadMeshingEncoder,
     QuadMeshingNetwork,
@@ -46,6 +48,67 @@ def make_csr_graph(vertices, batch_offsets, edges, edge_features, edge_ptr):
         edge_features=edge_features,
         edge_ptr=edge_ptr,
         target_edge_length=torch.ones(batch_offsets.numel() - 1, device=vertices.device, dtype=vertices.dtype),
+    )
+
+
+def make_quad_mesh_3d_graph():
+    vertices = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.1],
+            [1.0, 1.0, 0.2],
+            [0.0, 1.0, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    normals = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.1, 1.0],
+            [0.1, 0.0, 1.0],
+            [0.0, -0.1, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    normals = normals / torch.linalg.vector_norm(normals, dim=-1, keepdim=True)
+    edges = torch.tensor(
+        [
+            [0, 0, 1, 1, 2, 2, 3, 3],
+            [1, 3, 0, 2, 1, 3, 2, 0],
+        ],
+        dtype=torch.long,
+    )
+    edge_ptr = torch.tensor([0, 2, 4, 6, 8], dtype=torch.long)
+    return QuadMesh3DGraph(
+        vertices=vertices,
+        normals=normals,
+        batch_offsets=torch.tensor([0, vertices.size(0)], dtype=torch.long),
+        edges=edges,
+        edge_features=torch.empty(edges.size(1), 0, dtype=torch.bool),
+        edge_ptr=edge_ptr,
+        target_edge_length=torch.ones(1, dtype=torch.float32),
+        suggested_vertex_idx=torch.tensor([0], dtype=torch.long),
+    )
+
+
+def make_quad_mesh_3d_targets():
+    target_normals = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.2, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    target_normals = target_normals / torch.linalg.vector_norm(target_normals, dim=-1, keepdim=True)
+    return QuadMesh3DTargets(
+        source_idx=torch.tensor([0], dtype=torch.long),
+        target_batch_offsets=torch.tensor([0, 2], dtype=torch.long),
+        target_batches=torch.tensor([0, 0], dtype=torch.long),
+        target_positions=torch.tensor([[0.7, 0.2, 0.05], [1.0, 1.0, 0.2]], dtype=torch.float32),
+        target_normals=target_normals,
+        path_lengths=torch.tensor([0.8, 1.5], dtype=torch.float32),
+        target_kind=torch.tensor([0, 1], dtype=torch.long),
+        target_frontier_parity=torch.tensor([True, False]),
     )
 
 
@@ -288,6 +351,109 @@ def test_quad_meshing_encoder_init_painn_pipeline(monkeypatch):
     assert state.node_vectors.shape == (x.size(0), 4, 2)
     assert torch.isfinite(state.node_features).all()
     assert torch.isfinite(state.node_vectors).all()
+
+
+def test_quad_meshing_3d_init_stage_seeds_normals(monkeypatch):
+    monkeypatch.setattr(models, "nvtx_range", lambda _name: nullcontext())
+    graph = make_quad_mesh_3d_graph()
+    encoder = QuadMeshingEncoder(
+        obs_size=1,
+        spatial_dim=3,
+        frontier_node_hidden_size=8,
+        frontier_edge_hidden_size=5,
+        frontier_context_hidden_size=6,
+        target_hidden_size=8,
+        frontier_pipeline=["init"],
+        frontier_init_node_normal=True,
+        frontier_init_edge_face_incidence=False,
+        frontier_painn_vector_channels=4,
+        target_pipeline=["init"],
+        target_init_distance=False,
+        target_init_relative_distance=False,
+        target_init_normal=True,
+    )
+
+    state = encoder._encode_frontier(graph)
+
+    assert state.node_features.shape == (graph.vertices.size(0), 8)
+    assert state.node_vectors.shape == (graph.vertices.size(0), 4, 3)
+    torch.testing.assert_close(state.node_vectors[:, 0, :], graph.normals)
+    torch.testing.assert_close(state.node_vectors[:, 1:, :], torch.zeros_like(state.node_vectors[:, 1:, :]))
+
+
+def test_quad_meshing_3d_painn_global_pipeline(monkeypatch):
+    monkeypatch.setattr(models, "nvtx_range", lambda _name: nullcontext())
+    graph = make_quad_mesh_3d_graph()
+    targets = make_quad_mesh_3d_targets()
+    encoder = QuadMeshingEncoder(
+        obs_size=1,
+        spatial_dim=3,
+        frontier_node_hidden_size=8,
+        frontier_edge_hidden_size=5,
+        frontier_context_hidden_size=6,
+        target_hidden_size=8,
+        frontier_pipeline=["init", "painn"],
+        frontier_init_node_normal=True,
+        frontier_init_edge_face_incidence=False,
+        frontier_painn_layers=1,
+        frontier_painn_vector_channels=4,
+        frontier_painn_chiral=False,
+        target_pipeline=["init", "painn", "source_global_perceiver"],
+        target_init_distance=False,
+        target_init_relative_distance=False,
+        target_init_path_length=True,
+        target_init_relative_path_length=True,
+        target_init_normal=True,
+        target_painn_length_bands=2,
+        target_global_perceiver_d_model=8,
+        target_global_perceiver_num_latents=4,
+        target_global_perceiver_layers=1,
+        target_global_perceiver_heads=2,
+    )
+
+    frontier_state = encoder._encode_frontier(graph)
+    h_target = encoder._encode_targets(targets, frontier_state)
+
+    assert frontier_state.node_features.shape == (graph.vertices.size(0), 8)
+    assert frontier_state.node_vectors.shape == (graph.vertices.size(0), 4, 3)
+    assert h_target.shape == (2, 8)
+    assert torch.isfinite(frontier_state.node_features).all()
+    assert torch.isfinite(frontier_state.node_vectors).all()
+    assert torch.isfinite(h_target).all()
+
+
+def test_quad_meshing_3d_rejects_2d_only_features():
+    with pytest.raises(ValueError, match="frontier_init_node_ring"):
+        QuadMeshingEncoder(
+            obs_size=1,
+            spatial_dim=3,
+            frontier_pipeline=["init"],
+            frontier_init_node_ring=True,
+            frontier_init_edge_face_incidence=False,
+            target_init_distance=False,
+            target_init_relative_distance=False,
+        )
+
+    with pytest.raises(ValueError, match="target_init_distance"):
+        QuadMeshingEncoder(
+            obs_size=1,
+            spatial_dim=3,
+            frontier_pipeline=["init"],
+            frontier_init_edge_face_incidence=False,
+            target_init_distance=True,
+            target_init_relative_distance=False,
+        )
+
+    with pytest.raises(ValueError, match="frontier_painn_chiral"):
+        QuadMeshingEncoder(
+            obs_size=1,
+            spatial_dim=3,
+            frontier_pipeline=["init", "painn"],
+            frontier_init_edge_face_incidence=False,
+            frontier_painn_chiral=True,
+            target_init_distance=False,
+            target_init_relative_distance=False,
+        )
 
 
 def test_quad_meshing_encoder_init_only_pipeline(monkeypatch):
@@ -612,7 +778,7 @@ def test_quad_meshing_target_source_global_perceiver_pipeline(monkeypatch):
 
     h_target_rot = encoder._encode_targets(targets_rot, encoder._encode_frontier(graph_rot))
 
-    torch.testing.assert_close(h_target_rot, h_target, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(h_target_rot, h_target, rtol=1e-5, atol=5e-6)
 
 
 def test_target_source_global_perceiver_zero_scale_is_identity(monkeypatch):

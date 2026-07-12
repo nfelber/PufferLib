@@ -91,3 +91,11 @@ CrossFieldQuery cross_field_query(const CrossField* field, Vec2 p) {
     QM_ASSERT(false);
     return (CrossFieldQuery){{0.0f, 0.0f}, {0.0f, 0.0f}};
 }
+
+// [0, 1]
+float cross_field_alignment(const CrossFieldQuery* field, Vec2 unit_dir) {
+    const float du = dot2(unit_dir, field->u);
+    const float dv = dot2(unit_dir, field->v);
+    const float s = fmaxf(du * du, dv * dv); // [0.5, 1]
+    return 2.0f * s - 1.0f;
+}

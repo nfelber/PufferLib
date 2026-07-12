@@ -627,12 +627,12 @@ def _rotate90(v):
 
 class SE2PaiNNMessagePassing2D(nn.Module):
     """
-    PaiNN-like SO(2)-equivariant message passing for 2D graphs.
+    PaiNN-like equivariant message passing for 2D/3D graphs.
 
     Scalar node features are invariant. Vector node features have shape
-    [N, C, 2] and rotate with the input coordinates. If chiral=True, signed
-    cross/rotate90 terms are available to the network, preserving orientation
-    sensitivity similar to the signed sine in SE2AngleMessagePassing.
+    [N, C, spatial_dim] and rotate with the input coordinates. If chiral=True,
+    signed cross/rotate90 terms are available to the 2D network, preserving
+    orientation sensitivity similar to the signed sine in SE2AngleMessagePassing.
     """
 
     def __init__(
@@ -644,15 +644,21 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         length_bands=4,
         hidden_dim=128,
         chiral=True,
+        spatial_dim=2,
         eps=1e-8,
     ):
         super().__init__()
         if vector_channels < 1:
             raise ValueError("vector_channels must be at least 1.")
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if chiral and spatial_dim != 2:
+            raise ValueError("chiral PaiNN terms are only implemented for spatial_dim=2.")
 
         self.edge_cont_dim = edge_cont_dim
         self.vector_channels = vector_channels
         self.chiral = chiral
+        self.spatial_dim = spatial_dim
         self.eps = eps
         self.out_dim = out_dim
         self.scalar_residual = node_dim == out_dim
@@ -688,9 +694,11 @@ class SE2PaiNNMessagePassing2D(nn.Module):
         if self.edge_cont_dim > 0 and edge_cont is None:
             raise ValueError("edge_cont must be provided.")
         if vectors is None:
-            vectors = h.new_zeros(h.size(0), self.vector_channels, 2)
-        if vectors.shape != (h.size(0), self.vector_channels, 2):
-            raise ValueError("vectors must have shape [N, vector_channels, 2].")
+            vectors = h.new_zeros(h.size(0), self.vector_channels, self.spatial_dim)
+        if vectors.shape != (h.size(0), self.vector_channels, self.spatial_dim):
+            raise ValueError(
+                f"vectors must have shape [N, vector_channels, {self.spatial_dim}]."
+            )
 
         if edge_geometry is None:
             src = edge_index[0]
@@ -731,7 +739,7 @@ class SE2PaiNNMessagePassing2D(nn.Module):
 
         num_nodes = h.size(0)
         agg_s = torch.zeros(num_nodes, scalar_msg.size(-1), device=h.device, dtype=h.dtype)
-        agg_v = torch.zeros(num_nodes, self.vector_channels, 2, device=h.device, dtype=h.dtype)
+        agg_v = torch.zeros(num_nodes, self.vector_channels, self.spatial_dim, device=h.device, dtype=h.dtype)
         agg_s.index_add_(0, dst, scalar_msg)
         agg_v.index_add_(0, dst, v_msg)
 
@@ -788,6 +796,7 @@ class QuadMesh3DTargets:
     target_normals: torch.Tensor        # [Q, 3]
     path_lengths: torch.Tensor          # [Q]
     target_kind: torch.Tensor           # [Q], 0=new sample, 1=frontier
+    target_frontier_parity: torch.Tensor # [Q] parity of hop distance from source; new samples are odd
 
 
 # =============================================================================
@@ -1430,6 +1439,7 @@ def _qm3_scatter_targets_kernel(
     target_normals,
     path_lengths,
     target_kind,
+    target_frontier_parity,
     target_batches,
     OBS_SIZE: tl.constexpr,
     F_CAP: tl.constexpr,
@@ -1447,7 +1457,7 @@ def _qm3_scatter_targets_kernel(
     out = tl.load(target_batch_offsets + b) + j
 
     targets_base = row + 9 + F_CAP * 24 + F_CAP * D * 2 + 2 + 2 + 2
-    base = targets_base + j * 29
+    base = targets_base + j * 30
     px = _load_f32_le(obs, base + 0, valid)
     py = _load_f32_le(obs, base + 4, valid)
     pz = _load_f32_le(obs, base + 8, valid)
@@ -1456,6 +1466,7 @@ def _qm3_scatter_targets_kernel(
     nz = _load_f32_le(obs, base + 20, valid)
     path = _load_f32_le(obs, base + 24, valid)
     kind = tl.load(obs + base + 28, mask=valid, other=0).to(tl.int64)
+    parity = tl.load(obs + base + 29, mask=valid, other=0) != 0
 
     tl.store(target_positions + out * 3 + 0, px, mask=valid)
     tl.store(target_positions + out * 3 + 1, py, mask=valid)
@@ -1465,6 +1476,7 @@ def _qm3_scatter_targets_kernel(
     tl.store(target_normals + out * 3 + 2, nz, mask=valid)
     tl.store(path_lengths + out, path, mask=valid)
     tl.store(target_kind + out, kind, mask=valid)
+    tl.store(target_frontier_parity + out, parity, mask=valid)
     tl.store(target_batches + out, b, mask=valid)
 
 
@@ -2045,6 +2057,7 @@ class QuadMesh3DObservationDeserializer:
             self.target_normals = torch.empty((self.Q_CAP, 3), dtype=torch.float32, device=self.device)
             self.path_lengths = torch.empty((self.Q_CAP,), dtype=torch.float32, device=self.device)
             self.target_kind = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
+            self.target_frontier_parity = torch.empty((self.Q_CAP,), dtype=torch.bool, device=self.device)
             self.target_batches = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
 
             self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
@@ -2164,6 +2177,7 @@ class QuadMesh3DObservationDeserializer:
                 self.target_normals,
                 self.path_lengths,
                 self.target_kind,
+                self.target_frontier_parity,
                 self.target_batches,
                 OBS_SIZE=self.obs_size,
                 F_CAP=self.F_CAP,
@@ -2201,6 +2215,7 @@ class QuadMesh3DObservationDeserializer:
             target_normals=self.target_normals[:Q],
             path_lengths=self.path_lengths[:Q],
             target_kind=self.target_kind[:Q],
+            target_frontier_parity=self.target_frontier_parity[:Q],
         )
 
     @torch.no_grad()
@@ -2403,6 +2418,50 @@ class FourierEncoder2D(nn.Module):
         return feat
 
 
+class FourierEncoderND(nn.Module):
+    def __init__(
+        self,
+        num_bands: int,
+        coord_dim: int,
+        max_freq: Optional[float] = None,
+        include_input: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_bands < 0:
+            raise ValueError("num_bands can't be negative.")
+        if coord_dim < 1:
+            raise ValueError("coord_dim must be at least 1.")
+        if max_freq is not None and max_freq <= 0:
+            raise ValueError("max_freq must be positive.")
+        self.num_bands = num_bands
+        self.coord_dim = coord_dim
+        self.include_input = include_input
+        if max_freq is None:
+            freq_bands = 2.0 ** torch.arange(num_bands, dtype=torch.float32)
+        else:
+            freq_bands = torch.logspace(
+                0.0, math.log2(max_freq), steps=num_bands, base=2.0
+            ).to(dtype=torch.float32)
+        self.register_buffer("freq_bands", freq_bands, persistent=False)
+
+    @property
+    def out_dim(self) -> int:
+        base = 2 * self.coord_dim * self.num_bands
+        return base + self.coord_dim if self.include_input else base
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        if coords.shape[-1] != self.coord_dim:
+            raise ValueError(f"Expected coords with last dimension size {self.coord_dim}.")
+        coords = coords.to(dtype=torch.float32)
+        scaled = coords.unsqueeze(-1) * self.freq_bands
+        scaled = 2.0 * math.pi * scaled
+        feat = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1)
+        feat = feat.flatten(-2)
+        if self.include_input:
+            feat = torch.cat([coords, feat], dim=-1)
+        return feat
+
+
 class FourierEncoder1D(nn.Module):
     def __init__(
         self,
@@ -2504,7 +2563,7 @@ class FrontierState:
     node_features: torch.Tensor       # [N, node_dim]
     edge_features: torch.Tensor       # [E, edge_dim]
     context_features: torch.Tensor    # [B, context_dim] or empty
-    node_vectors: torch.Tensor | None = None  # [N, C, 2], optional equivariant features
+    node_vectors: torch.Tensor | None = None  # [N, C, spatial_dim], optional equivariant features
 
 
 class FrontierInitStage(nn.Module):
@@ -2513,8 +2572,11 @@ class FrontierInitStage(nn.Module):
         node_hidden_size,
         edge_hidden_size,
         pos_bands,
+        spatial_dim=2,
+        vector_channels=16,
         node_position=True,
         node_ring=False,
+        node_normal=False,
         node_ring_n_neighbors=3,
         edge_midpoint=True,
         edge_length=True,
@@ -2526,10 +2588,23 @@ class FrontierInitStage(nn.Module):
         eps=1e-8,
     ):
         super().__init__()
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if node_ring and spatial_dim != 2:
+            raise ValueError("frontier_init_node_ring is only supported for spatial_dim=2.")
+        if edge_face_incidence and spatial_dim != 2:
+            raise ValueError("frontier_init_edge_face_incidence is only supported for spatial_dim=2.")
+        if node_normal and spatial_dim != 3:
+            raise ValueError("frontier_init_node_normal requires spatial_dim=3.")
+        if node_normal and vector_channels < 1:
+            raise ValueError("frontier_init_node_normal requires at least one vector channel.")
         self.node_hidden_size = node_hidden_size
         self.edge_hidden_size = edge_hidden_size
+        self.spatial_dim = spatial_dim
+        self.vector_channels = vector_channels
         self.node_position = node_position
         self.node_ring = node_ring
+        self.node_normal = node_normal
         self.node_ring_n_neighbors = node_ring_n_neighbors
         self.edge_midpoint = edge_midpoint
         self.edge_length = edge_length
@@ -2539,7 +2614,7 @@ class FrontierInitStage(nn.Module):
         self.edge_direction = edge_direction
         self.edge_face_incidence = edge_face_incidence
         self.eps = eps
-        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+        self.pos_encoder = FourierEncoderND(num_bands=pos_bands, coord_dim=spatial_dim, include_input=True)
 
         node_in_dim = 0
         if node_position:
@@ -2559,7 +2634,7 @@ class FrontierInitStage(nn.Module):
         if edge_relative_length:
             edge_in_dim += 1
         if edge_direction:
-            edge_in_dim += 2
+            edge_in_dim += spatial_dim
         if edge_face_incidence:
             edge_in_dim += 2
 
@@ -2608,13 +2683,24 @@ class FrontierInitStage(nn.Module):
         if self.edge_relative_length:
             parts.append((length - target_length) / (length + target_length + self.eps))
         if self.edge_direction:
-            parts.append(self._canonical_direction(delta, length, self.eps))
+            if self.spatial_dim == 2:
+                parts.append(self._canonical_direction(delta, length, self.eps))
+            else:
+                parts.append(delta / length.clamp_min(self.eps))
         if self.edge_face_incidence:
             parts.append(graph.edge_features.to(dtype=graph.vertices.dtype))
 
         if not parts:
             return self.edge_initial.unsqueeze(0).expand(graph.edges.size(1), -1)
         return self.edge_proj(torch.cat(parts, dim=-1))
+
+    def _node_vectors(self, graph):
+        if not self.node_normal:
+            return None
+        normals = graph.normals.to(dtype=graph.vertices.dtype)
+        vectors = graph.vertices.new_zeros(graph.vertices.size(0), self.vector_channels, self.spatial_dim)
+        vectors[:, 0, :] = normals
+        return vectors
 
     def forward(self, state):
         graph = state.graph
@@ -2623,7 +2709,7 @@ class FrontierInitStage(nn.Module):
             node_features=self._node_features(graph),
             edge_features=self._edge_features(graph),
             context_features=graph.vertices.new_empty(0, 0),
-            node_vectors=None,
+            node_vectors=self._node_vectors(graph),
         )
 
 
@@ -2673,11 +2759,17 @@ class PaiNNFrontierStage(nn.Module):
         vector_channels=16,
         length_bands=4,
         chiral=True,
+        spatial_dim=2,
     ):
         super().__init__()
         if num_layers < 1:
             raise ValueError("frontier_painn_layers must be at least 1.")
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if chiral and spatial_dim != 2:
+            raise ValueError("frontier_painn_chiral is only supported for spatial_dim=2.")
         self.vector_channels = vector_channels
+        self.spatial_dim = spatial_dim
         self.layers = nn.ModuleList([
             SE2PaiNNMessagePassing2D(
                 node_dim=node_hidden_size,
@@ -2687,6 +2779,7 @@ class PaiNNFrontierStage(nn.Module):
                 length_bands=length_bands,
                 hidden_dim=node_hidden_size,
                 chiral=chiral,
+                spatial_dim=spatial_dim,
             )
             for _ in range(num_layers)
         ])
@@ -2695,7 +2788,9 @@ class PaiNNFrontierStage(nn.Module):
         h = state.node_features
         vectors = state.node_vectors
         if vectors is None:
-            vectors = h.new_zeros(h.size(0), self.vector_channels, 2)
+            vectors = h.new_zeros(h.size(0), self.vector_channels, self.spatial_dim)
+        elif vectors.shape[1:] != (self.vector_channels, self.spatial_dim):
+            raise ValueError("frontier node_vectors do not match frontier_painn_vector_channels/spatial_dim.")
 
         src = state.graph.edges[0]
         dst = state.graph.edges[1]
@@ -2886,6 +2981,7 @@ class FrontierPerceiverStage(nn.Module):
 class TargetState:
     targets: CandidateTargets
     target_features: torch.Tensor  # [Q, target_dim]
+    target_vectors: torch.Tensor | None = None  # [Q, C, spatial_dim], optional equivariant features
 
 
 class TargetInitStage(nn.Module):
@@ -2893,25 +2989,49 @@ class TargetInitStage(nn.Module):
         self,
         target_hidden_size,
         pos_bands,
+        spatial_dim=2,
+        vector_channels=16,
         include_ring_frame_pos=True,
         include_distance=True,
         include_target_length=True,
         include_target_log_length=True,
         include_relative_distance=True,
+        include_path_length=False,
+        include_relative_path_length=False,
+        include_normal=False,
         include_boundary_flag=True,
         include_frontier_parity=False,
         eps=1e-8,
     ):
         super().__init__()
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if include_ring_frame_pos and spatial_dim != 2:
+            raise ValueError("target_init_ring_frame_pos is only supported for spatial_dim=2.")
+        if include_distance and spatial_dim != 2:
+            raise ValueError("target_init_distance is only supported for spatial_dim=2.")
+        if include_relative_distance and spatial_dim != 2:
+            raise ValueError("target_init_relative_distance is only supported for spatial_dim=2.")
+        if include_normal and spatial_dim != 3:
+            raise ValueError("target_init_normal requires spatial_dim=3.")
+        if include_normal and vector_channels < 1:
+            raise ValueError("target_init_normal requires at least one vector channel.")
+        if (include_path_length or include_relative_path_length) and spatial_dim != 3:
+            raise ValueError("target_init_path_length features require spatial_dim=3.")
+        self.spatial_dim = spatial_dim
+        self.vector_channels = vector_channels
         self.include_ring_frame_pos = include_ring_frame_pos
         self.include_distance = include_distance
         self.include_target_length = include_target_length
         self.include_target_log_length = include_target_log_length
         self.include_relative_distance = include_relative_distance
+        self.include_path_length = include_path_length
+        self.include_relative_path_length = include_relative_path_length
+        self.include_normal = include_normal
         self.include_boundary_flag = include_boundary_flag
         self.include_frontier_parity = include_frontier_parity
         self.eps = eps
-        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+        self.pos_encoder = FourierEncoderND(num_bands=pos_bands, coord_dim=spatial_dim, include_input=True)
 
         in_dim = 0
         if include_ring_frame_pos:
@@ -2923,6 +3043,10 @@ class TargetInitStage(nn.Module):
         if include_target_log_length:
             in_dim += 1
         if include_relative_distance:
+            in_dim += 1
+        if include_path_length:
+            in_dim += 1
+        if include_relative_path_length:
             in_dim += 1
         if include_boundary_flag:
             in_dim += 1
@@ -2983,8 +3107,19 @@ class TargetInitStage(nn.Module):
             distance_features = distances.unsqueeze(-1)
             parts.append((distance_features - target_length) / (distance_features + target_length + self.eps))
 
+        if self.include_path_length:
+            path_length = targets.path_lengths.unsqueeze(-1).to(dtype=targets.target_positions.dtype)
+            parts.append(path_length)
+
+        if self.include_relative_path_length:
+            path_length = targets.path_lengths.unsqueeze(-1).to(dtype=targets.target_positions.dtype)
+            parts.append((path_length - target_length) / (path_length + target_length + self.eps))
+
         if self.include_boundary_flag:
-            boundary_mask = targets.target_idx >= 0
+            if hasattr(targets, "target_idx"):
+                boundary_mask = targets.target_idx >= 0
+            else:
+                boundary_mask = targets.target_kind == 1
             parts.append(boundary_mask.to(targets.target_positions.dtype).unsqueeze(-1))
 
         if self.include_frontier_parity:
@@ -2994,7 +3129,12 @@ class TargetInitStage(nn.Module):
             target_features = self.target_initial.unsqueeze(0).expand(Q, -1)
         else:
             target_features = self.target_proj(torch.cat(parts, dim=-1))
-        return TargetState(targets=targets, target_features=target_features)
+        target_vectors = None
+        if self.include_normal:
+            normals = targets.target_normals.to(dtype=targets.target_positions.dtype)
+            target_vectors = targets.target_positions.new_zeros(Q, self.vector_channels, self.spatial_dim)
+            target_vectors[:, 0, :] = normals
+        return TargetState(targets=targets, target_features=target_features, target_vectors=target_vectors)
 
 
 class SE2TargetStage(nn.Module):
@@ -3027,7 +3167,7 @@ class SE2TargetStage(nn.Module):
         total = int(counts.sum().item())
         if total == 0:
             agg = torch.zeros(Q, self.phi_m.net[-1].out_features, device=h_target.device, dtype=h_target.dtype)
-            return TargetState(targets, self.phi_h(torch.cat([h_target, agg], dim=-1)))
+            return TargetState(targets, self.phi_h(torch.cat([h_target, agg], dim=-1)), state.target_vectors)
 
         target_idx = torch.repeat_interleave(torch.arange(Q, device=h_target.device), counts)
         repeated_source = source[target_idx]
@@ -3063,7 +3203,7 @@ class SE2TargetStage(nn.Module):
         agg = torch.zeros(Q, msg.size(-1), device=msg.device, dtype=msg.dtype)
         agg.index_add_(0, target_idx, msg)
         agg = agg / counts.clamp_min(1).to(msg.dtype).unsqueeze(-1)
-        return TargetState(targets, self.phi_h(torch.cat([h_target, agg], dim=-1)))
+        return TargetState(targets, self.phi_h(torch.cat([h_target, agg], dim=-1)), state.target_vectors)
 
 
 class PaiNNTargetStage(nn.Module):
@@ -3074,23 +3214,47 @@ class PaiNNTargetStage(nn.Module):
         vector_channels=16,
         length_bands=4,
         chiral=True,
+        spatial_dim=2,
+        use_target_vectors=False,
     ):
         super().__init__()
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if chiral and spatial_dim != 2:
+            raise ValueError("frontier_painn_chiral is only supported for spatial_dim=2.")
         self.vector_channels = vector_channels
         self.chiral = chiral
+        self.spatial_dim = spatial_dim
+        self.use_target_vectors = bool(use_target_vectors)
         self.eps = 1e-8
         self.length_encoder = FourierEncoder1D(num_bands=length_bands, include_input=True)
         vector_scalar_dim = vector_channels * (3 if chiral else 2)
-        self.mlp = _MLP(
+        input_dim = (
             target_hidden_size
             + frontier_node_hidden_size
             + self.length_encoder.out_dim
-            + vector_scalar_dim,
+            + vector_scalar_dim
+            + (vector_scalar_dim if self.use_target_vectors else 0)
+        )
+        self.mlp = _MLP(
+            input_dim,
             target_hidden_size,
             target_hidden_size,
             num_layers=2,
             final_activation=False,
         )
+
+    def _vector_scalars(self, vectors, direction):
+        dot = (vectors * direction.unsqueeze(1)).sum(dim=-1)
+        norm = torch.linalg.vector_norm(vectors, dim=-1)
+        parts = [dot, norm]
+        if self.chiral:
+            cross = (
+                vectors[..., 0] * direction[:, None, 1]
+                - vectors[..., 1] * direction[:, None, 0]
+            )
+            parts.append(cross)
+        return torch.cat(parts, dim=-1)
 
     def forward(self, state, frontier_state):
         graph = frontier_state.graph
@@ -3105,30 +3269,30 @@ class PaiNNTargetStage(nn.Module):
         delta = targets.target_positions - graph.vertices[source]
         length = torch.linalg.vector_norm(delta, dim=-1, keepdim=True).clamp_min(self.eps)
         direction = delta / length
+        encoded_length = targets.path_lengths.unsqueeze(-1).to(dtype=length.dtype) if self.spatial_dim == 3 and hasattr(targets, "path_lengths") else length
 
         vectors = frontier_state.node_vectors
         if vectors is None:
-            vectors = h_target.new_zeros(graph.vertices.size(0), self.vector_channels, 2)
-        elif vectors.shape[1:] != (self.vector_channels, 2):
-            raise ValueError("frontier node_vectors do not match target_painn_vector_channels.")
+            vectors = h_target.new_zeros(graph.vertices.size(0), self.vector_channels, self.spatial_dim)
+        elif vectors.shape[1:] != (self.vector_channels, self.spatial_dim):
+            raise ValueError("frontier node_vectors do not match target_painn_vector_channels/spatial_dim.")
         source_vectors = vectors[source]
-        dot = (source_vectors * direction.unsqueeze(1)).sum(dim=-1)
-        norm = torch.linalg.vector_norm(source_vectors, dim=-1)
-        vector_parts = [dot, norm]
-        if self.chiral:
-            cross = (
-                source_vectors[..., 0] * direction[:, None, 1]
-                - source_vectors[..., 1] * direction[:, None, 0]
-            )
-            vector_parts.append(cross)
+        vector_parts = [self._vector_scalars(source_vectors, direction)]
+        if self.use_target_vectors:
+            target_vectors = state.target_vectors
+            if target_vectors is None:
+                target_vectors = h_target.new_zeros(Q, self.vector_channels, self.spatial_dim)
+            elif target_vectors.shape[1:] != (self.vector_channels, self.spatial_dim):
+                raise ValueError("target_vectors do not match target_painn_vector_channels/spatial_dim.")
+            vector_parts.append(self._vector_scalars(target_vectors, direction))
 
         target_features = self.mlp(torch.cat([
             h_target,
             frontier_state.node_features[source],
-            self.length_encoder(length),
+            self.length_encoder(encoded_length),
             *vector_parts,
         ], dim=-1))
-        return TargetState(targets, target_features)
+        return TargetState(targets, target_features, state.target_vectors)
 
 
 class SourceGlobalPerceiverTargetStage(nn.Module):
@@ -3150,6 +3314,8 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         max_frontier=0,
         max_candidates=0,
         compile_stage=False,
+        spatial_dim=2,
+        use_target_vectors=False,
         eps=1e-8,
     ):
         super().__init__()
@@ -3160,9 +3326,15 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
             raise ValueError("target_global_perceiver_layers must be at least 1.")
         if d_model % num_heads != 0:
             raise ValueError("target_global_perceiver_d_model must be divisible by target_global_perceiver_heads.")
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
+        if chiral and spatial_dim != 2:
+            raise ValueError("frontier_painn_chiral is only supported for spatial_dim=2.")
 
         self.vector_channels = vector_channels
         self.chiral = chiral
+        self.spatial_dim = spatial_dim
+        self.use_target_vectors = bool(use_target_vectors)
         self.eps = eps
         self.fixed_shapes = bool(fixed_shapes)
         self.max_frontier = int(max_frontier)
@@ -3177,6 +3349,8 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         length_dim = self.length_encoder.out_dim
         frontier_token_dim = 2 * frontier_node_hidden_size + length_dim + 2 * vector_scalar_dim
         target_query_dim = target_hidden_size + frontier_node_hidden_size + length_dim + vector_scalar_dim
+        if self.use_target_vectors:
+            target_query_dim += vector_scalar_dim
 
         self.frontier_token_proj = nn.Sequential(
             nn.LayerNorm(frontier_token_dim),
@@ -3214,9 +3388,9 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         graph = frontier_state.graph
         vectors = frontier_state.node_vectors
         if vectors is None:
-            return graph.vertices.new_zeros(graph.vertices.size(0), self.vector_channels, 2)
-        if vectors.shape[1:] != (self.vector_channels, 2):
-            raise ValueError("frontier node_vectors do not match frontier_painn_vector_channels.")
+            return graph.vertices.new_zeros(graph.vertices.size(0), self.vector_channels, self.spatial_dim)
+        if vectors.shape[1:] != (self.vector_channels, self.spatial_dim):
+            raise ValueError("frontier node_vectors do not match frontier_painn_vector_channels/spatial_dim.")
         return vectors
 
     def _vector_scalars(self, vectors, direction):
@@ -3298,12 +3472,24 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         source_for_target = source_per_batch[targets.target_batches]
         target_delta = targets.target_positions - graph.vertices[source_for_target]
         target_length, target_direction = self._directions(target_delta)
+        encoded_target_length = (
+            targets.path_lengths.unsqueeze(-1).to(dtype=target_length.dtype)
+            if self.spatial_dim == 3 and hasattr(targets, "path_lengths")
+            else target_length
+        )
         target_parts = [
             h_target,
             frontier_state.node_features[source_for_target],
-            self.length_encoder(target_length),
+            self.length_encoder(encoded_target_length),
             self._vector_scalars(vectors[source_for_target], target_direction),
         ]
+        if self.use_target_vectors:
+            target_vectors = state.target_vectors
+            if target_vectors is None:
+                target_vectors = h_target.new_zeros(Q, self.vector_channels, self.spatial_dim)
+            elif target_vectors.shape[1:] != (self.vector_channels, self.spatial_dim):
+                raise ValueError("target_vectors do not match target_painn_vector_channels/spatial_dim.")
+            target_parts.append(self._vector_scalars(target_vectors, target_direction))
         target_queries = self.target_query_proj(torch.cat(target_parts, dim=-1))
         target_counts = targets.target_batch_offsets[1:] - targets.target_batch_offsets[:-1]
         if self.fixed_shapes:
@@ -3325,7 +3511,7 @@ class SourceGlobalPerceiverTargetStage(nn.Module):
         decoded_targets = decoded[targets.target_batches, pos]
         target_update = self.target_out(torch.cat([h_target, decoded_targets], dim=-1))
         target_features = h_target + self.global_residual_scale * target_update
-        return TargetState(targets, target_features)
+        return TargetState(targets, target_features, state.target_vectors)
 
     def forward(self, state, frontier_state):
         if not self.compile_stage or not state.target_features.is_cuda:
@@ -3360,7 +3546,7 @@ class TargetSourceConditionStage(nn.Module):
             state.target_features,
             frontier_state.node_features[source],
         ], dim=-1))
-        return TargetState(targets, target_features)
+        return TargetState(targets, target_features, state.target_vectors)
 
 
 @triton.jit
@@ -3829,9 +4015,11 @@ class QuadMeshingEncoder(nn.Module):
             frontier_context_hidden_size=128,
             target_hidden_size=128,
             pos_bands=6,
+            spatial_dim=2,
             frontier_pipeline=("init", "se2"),
             frontier_init_node_position=False,
             frontier_init_node_ring=False,
+            frontier_init_node_normal=False,
             frontier_init_node_ring_n_neighbors=3,
             frontier_init_edge_midpoint=False,
             frontier_init_edge_length=True,
@@ -3860,6 +4048,9 @@ class QuadMeshingEncoder(nn.Module):
             target_init_target_length=True,
             target_init_target_log_length=True,
             target_init_relative_distance=True,
+            target_init_path_length=False,
+            target_init_relative_path_length=False,
+            target_init_normal=False,
             target_init_boundary_flag=True,
             target_init_frontier_parity=False,
             target_painn_length_bands=4,
@@ -3876,7 +4067,10 @@ class QuadMeshingEncoder(nn.Module):
             **kwargs
     ):
         super().__init__()
+        if spatial_dim not in (2, 3):
+            raise ValueError("spatial_dim must be 2 or 3.")
 
+        self.spatial_dim = spatial_dim
         self.max_frontier = max_frontier
         self.max_degree = max_degree
         self.max_candidates = max_candidates
@@ -3886,7 +4080,7 @@ class QuadMeshingEncoder(nn.Module):
         self.frontier_context_hidden_size = frontier_context_hidden_size
         self.target_hidden_size = target_hidden_size
         self.frontier_init_node_ring_n_neighbors = frontier_init_node_ring_n_neighbors
-        self.pos_encoder = FourierEncoder2D(num_bands=pos_bands, include_input=True)
+        self.pos_encoder = FourierEncoderND(num_bands=pos_bands, coord_dim=spatial_dim, include_input=True)
 
         if isinstance(frontier_pipeline, str):
             frontier_pipeline = [stage.strip() for stage in frontier_pipeline.split(",") if stage.strip()]
@@ -3903,9 +4097,12 @@ class QuadMeshingEncoder(nn.Module):
                     node_hidden_size=frontier_node_hidden_size,
                     edge_hidden_size=frontier_edge_hidden_size,
                     pos_bands=pos_bands,
+                    spatial_dim=spatial_dim,
+                    vector_channels=frontier_painn_vector_channels,
                     node_ring_n_neighbors=frontier_init_node_ring_n_neighbors,
                     node_position=frontier_init_node_position,
                     node_ring=frontier_init_node_ring,
+                    node_normal=frontier_init_node_normal,
                     edge_midpoint=frontier_init_edge_midpoint,
                     edge_length=frontier_init_edge_length,
                     edge_target_length=frontier_init_edge_target_length,
@@ -3930,6 +4127,8 @@ class QuadMeshingEncoder(nn.Module):
                     update_context=frontier_perceiver_update_context,
                 ))
             elif stage == "se2":
+                if spatial_dim != 2:
+                    raise ValueError("frontier stage 'se2' is only supported for spatial_dim=2.")
                 stages.append(SE2FrontierStage(
                     node_hidden_size=frontier_node_hidden_size,
                     edge_hidden_size=frontier_edge_hidden_size,
@@ -3943,6 +4142,7 @@ class QuadMeshingEncoder(nn.Module):
                     vector_channels=frontier_painn_vector_channels,
                     length_bands=frontier_painn_length_bands,
                     chiral=frontier_painn_chiral,
+                    spatial_dim=spatial_dim,
                 ))
             else:
                 raise ValueError(f"Unknown frontier stage: {stage!r}.")
@@ -3962,15 +4162,22 @@ class QuadMeshingEncoder(nn.Module):
                 target_stages.append(TargetInitStage(
                     target_hidden_size=target_hidden_size,
                     pos_bands=pos_bands,
+                    spatial_dim=spatial_dim,
+                    vector_channels=frontier_painn_vector_channels,
                     include_ring_frame_pos=target_init_ring_frame_pos,
                     include_distance=target_init_distance,
                     include_target_length=target_init_target_length,
                     include_target_log_length=target_init_target_log_length,
                     include_relative_distance=target_init_relative_distance,
+                    include_path_length=target_init_path_length,
+                    include_relative_path_length=target_init_relative_path_length,
+                    include_normal=target_init_normal,
                     include_boundary_flag=target_init_boundary_flag,
                     include_frontier_parity=target_init_frontier_parity,
                 ))
             elif stage == "se2":
+                if spatial_dim != 2:
+                    raise ValueError("target stage 'se2' is only supported for spatial_dim=2.")
                 target_stages.append(SE2TargetStage(
                     target_hidden_size=target_hidden_size,
                     frontier_node_hidden_size=frontier_node_hidden_size,
@@ -3983,6 +4190,8 @@ class QuadMeshingEncoder(nn.Module):
                     vector_channels=frontier_painn_vector_channels,
                     length_bands=target_painn_length_bands,
                     chiral=frontier_painn_chiral,
+                    spatial_dim=spatial_dim,
+                    use_target_vectors=target_init_normal,
                 ))
             elif stage == "source_global_perceiver":
                 target_stages.append(SourceGlobalPerceiverTargetStage(
@@ -4002,6 +4211,8 @@ class QuadMeshingEncoder(nn.Module):
                     max_frontier=max_frontier,
                     max_candidates=max_candidates,
                     compile_stage=target_global_perceiver_compile,
+                    spatial_dim=spatial_dim,
+                    use_target_vectors=target_init_normal,
                 ))
             elif stage == "source_condition":
                 target_stages.append(TargetSourceConditionStage(
@@ -4060,16 +4271,29 @@ class QuadMeshingEncoder(nn.Module):
         # SUBSTEP 0
         if B0 > 0:
             with nvtx_range("deserialize_observation (substep 0)"):
-                graph0 = deserialize_observation(
-                    obs,
-                    substep0_idx,
-                    D=self.max_degree,
-                    F_CAP=self.max_frontier,
-                    deserialize_candidates=False,
-                    exact_output=True,
-                    copy_obs=False,
-                    use_cuda_graph=False,
-                )
+                if self.spatial_dim == 3:
+                    graph0 = deserialize_observation_3d(
+                        obs,
+                        substep0_idx,
+                        D=self.max_degree,
+                        F_CAP=self.max_frontier,
+                        T_CAP=self.max_candidates,
+                        deserialize_targets=False,
+                        exact_output=True,
+                        copy_obs=False,
+                        use_cuda_graph=False,
+                    )
+                else:
+                    graph0 = deserialize_observation(
+                        obs,
+                        substep0_idx,
+                        D=self.max_degree,
+                        F_CAP=self.max_frontier,
+                        deserialize_candidates=False,
+                        exact_output=True,
+                        copy_obs=False,
+                        use_cuda_graph=False,
+                    )
 
             frontier_state = self._encode_frontier(graph0)
             h_source0 = frontier_state.node_features
@@ -4085,17 +4309,30 @@ class QuadMeshingEncoder(nn.Module):
         # SUBSTEP 1
         if B1 > 0:
             with nvtx_range("deserialize_observation (substep 1)"):
-                graph1, targets = deserialize_observation(
-                    obs,
-                    substep1_idx,
-                    D=self.max_degree,
-                    F_CAP=self.max_frontier,
-                    C_CAP=self.max_candidates,
-                    deserialize_candidates=True,
-                    exact_output=True,
-                    copy_obs=False,
-                    use_cuda_graph=False,
-                )
+                if self.spatial_dim == 3:
+                    graph1, targets = deserialize_observation_3d(
+                        obs,
+                        substep1_idx,
+                        D=self.max_degree,
+                        F_CAP=self.max_frontier,
+                        T_CAP=self.max_candidates,
+                        deserialize_targets=True,
+                        exact_output=True,
+                        copy_obs=False,
+                        use_cuda_graph=False,
+                    )
+                else:
+                    graph1, targets = deserialize_observation(
+                        obs,
+                        substep1_idx,
+                        D=self.max_degree,
+                        F_CAP=self.max_frontier,
+                        C_CAP=self.max_candidates,
+                        deserialize_candidates=True,
+                        exact_output=True,
+                        copy_obs=False,
+                        use_cuda_graph=False,
+                    )
 
             frontier_state = self._encode_frontier(graph1)
             h_source1 = frontier_state.node_features

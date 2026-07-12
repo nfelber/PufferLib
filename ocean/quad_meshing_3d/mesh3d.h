@@ -85,6 +85,10 @@ typedef struct {
     uint16_t degree;
     uint16_t open_edges;
     int32_t frontier_index;
+    float frontier_edge_length_cost;
+    float frontier_alignment_cost;
+    float frontier_angle_cost;
+    bool frontier_quality_dirty;
     bool disabled;
 } Qm3MeshVertex;
 
@@ -159,6 +163,36 @@ static void qm3_mesh_free(Qm3Mesh* mesh) {
     qm3_mesh_init(mesh, mesh->max_degree);
 }
 
+static void qm3_mesh_dump_obj(const Qm3Mesh* mesh, const char* filename) {
+    FILE* f = fopen(filename, "w");
+    QM3_ASSERT(f != NULL);
+    fprintf(f, "# QuadMeshing3D OBJ export\n");
+    for (uint32_t i = 0; i < mesh->vertex_count; ++i) {
+        const Qm3MeshVertex* v = &mesh->vertices[i];
+        fprintf(f, "v %.8f %.8f %.8f\n", v->pos.x, v->pos.y, v->pos.z);
+    }
+    for (uint32_t i = 0; i < mesh->vertex_count; ++i) {
+        const Qm3MeshVertex* v = &mesh->vertices[i];
+        fprintf(f, "vn %.8f %.8f %.8f\n", v->normal.x, v->normal.y, v->normal.z);
+    }
+    for (uint32_t i = 0; i < mesh->face_count; ++i) {
+        const Qm3MeshFace* face = &mesh->faces[i];
+        if (face->disabled || face->n < 3) continue;
+        fprintf(f, "f");
+        for (uint8_t j = 0; j < face->n; ++j) {
+            uint32_t v = face->vertices[j] + 1;
+            fprintf(f, " %u//%u", v, v);
+        }
+        fprintf(f, "\n");
+    }
+    for (uint32_t i = 0; i < mesh->edge_count; ++i) {
+        const Qm3MeshEdge* e = &mesh->edges[i];
+        if (e->disabled || e->face_count == 0) continue;
+        fprintf(f, "l %u %u\n", e->a + 1, e->b + 1);
+    }
+    fclose(f);
+}
+
 static void qm3_mesh_reserve_vertices(Qm3Mesh* mesh, uint32_t cap) {
     if (cap <= mesh->vertex_cap) return;
     mesh->vertices = (Qm3MeshVertex*)qm3_checked_realloc(mesh->vertices, (size_t)cap * sizeof(Qm3MeshVertex));
@@ -227,6 +261,10 @@ static uint32_t qm3_mesh_add_vertex(Qm3Mesh* mesh, Qm3Vec3 pos, Qm3Vec3 normal, 
         .degree = 0,
         .open_edges = 0,
         .frontier_index = -1,
+        .frontier_edge_length_cost = 0.0f,
+        .frontier_alignment_cost = 0.0f,
+        .frontier_angle_cost = 0.0f,
+        .frontier_quality_dirty = true,
         .disabled = false,
     };
     for (uint32_t i = 0; i < mesh->max_degree; ++i) {

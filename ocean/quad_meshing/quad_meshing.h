@@ -95,6 +95,7 @@ typedef struct {
     // ...
 
     // Reward settings
+    bool reward_cross_field;
     float reward_invalid;
     float reward_incomplete;
     float reward_triangle;
@@ -581,10 +582,7 @@ static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
         edge_length_cost += 1.0f - compute_edge_length_quality(edge_length, env->cache.target_edge_length);
 
         const Vec2 edir = scalmul2(eivec, 1.0f / edge_length);
-        const float du = dot2(edir, field.u);
-        const float dv = dot2(edir, field.v);
-        const float s = fmaxf(du * du, dv * dv);
-        alignment_cost += 4.0f * s * (1.0f - s);
+        alignment_cost += cross_field_alignment(&field, edir);
 
         const bool cw_face_i = mesh_edge_face_orientation_from_vertex(&env->mesh, eidx, vidx);
         if (ei->face_count == 1 && !cw_face_i) continue;
@@ -669,6 +667,20 @@ float compute_quad_quality(QuadMeshingEnv* env, const Vec2* quad) {
     return eq * aq;
 }
 
+float compute_quad_cross_field_alignment(QuadMeshingEnv* env, const Vec2* quad) {
+    // Element quality
+    float alignment = 0;
+    CrossFieldQuery cf_queries[4];
+    for (int i=0; i<4; ++i) cf_queries[i] = cross_field_query(&env->cross_field, quad[i]);
+    for (int i=3, j=0; j<4; i=j, ++j) {
+        Vec2 edir = safe_normalize(sub2(quad[j], quad[i]));
+        alignment += cross_field_alignment(&cf_queries[i], edir);
+        alignment += cross_field_alignment(&cf_queries[j], edir);
+    }
+
+    return 0.125 * alignment;
+}
+
 static float compute_pressure_ratio(float value, float safe_ratio, float max_value) {
     float denom = (1.0f - safe_ratio) * max_value;
     if (denom <= 0.0f) return value > max_value ? 1.0f : 0.0f;
@@ -711,9 +723,11 @@ static float compute_frontier_potential(QuadMeshingEnv* env) {
 }
 
 static float compute_quad_reward(QuadMeshingEnv* env, const Vec2* quad) {
-    // float area_scale = env->cache.target_quad_area / env->cache.starting_boundary_area;
-    // return area_scale * (env->base_quad_reward + compute_quad_quality(env, quad));
-    return env->base_quad_reward + (1 - env->base_quad_reward) * compute_quad_quality(env, quad);
+    float quad_reward = compute_quad_quality(env, quad);
+    if (env->reward_cross_field) {
+        quad_reward *= compute_quad_cross_field_alignment(env, quad);
+    }
+    return env->base_quad_reward + (1 - env->base_quad_reward) * quad_reward;
 }
 
 /** Resets the environment state and observation buffers. */
