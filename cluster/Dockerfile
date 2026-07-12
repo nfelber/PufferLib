@@ -59,6 +59,7 @@ RUN uv pip install \
         gpytorch \
         scikit-learn \
         wandb \
+        tomli \
         pybind11
 
 RUN uv pip install --no-deps -e . --no-build-isolation

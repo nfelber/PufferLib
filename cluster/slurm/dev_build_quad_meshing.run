@@ -15,6 +15,7 @@ set -euo pipefail
 IMAGE=${IMAGE:-$HOME/docker-images/pufferlib_quad_meshing_latest.sif}
 SOURCE_DIR=${SOURCE_DIR:-$PWD}
 OUTPUT_DIR=${OUTPUT_DIR:-$SOURCE_DIR/cluster_runs/dev}
+ENV_NAME=${ENV_NAME:-quad_meshing}
 
 mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/cache"
 
@@ -38,4 +39,4 @@ srun apptainer exec --nv \
     --bind "$SOURCE_DIR:/workspace/PufferLib" \
     --bind "$OUTPUT_DIR:/outputs" \
     "$IMAGE" \
-    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR=/outputs/cache/triton && cd /workspace/PufferLib && NVCC_ARCH=sm_70 bash build.sh quad_meshing --float"
+    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR=/outputs/cache/triton && cd /workspace/PufferLib && NVCC_ARCH=sm_70 bash build.sh '$ENV_NAME' --float"

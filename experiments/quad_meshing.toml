@@ -1,0 +1,22 @@
+[batch]
+env = "quad_meshing"
+project = "puffer4"
+group = "quad_meshing_experiments"
+seeds = [1, 2, 3]
+slowly = true
+wandb = true
+
+# These values override config/default.ini and then config/quad_meshing.ini for
+# every experiment in this file.
+[defaults.train]
+total_timesteps = 2_000_000
+
+[[experiments]]
+name = "baseline"
+
+[[experiments]]
+name = "deeper-painn"
+
+[experiments.policy]
+frontier_painn_layers = 5
+target_painn_length_bands = 6

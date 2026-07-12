@@ -198,6 +198,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         run_id = wandb.util.generate_id()
         wandb.init(id=run_id, config=args,
             project=args['wandb_project'], group=args['wandb_group'],
+            name=args.get('wandb_name'), job_type=args.get('wandb_job_type'),
             tags=[args['tag']] if args['tag'] is not None else [],
             settings=wandb.Settings(console="off"),
         )
@@ -701,7 +702,7 @@ def eval(env_name, args=None, load_path=None):
 
     backend.close(pufferl)
 
-def load_config(env_name):
+def load_config(env_name, argv=None):
     parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
     parser.add_argument('--load-model-path', type=str, default=None,
         help='Path to a pretrained checkpoint')
@@ -712,6 +713,8 @@ def load_config(env_name):
     parser.add_argument('--wandb', action='store_true', help='Use wandb for logging')
     parser.add_argument('--wandb-project', type=str, default='puffer4')
     parser.add_argument('--wandb-group', type=str, default='debug')
+    parser.add_argument('--wandb-name', type=str, default=None)
+    parser.add_argument('--wandb-job-type', type=str, default=None)
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
     parser.add_argument('--slowly', action='store_true', help='Use PyTorch training backend')
     parser.add_argument('--sweep-dir', type=str, default=None,
@@ -762,7 +765,7 @@ def load_config(env_name):
         action='help', help='Show this help message and exit')
 
     # Unpack to nested dict
-    parsed = vars(parser.parse_args())
+    parsed = vars(parser.parse_args(argv))
     args = defaultdict(dict)
     for key, value in parsed.items():
         nxt = args

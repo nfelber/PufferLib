@@ -7,6 +7,7 @@ import glob
 import time
 import ctypes
 import pprint
+import random
 from collections import defaultdict
 
 import numpy as np
@@ -702,6 +703,13 @@ class PuffeRL:
     @classmethod
     def create_pufferl(cls, args):
         '''Matches _C.create_pufferl(args) interface.'''
+        seed = args['seed']
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
         # DDP setup
         if 'LOCAL_RANK' in os.environ:
             world_size = int(os.environ.get('WORLD_SIZE', 1))

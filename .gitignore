@@ -155,7 +155,6 @@ dmypy.json
 *.gb
 
 checkpoints/
-experiments/
 wandb/
 .neptune/
 raylib*/

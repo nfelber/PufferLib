@@ -241,3 +241,49 @@ For final experiments, rebuild and pull a baked image tagged with the git commit
 - The scripts set `CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include` to work
   around clusters where Apptainer/GCC does not find GCC's internal headers such
   as `stddef.h` during Triton JIT compilation.
+
+## Explicit Experiment Arrays
+
+Use an experiment manifest when you want a fixed set of configurations rather
+than an automatic sweep. The precedence for every run is:
+
+```text
+config/default.ini
+config/<environment>.ini
+manifest [defaults]
+manifest [[experiments]] overrides
+selected seed
+```
+
+Thus `config/default.ini` continues to provide every setting not replaced by
+the selected environment config. See `experiments/quad_meshing.toml` and
+`experiments/quad_meshing_3d.toml` for complete examples.
+
+Submit all experiment and seed combinations with:
+
+```bash
+cluster/submit_dev_experiments.sh experiments/quad_meshing.toml \
+  --image "$HOME/myimages/pufferlib_quad_meshing_latest.sif" \
+  --max-concurrent 4 \
+  --build
+```
+
+`--build` submits one build job for the manifest environment and makes the
+array depend on it. Omit it when the mounted checkout already contains the
+correct float backend. Array tasks never build, so tasks from one array can run
+concurrently without racing on `pufferlib/_C*.so`.
+
+The default output directory is
+`cluster_runs/experiments/<manifest-name>`. Override it with `--output-dir`.
+Each array task requests one GPU, and `--max-concurrent` controls the Slurm
+array concurrency cap.
+
+Do not overlap 2D and 3D arrays that mount the same checkout. Both environment
+builds write the same `pufferlib/_C*.so`; build and finish one environment's
+batch before building the other.
+
+Each W&B run uses the manifest's project and group, with names such as
+`deeper-painn-seed-2`. The experiment name is also recorded as W&B `job_type`
+and as `config.experiment`, while the seed is recorded as
+`config.experiment_seed`. This makes repeated seeds easy to group and compare
+without creating a W&B sweep.
