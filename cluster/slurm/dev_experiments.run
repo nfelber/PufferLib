@@ -46,6 +46,6 @@ export SINGULARITYENV_TRITON_CACHE_DIR="$TASK_CACHE/triton"
 srun apptainer exec --nv \
     --bind "$SOURCE_DIR:/workspace/PufferLib" \
     --bind "$OUTPUT_DIR:/outputs" \
-    --bind "$MANIFEST:/tmp/puffer-experiments.toml:ro" \
+    --bind "$MANIFEST:/tmp/puffer-experiments.json:ro" \
     "$IMAGE" \
-    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR='$TASK_CACHE/triton' && cd /workspace/PufferLib && python -m pufferlib.experiments run /tmp/puffer-experiments.toml --index '$TASK_ID' --output-dir /outputs"
+    bash -lc "export CC=/usr/bin/gcc CXX=/usr/bin/g++ CUDAHOSTCXX=/usr/bin/g++ CPATH=/usr/lib/gcc/x86_64-linux-gnu/11/include LIBRARY_PATH=/usr/local/cuda/lib64/stubs TRITON_CACHE_DIR='$TASK_CACHE/triton' && cd /workspace/PufferLib && python -m pufferlib.experiments run /tmp/puffer-experiments.json --index '$TASK_ID' --output-dir /outputs"
