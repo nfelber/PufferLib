@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
     env.reward_invalid = -0.05f;
     env.reward_incomplete = -1.0f;
     env.reward_triangle = -0.5f;
+    env.reward_cross_field = true;
     env.base_quad_reward = 0.0f;
     env.potential_beta = 0.15f;
     env.potential_gamma = 1.0f;

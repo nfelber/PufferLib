@@ -16,8 +16,9 @@
 // - source index [2] (substep 1 only)
 // - frontier validity mask [MAX_FRONTIER_SIZE]
 // - frontier target parity [MAX_FRONTIER_SIZE]
+// - frontier target cross-field alignment [MAX_FRONTIER_SIZE * 4]
 // - valid new vertex candidates count [2]
-// - valid new vertex candidates [MAX_NEW_CANDIDATES * 8]
+// - valid new vertex candidates [MAX_NEW_CANDIDATES * 12]
 #define OBS_TENSOR_T ByteTensor // Pack observations in raw bytes buffer
 #define MAX_FRONTIER_SIZE 512 // Assume less than 2^16
 #define MAX_DEGREE 8
@@ -34,8 +35,9 @@
   2 + \
   MAX_FRONTIER_SIZE + \
   MAX_FRONTIER_SIZE + \
+  MAX_FRONTIER_SIZE * 4 + \
   2 + \
-  MAX_NEW_CANDIDATES * 8 \
+  MAX_NEW_CANDIDATES * 12 \
 )
 
 // ENV

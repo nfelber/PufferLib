@@ -101,6 +101,9 @@ def test_quad_meshing_3d_deserialize():
         assert (targets.path_lengths >= 0).all()
         assert targets.target_frontier_parity.shape == targets.path_lengths.shape
         assert targets.target_frontier_parity.dtype == torch.bool
+        assert targets.cross_field_alignment.shape == targets.path_lengths.shape
+        assert torch.isfinite(targets.cross_field_alignment).all()
+        assert ((targets.cross_field_alignment >= 0) & (targets.cross_field_alignment <= 1)).all()
 
         print(
             "quad_meshing_3d deserialize ok:",

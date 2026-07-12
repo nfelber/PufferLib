@@ -12,7 +12,7 @@
 // - suggested source frontier index [2]
 // - selected source frontier index [2]
 // - valid target count [2]
-// - valid targets: position xyz + normal xyz + path length + kind + parity [MAX_TARGETS * 30]
+// - valid targets: position xyz + normal xyz + path length + kind + parity + cross-field alignment [MAX_TARGETS * 34]
 #define MAX_FRONTIER_SIZE 256
 #define MAX_DEGREE 8
 #define MAX_TARGETS 768
@@ -26,7 +26,7 @@
   2 + \
   2 + \
   2 + \
-  MAX_TARGETS * 30 \
+  MAX_TARGETS * 34 \
 )
 
 #include "quad_meshing_3d.h"
@@ -130,6 +130,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
     env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
+    env->reward_cross_field = dict_get(kwargs, "reward_cross_field")->value > 0.5;
     env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;
     env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
     env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;
@@ -166,5 +167,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "score", log->score);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "episode_length_ratio", log->episode_length_ratio);
+    dict_set(out, "num_quads", log->num_quads);
+    dict_set(out, "num_quads_ratio", log->num_quads_ratio);
     dict_set(out, "n", log->n);
 }

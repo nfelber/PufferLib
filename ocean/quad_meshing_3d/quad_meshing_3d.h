@@ -18,6 +18,9 @@ typedef struct {
     float score;
     float episode_return;
     float episode_length;
+    float episode_length_ratio;
+    float num_quads;
+    float num_quads_ratio;
     float n;
 } Log;
 
@@ -197,6 +200,7 @@ typedef struct {
     float reward_invalid;
     float reward_incomplete;
     float reward_triangle;
+    bool reward_cross_field;
     float base_quad_reward;
     float potential_beta;
     float potential_gamma;
@@ -2105,9 +2109,14 @@ static void qm3_update_target_scale(QuadMeshing3DEnv* env) {
 }
 
 static void qm3_add_log(QuadMeshing3DEnv* env) {
+    const float area_scale = env->target_quad_area / env->surface.info.total_area;
+    env->log.perf += env->episode_return * area_scale;
     env->log.score += env->episode_return;
     env->log.episode_return += env->episode_return;
     env->log.episode_length += (float)env->episode_length;
+    env->log.episode_length_ratio += (float)env->episode_length / env->episode_max_length;
+    env->log.num_quads += (float)env->mesh.quad_count;
+    env->log.num_quads_ratio += (float)env->mesh.quad_count * area_scale;
     env->log.n += 1.0f;
 }
 
@@ -2225,9 +2234,32 @@ static float qm3_compute_face_quality(QuadMeshing3DEnv* env, Qm3MeshFace* face) 
     return quality;
 }
 
+static float qm3_cross_field_alignment_from_dir_and_tri(const QuadMeshing3DEnv* env, Qm3Vec3 unit_dir, int tri) {
+    if (tri < 0 || tri >= (int)env->surface.triangle_count) return 0.0f;
+    float du = qm3_dot(unit_dir, qm3_normalize(env->surface.face_dir_u[tri]));
+    float dv = qm3_dot(unit_dir, qm3_normalize(env->surface.face_dir_v[tri]));
+    float s = fmaxf(du * du, dv * dv);
+    return fminf(fmaxf(2.0f * s - 1.0f, 0.0f), 1.0f);
+}
+
+static float qm3_compute_face_cross_field_alignment(const QuadMeshing3DEnv* env, const Qm3MeshFace* face) {
+    float alignment = 0.0f;
+    for (uint32_t i = 0; i < 4; ++i) {
+        const Qm3MeshVertex* a = &env->mesh.vertices[face->vertices[i]];
+        const Qm3MeshVertex* b = &env->mesh.vertices[face->vertices[(i + 1) % 4]];
+        Qm3Vec3 dir = qm3_sub(b->pos, a->pos);
+        float len = qm3_len(dir);
+        if (len > 1e-12f) dir = qm3_scale(dir, 1.0f / len);
+        alignment += qm3_cross_field_alignment_from_dir_and_tri(env, dir, a->surface_tri);
+        alignment += qm3_cross_field_alignment_from_dir_and_tri(env, dir, b->surface_tri);
+    }
+    return 0.125f * alignment;
+}
+
 static float qm3_compute_face_reward(QuadMeshing3DEnv* env, Qm3MeshFace* face) {
     if (face->n == 3) return env->reward_triangle;
     float q = qm3_compute_face_quality(env, face);
+    if (env->reward_cross_field) q *= qm3_compute_face_cross_field_alignment(env, face);
     return env->base_quad_reward + (1.0f - env->base_quad_reward) * q;
 }
 
@@ -2421,6 +2453,53 @@ static Qm3Vec3 qm3_candidate_target_normal(const QuadMeshing3DEnv* env, const Qm
     return (Qm3Vec3){0.0f, 0.0f, 1.0f};
 }
 
+typedef struct {
+    Qm3Vec3 u;
+    Qm3Vec3 v;
+} Qm3CrossFieldQuery;
+
+static Qm3CrossFieldQuery qm3_cross_field_query(const Qm3Surface* surface, int tri) {
+    if (tri < 0 || tri >= (int)surface->triangle_count) {
+        return (Qm3CrossFieldQuery){{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+    }
+    return (Qm3CrossFieldQuery){
+        qm3_normalize(surface->face_dir_u[tri]),
+        qm3_normalize(surface->face_dir_v[tri]),
+    };
+}
+
+static float qm3_cross_field_alignment(const Qm3CrossFieldQuery* field, Qm3Vec3 unit_dir) {
+    float du = qm3_dot(unit_dir, field->u);
+    float dv = qm3_dot(unit_dir, field->v);
+    float s = fmaxf(du * du, dv * dv);
+    return fminf(fmaxf(2.0f * s - 1.0f, 0.0f), 1.0f);
+}
+
+static int qm3_candidate_target_tri(const QuadMeshing3DEnv* env, const Qm3TargetCandidate* candidate) {
+    if (candidate->kind == QM3_TARGET_EXISTING_FRONTIER && candidate->graph_vertex < env->mesh.vertex_count) {
+        return env->mesh.vertices[candidate->graph_vertex].surface_tri;
+    }
+    if (candidate->sample_id < env->surface.sample_count) return (int)env->surface.samples[candidate->sample_id].tri;
+    return -1;
+}
+
+static float qm3_target_cross_field_alignment(
+    const QuadMeshing3DEnv* env,
+    const Qm3CrossFieldQuery* source_field,
+    Qm3Vec3 source_pos,
+    const Qm3TargetCandidate* candidate
+) {
+    Qm3Vec3 dir = qm3_sub(qm3_candidate_target_pos3(env, candidate), source_pos);
+    float len = qm3_len(dir);
+    if (len <= 1e-12f) return 0.0f;
+    dir = qm3_scale(dir, 1.0f / len);
+    Qm3CrossFieldQuery target_field = qm3_cross_field_query(&env->surface, qm3_candidate_target_tri(env, candidate));
+    return 0.5f * (
+        qm3_cross_field_alignment(source_field, dir) +
+        qm3_cross_field_alignment(&target_field, dir)
+    );
+}
+
 static uint16_t qm3_u16_or_max(uint32_t value) {
     return value < UINT16_MAX ? (uint16_t)value : UINT16_MAX;
 }
@@ -2511,6 +2590,12 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
     }
 
     uint32_t written = 0;
+    uint32_t source_vidx = env->mesh.frontier[env->source_frontier_idx];
+    Qm3Vec3 source_pos = env->mesh.vertices[source_vidx].pos;
+    Qm3CrossFieldQuery source_field = qm3_cross_field_query(
+        &env->surface,
+        env->mesh.vertices[source_vidx].surface_tri
+    );
     for (uint32_t i = 0; i < env->candidate_count && written < target_count; ++i) {
         const Qm3TargetCandidate* candidate = &env->candidates[i];
         if (!candidate->path_ok) continue;
@@ -2526,6 +2611,7 @@ static void qm3_compute_observations(QuadMeshing3DEnv* env) {
                 : 0;
         }
         serialize_u8(sb, parity);
+        serialize_float(sb, qm3_target_cross_field_alignment(env, &source_field, source_pos, candidate));
         written++;
     }
     free(frontier_hop_distance);

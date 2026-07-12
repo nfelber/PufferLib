@@ -59,7 +59,7 @@ int main() {
     env.intersection_tol = 1e-3;
 
     quad_meshing_init(&env);
-    env.observations = (unsigned char*)calloc(1 + 4 + 4 + env.max_frontier * (8 + 3 * env.max_degree + 2) + 2 + 2 + env.candidate_angles*env.candidate_rings * 8, sizeof(unsigned char));
+    env.observations = (unsigned char*)calloc(1 + 4 + 4 + env.max_frontier * (8 + 3 * env.max_degree + 6) + 2 + 2 + env.candidate_angles*env.candidate_rings * 12, sizeof(unsigned char));
     env.actions = (float*)calloc(2, sizeof(int));
     env.rewards = (float*)calloc(1, sizeof(float));
     env.terminals = (float*)calloc(1, sizeof(unsigned char));

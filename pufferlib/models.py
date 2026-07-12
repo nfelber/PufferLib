@@ -773,6 +773,7 @@ class CandidateTargets:
     target_batches: torch.Tensor        # [Q] batch index per target
     target_positions: torch.Tensor      # [Q, 2] existing vertex or new candidate position
     target_frontier_parity: torch.Tensor # [Q] parity of hop distance from source; new candidates are odd
+    cross_field_alignment: torch.Tensor | None = None  # [Q] source-target edge alignment with the cross field
 
 
 @dataclass
@@ -797,6 +798,7 @@ class QuadMesh3DTargets:
     path_lengths: torch.Tensor          # [Q]
     target_kind: torch.Tensor           # [Q], 0=new sample, 1=frontier
     target_frontier_parity: torch.Tensor # [Q] parity of hop distance from source; new samples are odd
+    cross_field_alignment: torch.Tensor | None = None  # [Q] source-target edge alignment with the cross field
 
 
 # =============================================================================
@@ -1104,7 +1106,7 @@ def _cand_decode_counts_kernel(
     source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
     parity_start = validity_start + frontier_size
-    candidates_start = parity_start + frontier_size
+    candidates_start = parity_start + frontier_size + frontier_size * 4
 
     src_lo = tl.load(obs + source_idx_pos + 0).to(tl.uint32)
     src_hi = tl.load(obs + source_idx_pos + 1).to(tl.uint32)
@@ -1141,6 +1143,8 @@ def _cand_write_target_size_kernel(
 
 @triton.jit
 def _cand_scatter_existing_targets_kernel(
+    obs,                    # uint8*, [B_full, obs_size]
+    valid_batch_idx,        # int64*, [B]
     vertices,               # float32*, [N_CAP, 2]
     vertex_batch_offsets,   # int64*, [B + 1]
     target_batch_offsets,   # int64*, [B + 1]
@@ -1151,6 +1155,9 @@ def _cand_scatter_existing_targets_kernel(
     target_batches,         # int64*, [Q_CAP]
     target_positions,       # float32*, [Q_CAP, 2]
     target_frontier_parity, # bool*, [Q_CAP]
+    target_cross_field,     # float32*, [Q_CAP]
+    OBS_SIZE: tl.constexpr,
+    D: tl.constexpr,
     F_CAP: tl.constexpr,
     BLOCK_F: tl.constexpr,
 ):
@@ -1173,12 +1180,17 @@ def _cand_scatter_existing_targets_kernel(
     x = tl.load(vertices + global_i * 2 + 0, mask=mask, other=0.0)
     y = tl.load(vertices + global_i * 2 + 1, mask=mask, other=0.0)
     parity = tl.load(node_parity + global_i, mask=mask, other=0)
+    physical_b = tl.load(valid_batch_idx + b)
+    row = physical_b * OBS_SIZE
+    alignment_start = row + 13 + frontier_size * (10 + 3 * D)
+    alignment = _load_f32_le(obs, alignment_start + i * 4, mask)
 
     tl.store(target_idx + out, global_i, mask=mask)
     tl.store(target_batches + out, b, mask=mask)
     tl.store(target_positions + out * 2 + 0, x, mask=mask)
     tl.store(target_positions + out * 2 + 1, y, mask=mask)
     tl.store(target_frontier_parity + out, parity, mask=mask)
+    tl.store(target_cross_field + out, alignment, mask=mask)
 
 
 @triton.jit
@@ -1192,6 +1204,7 @@ def _cand_scatter_new_targets_kernel(
     target_batches,         # int64*, [Q_CAP]
     target_positions,       # float32*, [Q_CAP, 2]
     target_frontier_parity, # bool*, [Q_CAP]
+    target_cross_field,     # float32*, [Q_CAP]
     OBS_SIZE: tl.constexpr,
     D: tl.constexpr,
     C_CAP: tl.constexpr,
@@ -1212,12 +1225,12 @@ def _cand_scatter_new_targets_kernel(
     source_idx_pos = neighbor_start + frontier_size * D * 3 + 2
     validity_start = source_idx_pos + 2
     parity_start = validity_start + frontier_size
-    candidates_start = parity_start + frontier_size
+    candidates_start = parity_start + frontier_size + frontier_size * 4
 
     cand_count = tl.load(candidate_count + b)
     valid = (j < cand_count) & (j < C_CAP)
 
-    base = candidates_start + 2 + j * 8
+    base = candidates_start + 2 + j * 12
     x_u32 = (
         tl.load(obs + base + 0, mask=valid, other=0).to(tl.uint32)
         | (tl.load(obs + base + 1, mask=valid, other=0).to(tl.uint32) << 8)
@@ -1230,6 +1243,7 @@ def _cand_scatter_new_targets_kernel(
         | (tl.load(obs + base + 6, mask=valid, other=0).to(tl.uint32) << 16)
         | (tl.load(obs + base + 7, mask=valid, other=0).to(tl.uint32) << 24)
     )
+    alignment = _load_f32_le(obs, base + 8, valid)
 
     out = tl.load(target_batch_offsets + b) + tl.load(valid_node_count + b) + j
 
@@ -1238,6 +1252,7 @@ def _cand_scatter_new_targets_kernel(
     tl.store(target_positions + out * 2 + 0, x_u32.to(tl.float32, bitcast=True), mask=valid)
     tl.store(target_positions + out * 2 + 1, y_u32.to(tl.float32, bitcast=True), mask=valid)
     tl.store(target_frontier_parity + out, valid, mask=valid)
+    tl.store(target_cross_field + out, alignment, mask=valid)
 
 
 # =============================================================================
@@ -1440,6 +1455,7 @@ def _qm3_scatter_targets_kernel(
     path_lengths,
     target_kind,
     target_frontier_parity,
+    target_cross_field,
     target_batches,
     OBS_SIZE: tl.constexpr,
     F_CAP: tl.constexpr,
@@ -1457,7 +1473,7 @@ def _qm3_scatter_targets_kernel(
     out = tl.load(target_batch_offsets + b) + j
 
     targets_base = row + 9 + F_CAP * 24 + F_CAP * D * 2 + 2 + 2 + 2
-    base = targets_base + j * 30
+    base = targets_base + j * 34
     px = _load_f32_le(obs, base + 0, valid)
     py = _load_f32_le(obs, base + 4, valid)
     pz = _load_f32_le(obs, base + 8, valid)
@@ -1467,6 +1483,7 @@ def _qm3_scatter_targets_kernel(
     path = _load_f32_le(obs, base + 24, valid)
     kind = tl.load(obs + base + 28, mask=valid, other=0).to(tl.int64)
     parity = tl.load(obs + base + 29, mask=valid, other=0) != 0
+    alignment = _load_f32_le(obs, base + 30, valid)
 
     tl.store(target_positions + out * 3 + 0, px, mask=valid)
     tl.store(target_positions + out * 3 + 1, py, mask=valid)
@@ -1477,6 +1494,7 @@ def _qm3_scatter_targets_kernel(
     tl.store(path_lengths + out, path, mask=valid)
     tl.store(target_kind + out, kind, mask=valid)
     tl.store(target_frontier_parity + out, parity, mask=valid)
+    tl.store(target_cross_field + out, alignment, mask=valid)
     tl.store(target_batches + out, b, mask=valid)
 
 
@@ -1693,6 +1711,11 @@ class CUDAGraphObservationDeserializer:
                     dtype=torch.bool,
                     device=self.device,
                 )
+                self.target_cross_field = torch.empty(
+                    (self.Q_CAP,),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
                 self.target_batch_offsets_tail = self.target_batch_offsets[1:]
             else:
                 self.source_idx = None
@@ -1706,6 +1729,7 @@ class CUDAGraphObservationDeserializer:
                 self.target_positions = None
                 self.node_parity = None
                 self.target_frontier_parity = None
+                self.target_cross_field = None
                 self.target_batch_offsets_tail = None
 
             self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
@@ -1875,6 +1899,8 @@ class CUDAGraphObservationDeserializer:
             )
 
             _cand_scatter_existing_targets_kernel[(self.B,)](
+                self.obs_static,
+                self.valid_batch_idx_static,
                 self.vertices,
                 self.vertex_batch_offsets,
                 self.target_batch_offsets,
@@ -1885,6 +1911,9 @@ class CUDAGraphObservationDeserializer:
                 self.target_batches,
                 self.target_positions,
                 self.target_frontier_parity,
+                self.target_cross_field,
+                OBS_SIZE=self.obs_size,
+                D=self.D,
                 F_CAP=self.F_CAP,
                 BLOCK_F=self.BLOCK_F,
                 num_warps=4,
@@ -1902,6 +1931,7 @@ class CUDAGraphObservationDeserializer:
                 self.target_batches,
                 self.target_positions,
                 self.target_frontier_parity,
+                self.target_cross_field,
                 OBS_SIZE=self.obs_size,
                 D=self.D,
                 C_CAP=max(self.C_CAP, 1),
@@ -1918,6 +1948,7 @@ class CUDAGraphObservationDeserializer:
                 target_batches=self.target_batches,
                 target_positions=self.target_positions,
                 target_frontier_parity=self.target_frontier_parity,
+                cross_field_alignment=self.target_cross_field,
             )
 
         return CandidateTargets(
@@ -1927,6 +1958,7 @@ class CUDAGraphObservationDeserializer:
             target_batches=self.target_batches[:Q],
             target_positions=self.target_positions[:Q],
             target_frontier_parity=self.target_frontier_parity[:Q],
+            cross_field_alignment=self.target_cross_field[:Q],
         )
 
     @torch.no_grad()
@@ -2058,6 +2090,7 @@ class QuadMesh3DObservationDeserializer:
             self.path_lengths = torch.empty((self.Q_CAP,), dtype=torch.float32, device=self.device)
             self.target_kind = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
             self.target_frontier_parity = torch.empty((self.Q_CAP,), dtype=torch.bool, device=self.device)
+            self.target_cross_field = torch.empty((self.Q_CAP,), dtype=torch.float32, device=self.device)
             self.target_batches = torch.empty((self.Q_CAP,), dtype=torch.long, device=self.device)
 
             self.vertex_batch_offsets_tail = self.vertex_batch_offsets[1:]
@@ -2178,6 +2211,7 @@ class QuadMesh3DObservationDeserializer:
                 self.path_lengths,
                 self.target_kind,
                 self.target_frontier_parity,
+                self.target_cross_field,
                 self.target_batches,
                 OBS_SIZE=self.obs_size,
                 F_CAP=self.F_CAP,
@@ -2216,6 +2250,7 @@ class QuadMesh3DObservationDeserializer:
             path_lengths=self.path_lengths[:Q],
             target_kind=self.target_kind[:Q],
             target_frontier_parity=self.target_frontier_parity[:Q],
+            cross_field_alignment=self.target_cross_field[:Q],
         )
 
     @torch.no_grad()
@@ -3001,6 +3036,7 @@ class TargetInitStage(nn.Module):
         include_normal=False,
         include_boundary_flag=True,
         include_frontier_parity=False,
+        include_cross_field=False,
         eps=1e-8,
     ):
         super().__init__()
@@ -3030,6 +3066,7 @@ class TargetInitStage(nn.Module):
         self.include_normal = include_normal
         self.include_boundary_flag = include_boundary_flag
         self.include_frontier_parity = include_frontier_parity
+        self.include_cross_field = include_cross_field
         self.eps = eps
         self.pos_encoder = FourierEncoderND(num_bands=pos_bands, coord_dim=spatial_dim, include_input=True)
 
@@ -3051,6 +3088,8 @@ class TargetInitStage(nn.Module):
         if include_boundary_flag:
             in_dim += 1
         if include_frontier_parity:
+            in_dim += 1
+        if include_cross_field:
             in_dim += 1
 
         self.target_proj = layer_init(nn.Linear(in_dim, target_hidden_size)) if in_dim > 0 else None
@@ -3124,6 +3163,9 @@ class TargetInitStage(nn.Module):
 
         if self.include_frontier_parity:
             parts.append(targets.target_frontier_parity.to(targets.target_positions.dtype).unsqueeze(-1))
+
+        if self.include_cross_field:
+            parts.append(targets.cross_field_alignment.to(targets.target_positions.dtype).unsqueeze(-1))
 
         if not parts:
             target_features = self.target_initial.unsqueeze(0).expand(Q, -1)
@@ -4053,6 +4095,7 @@ class QuadMeshingEncoder(nn.Module):
             target_init_normal=False,
             target_init_boundary_flag=True,
             target_init_frontier_parity=False,
+            target_init_cross_field=False,
             target_painn_length_bands=4,
             target_global_perceiver_d_model=None,
             target_global_perceiver_length_bands=4,
@@ -4174,6 +4217,7 @@ class QuadMeshingEncoder(nn.Module):
                     include_normal=target_init_normal,
                     include_boundary_flag=target_init_boundary_flag,
                     include_frontier_parity=target_init_frontier_parity,
+                    include_cross_field=target_init_cross_field,
                 ))
             elif stage == "se2":
                 if spatial_dim != 2:

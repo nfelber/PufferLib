@@ -354,7 +354,16 @@ uint16_t deserialize_obs_source(SerialObsBuffer* obs, const QuadMesh* mesh, uint
 static void compute_frontier_hop_distances(QuadMeshingEnv* env, int source);
 static bool prevent_triangle_target_allowed(QuadMeshingEnv* env, int target_fidx);
 
-static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode) {
+static float target_cross_field_alignment(QuadMeshingEnv* env, const CrossFieldQuery* source_field, Vec2 source_pos, Vec2 target_pos) {
+    Vec2 unit_dir = safe_normalize(sub2(target_pos, source_pos));
+    CrossFieldQuery target_field = cross_field_query(&env->cross_field, target_pos);
+    return 0.5f * (
+        cross_field_alignment(source_field, unit_dir) +
+        cross_field_alignment(&target_field, unit_dir)
+    );
+}
+
+static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, bool boundary_mode, const CrossFieldQuery* source_field) {
     SerialBuffer* sb = &obs->sb;
     sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t);
 
@@ -387,6 +396,18 @@ static void serialize_obs_validity_mask(SerialObsBuffer* obs, QuadMeshingEnv* en
         int dist = env->cache.frontier_hop_distance.data[i];
         serialize_u8(sb, dist >= 0 ? (uint8_t)(dist & 1) : 0);
     }
+
+    Vec2 source_pos = env->mesh.vertices.data[source].pos;
+    int valid_idx = 0;
+    for (int i=0; i<env->mesh.frontier.size; ++i) {
+        int target = env->mesh.frontier.data[i];
+        float alignment = 0.0f;
+        if (valid_idx < env->cache.valid_boundary_idx.size && env->cache.valid_boundary_idx.data[valid_idx] == i) {
+            alignment = target_cross_field_alignment(env, source_field, source_pos, env->mesh.vertices.data[target].pos);
+            ++valid_idx;
+        }
+        serialize_float(sb, alignment);
+    }
     BENCH_END(obs_validity_loop);
 }
 
@@ -407,6 +428,10 @@ static size_t obs_validity_bytes(QuadMesh* mesh) {
 
 static size_t obs_target_parity_bytes(QuadMesh* mesh) {
     return mesh->frontier.size * sizeof(uint8_t);
+}
+
+static size_t obs_target_cross_field_bytes(QuadMesh* mesh) {
+    return mesh->frontier.size * sizeof(float);
 }
 
 static void compute_frontier_hop_distances(QuadMeshingEnv* env, int source) {
@@ -472,9 +497,9 @@ static bool prevent_triangle_target_allowed(QuadMeshingEnv* env, int target_fidx
     return false;
 }
 
-static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source) {
+static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* env, int source, const CrossFieldQuery* source_field) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(&env->mesh) + obs_target_parity_bytes(&env->mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(&env->mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(&env->mesh) + obs_target_parity_bytes(&env->mesh) + obs_target_cross_field_bytes(&env->mesh);
 
     // Empty valid index cache
     IntArray_resize(&env->cache.valid_candidate_idx, 0);
@@ -490,6 +515,7 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
         IntArray_push(&env->cache.valid_candidate_idx, i);
         serialize_float(sb, target_pos.x);
         serialize_float(sb, target_pos.y);
+        serialize_float(sb, target_cross_field_alignment(env, source_field, env->mesh.vertices.data[source].pos, target_pos));
         ++valid_count;
     }
     BENCH_END(obs_candidate_loop);
@@ -500,7 +526,7 @@ static void serialize_obs_new_candidates(SerialObsBuffer* obs, QuadMeshingEnv* e
 
 void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Array* candidates) {
     SerialBuffer* sb = &obs->sb;
-    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(mesh) + obs_target_parity_bytes(mesh);
+    sb->pos = sizeof(uint8_t) + sizeof(float) + obs_frontier_bytes(mesh) + 2*sizeof(uint16_t) + obs_validity_bytes(mesh) + obs_target_parity_bytes(mesh) + obs_target_cross_field_bytes(mesh);
 
     int valid_count = deserialize_u16(sb);
 
@@ -509,6 +535,7 @@ void deserialize_obs_new_candidates(SerialObsBuffer* obs, QuadMesh* mesh, Vec2Ar
     for (int i=0; i<valid_count; ++i) {
         float x = deserialize_float(sb);
         float y = deserialize_float(sb);
+        (void)deserialize_float(sb);
         Vec2Array_push(candidates,(Vec2){x, y});
     }
 }
@@ -538,14 +565,15 @@ static void compute_observations(QuadMeshingEnv* env) {
         BENCH_END(obs_frontier);
     } else {
         int source = env->mesh.frontier.data[source_slot];
+        CrossFieldQuery source_field = cross_field_query(&env->cross_field, env->mesh.vertices.data[source].pos);
         BENCH_START(obs_source, "quad_meshing.obs_source");
         serialize_obs_source(&obs, &env->mesh, (uint16_t)source_slot);
         BENCH_END(obs_source);
         BENCH_START(obs_validity_mask, "quad_meshing.obs_validity_mask");
-        serialize_obs_validity_mask(&obs, env, source, env->boundary_mode);
+        serialize_obs_validity_mask(&obs, env, source, env->boundary_mode, &source_field);
         BENCH_END(obs_validity_mask);
         BENCH_START(obs_new_candidates, "quad_meshing.obs_new_candidates");
-        serialize_obs_new_candidates(&obs, env, source);
+        serialize_obs_new_candidates(&obs, env, source, &source_field);
         BENCH_END(obs_new_candidates);
     }
 }
