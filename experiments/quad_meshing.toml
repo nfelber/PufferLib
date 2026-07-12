@@ -159,6 +159,12 @@ target_global_perceiver_layers = 6
 target_global_perceiver_heads = 8
 
 [[experiments]]
+name = "random_source"
+
+[experiments.policy]
+use_suggested_vertex = True
+
+[[experiments]]
 name = "no_chiral"
 
 [experiments.policy]
