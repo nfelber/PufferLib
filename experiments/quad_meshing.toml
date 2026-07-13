@@ -1,7 +1,7 @@
 [batch]
 env = "quad_meshing"
 project = "puffer4"
-group = "quad_meshing_experiments"
+group = "quad_meshing_ablations"
 seeds = [1, 2, 3]
 slowly = true
 wandb = true
@@ -108,7 +108,7 @@ intersection_tol = 1e-3
 export_obj = false
 
 [defaults.train]
-total_timesteps = 5_000_000
+total_timesteps = 30_000_000
 learning_rate = 1e-3
 anneal_lr = true
 min_lr_ratio = 0.1
@@ -119,24 +119,18 @@ ent_coef = 0.001
 minibatch_size = 1024
 horizon = 256
 
-# [[experiments]]
-# name = "baseline"
-#
-# [[experiments]]
-# name = "no_perceiver"
-#
-# [experiments.policy]
-# target_pipeline = [ "init", "painn" ]
-#
-# [[experiments]]
-# name = "big"
-#
-# [experiments.policy]
-# frontier_node_hidden_size = 128
-# frontier_edge_hidden_size = 128
-# frontier_context_hidden_size = 128
-# target_hidden_size = 128
-# target_global_perceiver_d_model = 128
+[[experiments]]
+name = "baseline"
+
+[[experiments]]
+name = "big"
+
+[experiments.policy]
+frontier_node_hidden_size = 128
+frontier_edge_hidden_size = 128
+frontier_context_hidden_size = 128
+target_hidden_size = 128
+target_global_perceiver_d_model = 128
 
 [[experiments]]
 name = "small"
@@ -148,68 +142,63 @@ frontier_context_hidden_size = 32
 target_hidden_size = 32
 target_global_perceiver_d_model = 32
 
-# [[experiments]]
-# name = "deep_perceiver"
-#
-# [experiments.policy]
-# target_global_perceiver_d_model = 64
-# target_global_perceiver_length_bands = 4
-# target_global_perceiver_num_latents = 32
-# target_global_perceiver_layers = 6
-# target_global_perceiver_heads = 8
-#
-# [[experiments]]
-# name = "random_source"
-#
-# [experiments.policy]
-# use_suggested_vertex = true
-#
-# [[experiments]]
-# name = "no_chiral"
-#
-# [experiments.policy]
-# frontier_painn_chiral = false
-#
-# [[experiments]]
-# name = "no_cross_field_observation"
-#
-# [experiments.policy]
-# target_init_cross_field = false
-#
-# [[experiments]]
-# name = "boundary_mode"
-#
-# [experiments.env]
-# boundary_mode = true
-#
-# [[experiments]]
-# name = "no_cross_field_reward"
-#
-# [experiments.env]
-# reward_cross_field = true
-#
-# [[experiments]]
-# name = "no_potential"
-#
-# [experiments.env]
-# potential_beta = 0.0
+[[experiments]]
+name = "se2_invariant"
+
+[experiments.policy]
+frontier_pipeline = [ "init", "se2" ]
+target_pipeline = [ "init", "se2" ]
+frontier_se2_layers = 3
 
 [[experiments]]
-name = "long"
+name = "no_perceiver"
 
-[experiments.train]
-total_timesteps = 20_000_000
-
-[[experiments]]
-name = "long_lr_small"
-
-[experiments.train]
-total_timesteps = 20_000_000
-learning_rate = 3e-4
+[experiments.policy]
+target_pipeline = [ "init", "painn" ]
 
 [[experiments]]
-name = "long_lr_big"
+name = "deep_perceiver"
 
-[experiments.train]
-total_timesteps = 20_000_000
-learning_rate = 3e-3
+[experiments.policy]
+target_global_perceiver_d_model = 64
+target_global_perceiver_length_bands = 4
+target_global_perceiver_num_latents = 32
+target_global_perceiver_layers = 6
+target_global_perceiver_heads = 8
+
+[[experiments]]
+name = "no_chiral"
+
+[experiments.policy]
+frontier_painn_chiral = false
+
+[[experiments]]
+name = "no_cross_field_observation"
+
+[experiments.policy]
+target_init_cross_field = false
+
+[[experiments]]
+name = "random_source"
+
+[experiments.policy]
+use_suggested_vertex = true
+
+[[experiments]]
+name = "boundary_mode"
+
+[experiments.env]
+boundary_mode = true
+
+[[experiments]]
+name = "no_cross_field_reward"
+
+[experiments.env]
+reward_cross_field = true
+
+[[experiments]]
+name = "no_potential"
+
+[experiments.env]
+potential_beta = 0.0
+
