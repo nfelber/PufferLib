@@ -13,7 +13,7 @@
 // - selected source frontier index [2]
 // - valid target count [2]
 // - valid targets: position xyz + normal xyz + path length + kind + parity + cross-field alignment [MAX_TARGETS * 34]
-#define MAX_FRONTIER_SIZE 256
+#define MAX_FRONTIER_SIZE 512
 #define MAX_DEGREE 8
 #define MAX_TARGETS 768
 #define OBS_SIZE ( \

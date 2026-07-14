@@ -184,6 +184,53 @@ static bool qm3_check_loop_removal_across_triangles_debug(void) {
     return ok;
 }
 
+static bool qm3_check_loop_removal_native_edge_debug(void) {
+    Qm3Vec3 vertices[4] = {
+        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+        {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+    };
+    Qm3Tri triangles[2] = {{0, 1, 2}, {0, 2, 3}};
+    Qm3TriNeighbors neighbors[2] = {{-1, 1, -1}, {-1, -1, 0}};
+    Qm3SurfaceSample samples[2] = {
+        {.p = {0.75f, 0.25f, 0.0f}, .tri = 0},
+        {.p = {0.25f, 0.75f, 0.0f}, .tri = 1},
+    };
+    Qm3Vec2 tri2d[6] = {
+        {0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f},
+        {0.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f},
+    };
+    unsigned char tri2d_valid[2] = {1, 1};
+    unsigned char disabled[2] = {0};
+    int sample_offsets[3] = {0, 1, 2};
+    int sample_ids[2] = {0, 1};
+    Qm3PathSegment segments[] = {
+        {.tri = 0, .a = {0.0f, 0.0f, 0.0f}, .b = {1.0f, 0.0f, 0.0f}},
+        {.tri = 0, .a = {1.0f, 0.0f, 0.0f}, .b = {1.0f, 1.0f, 0.0f}},
+        {.tri = 0, .a = {1.0f, 1.0f, 0.0f}, .b = {0.0f, 0.0f, 0.0f}},
+        {.tri = 1, .a = {1.0f, 1.0f, 0.0f}, .b = {0.0f, 0.0f, 0.0f}},
+    };
+    QuadMeshing3DEnv env = {0};
+    env.surface.vertices = vertices;
+    env.surface.vertex_count = 4;
+    env.surface.triangles = triangles;
+    env.surface.triangle_neighbors = neighbors;
+    env.surface.triangle_count = 2;
+    env.surface.samples = samples;
+    env.surface.sample_count = 2;
+    env.continuous_ctx.tri2d_base = tri2d;
+    env.continuous_ctx.tri2d_valid = tri2d_valid;
+    env.surface_topo.tri_sample_offsets = sample_offsets;
+    env.surface_topo.tri_sample_ids = sample_ids;
+    env.sample_disabled = disabled;
+    Qm3PathSegmentArray loop = {.data = segments, .count = 4, .cap = 4};
+    Qm3LoopRemovalStats stats = qm3_remove_samples_inside_loop(&env, &loop, 1);
+    bool ok = stats.chosen_side == 1 && stats.disabled_samples == 1 && disabled[0] && !disabled[1];
+    printf("debug_loop_removal_native_edge chosen=%d removed=%u inside=%d outside=%d conflicts=%u\n",
+        stats.chosen_side, stats.disabled_samples, disabled[0], disabled[1], stats.classification_conflicts);
+    qm3_loop_debug_free(&env.loop_debug);
+    return ok;
+}
+
 static bool qm3_check_loop_removal_locality_debug(void) {
     const uint32_t triangle_count = 40000;
     Qm3Vec3 vertices[3] = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
@@ -348,6 +395,7 @@ int main(int argc, char** argv) {
         QM3_ASSERT(qm3_check_loop_subdivision_debug());
         QM3_ASSERT(qm3_check_loop_removal_debug());
         QM3_ASSERT(qm3_check_loop_removal_across_triangles_debug());
+        QM3_ASSERT(qm3_check_loop_removal_native_edge_debug());
         QM3_ASSERT(qm3_check_loop_removal_locality_debug());
         c_close(&env);
         return 0;

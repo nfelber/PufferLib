@@ -25,12 +25,6 @@ typedef struct {
 } Qm3Path;
 
 typedef struct {
-    int tri;
-    Qm3Vec3 a;
-    Qm3Vec3 b;
-} Qm3PathSegment;
-
-typedef struct {
     Qm3PathSegment* data;
     uint32_t count;
     uint32_t cap;
@@ -650,6 +644,22 @@ static void qm3_mesh_build_from_frontier_edges(Qm3Mesh* mesh, const Qm3Surface* 
         uint32_t sample_b = surface->frontier_edges[2u * i + 1u];
         uint32_t a = qm3_mesh_vertex_for_sample(mesh, surface, sample_to_graph, sample_a);
         uint32_t b = qm3_mesh_vertex_for_sample(mesh, surface, sample_to_graph, sample_b);
+        if (surface->frontier_paths) {
+            const Qm3FrontierPath* path = &surface->frontier_paths[i];
+            qm3_mesh_add_edge_with_path(
+                mesh,
+                a,
+                b,
+                0,
+                &surface->frontier_path_points[path->path_offset],
+                path->path_count,
+                &surface->frontier_path_segments[path->segment_offset],
+                path->segment_count,
+                path->path_length
+            );
+            continue;
+        }
+
         Qm3Vec3 points[2] = {surface->samples[sample_a].p, surface->samples[sample_b].p};
         Qm3PathSegment segments[2];
         uint32_t segment_count = 0;

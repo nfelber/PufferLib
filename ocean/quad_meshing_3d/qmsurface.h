@@ -24,12 +24,21 @@
 #define QMSURF3D_SECTION_FACE_DIR_V 8u
 #define QMSURF3D_SECTION_SAMPLES 9u
 #define QMSURF3D_SECTION_FRONTIER_EDGES 10u
+#define QMSURF3D_SECTION_FRONTIER_PATHS 11u
+#define QMSURF3D_SECTION_FRONTIER_PATH_POINTS 12u
+#define QMSURF3D_SECTION_FRONTIER_PATH_SEGMENTS 13u
 
 typedef struct {
     float x;
     float y;
     float z;
 } Qm3Vec3;
+
+typedef struct {
+    int32_t tri;
+    Qm3Vec3 a;
+    Qm3Vec3 b;
+} Qm3PathSegment;
 
 typedef struct {
     uint32_t a;
@@ -58,6 +67,14 @@ typedef struct {
 } Qm3SurfaceSample;
 
 typedef struct {
+    uint32_t path_offset;
+    uint32_t path_count;
+    uint32_t segment_offset;
+    uint32_t segment_count;
+    float path_length;
+} Qm3FrontierPath;
+
+typedef struct {
     uint32_t type;
     uint32_t count;
     uint32_t elem_size;
@@ -75,10 +92,16 @@ typedef struct {
     Qm3Vec3* face_dir_v;
     Qm3SurfaceSample* samples;
     uint32_t* frontier_edges;
+    Qm3FrontierPath* frontier_paths;
+    Qm3Vec3* frontier_path_points;
+    Qm3PathSegment* frontier_path_segments;
     uint32_t vertex_count;
     uint32_t triangle_count;
     uint32_t sample_count;
     uint32_t frontier_edge_count;
+    uint32_t frontier_path_count;
+    uint32_t frontier_path_point_count;
+    uint32_t frontier_path_segment_count;
     Qm3Vec3 bounds_min;
     Qm3Vec3 bounds_max;
 } Qm3Surface;
@@ -129,6 +152,9 @@ static void qm3_surface_free(Qm3Surface* surface) {
     free(surface->face_dir_v);
     free(surface->samples);
     free(surface->frontier_edges);
+    free(surface->frontier_paths);
+    free(surface->frontier_path_points);
+    free(surface->frontier_path_segments);
     qm3_surface_init(surface);
 }
 
@@ -186,6 +212,9 @@ static void qm3_surface_load(Qm3Surface* surface, const char* path) {
     int saw_dir_v = 0;
     int saw_samples = 0;
     int saw_frontier_edges = 0;
+    int saw_frontier_paths = 0;
+    int saw_frontier_path_points = 0;
+    int saw_frontier_path_segments = 0;
 
     for (uint32_t i = 0; i < section_count; ++i) {
         Qm3SectionHeader header;
@@ -227,6 +256,18 @@ static void qm3_surface_load(Qm3Surface* surface, const char* path) {
             surface->frontier_edges = (uint32_t*)qm3_read_section_array(f, header.count, header.elem_size, 2u * sizeof(uint32_t));
             surface->frontier_edge_count = header.count;
             saw_frontier_edges = 1;
+        } else if (header.type == QMSURF3D_SECTION_FRONTIER_PATHS) {
+            surface->frontier_paths = (Qm3FrontierPath*)qm3_read_section_array(f, header.count, header.elem_size, sizeof(Qm3FrontierPath));
+            surface->frontier_path_count = header.count;
+            saw_frontier_paths = 1;
+        } else if (header.type == QMSURF3D_SECTION_FRONTIER_PATH_POINTS) {
+            surface->frontier_path_points = (Qm3Vec3*)qm3_read_section_array(f, header.count, header.elem_size, sizeof(Qm3Vec3));
+            surface->frontier_path_point_count = header.count;
+            saw_frontier_path_points = 1;
+        } else if (header.type == QMSURF3D_SECTION_FRONTIER_PATH_SEGMENTS) {
+            surface->frontier_path_segments = (Qm3PathSegment*)qm3_read_section_array(f, header.count, header.elem_size, sizeof(Qm3PathSegment));
+            surface->frontier_path_segment_count = header.count;
+            saw_frontier_path_segments = 1;
         } else {
             QM3_ASSERT(fseek(f, (long)((size_t)header.count * (size_t)header.elem_size), SEEK_CUR) == 0);
         }
@@ -242,4 +283,29 @@ static void qm3_surface_load(Qm3Surface* surface, const char* path) {
         QM3_ASSERT(surface->frontier_edges[i] < surface->sample_count);
     }
     qm3_surface_update_bounds(surface);
+
+    int embedded_path_sections = saw_frontier_paths + saw_frontier_path_points + saw_frontier_path_segments;
+    QM3_ASSERT(embedded_path_sections == 0 || embedded_path_sections == 3);
+    if (embedded_path_sections == 3) {
+        QM3_ASSERT(surface->frontier_path_count == surface->frontier_edge_count);
+        float tol = fmaxf(qm3_surface_diag(surface) * 1e-5f, 1e-6f);
+        for (uint32_t i = 0; i < surface->frontier_edge_count; ++i) {
+            const Qm3FrontierPath* path = &surface->frontier_paths[i];
+            QM3_ASSERT(path->path_count >= 2 && path->segment_count > 0);
+            QM3_ASSERT((uint64_t)path->path_offset + path->path_count <= surface->frontier_path_point_count);
+            QM3_ASSERT((uint64_t)path->segment_offset + path->segment_count <= surface->frontier_path_segment_count);
+            QM3_ASSERT(isfinite(path->path_length) && path->path_length > 0.0f);
+            uint32_t sample_a = surface->frontier_edges[2u * i];
+            uint32_t sample_b = surface->frontier_edges[2u * i + 1u];
+            Qm3Vec3 first = surface->frontier_path_points[path->path_offset];
+            Qm3Vec3 last = surface->frontier_path_points[path->path_offset + path->path_count - 1u];
+            QM3_ASSERT(qm3_len(qm3_sub(first, surface->samples[sample_a].p)) <= tol);
+            QM3_ASSERT(qm3_len(qm3_sub(last, surface->samples[sample_b].p)) <= tol);
+            for (uint32_t si = 0; si < path->segment_count; ++si) {
+                const Qm3PathSegment* segment = &surface->frontier_path_segments[path->segment_offset + si];
+                QM3_ASSERT(segment->tri >= 0 && (uint32_t)segment->tri < surface->triangle_count);
+                QM3_ASSERT(qm3_len(qm3_sub(segment->a, segment->b)) > 0.0f);
+            }
+        }
+    }
 }

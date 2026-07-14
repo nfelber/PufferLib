@@ -46,6 +46,9 @@ constexpr std::uint32_t kSurfSectionFaceDirU = 7;
 constexpr std::uint32_t kSurfSectionFaceDirV = 8;
 constexpr std::uint32_t kSurfSectionSamples = 9;
 constexpr std::uint32_t kSurfSectionFrontierEdges = 10;
+constexpr std::uint32_t kSurfSectionFrontierPaths = 11;
+constexpr std::uint32_t kSurfSectionFrontierPathPoints = 12;
+constexpr std::uint32_t kSurfSectionFrontierPathSegments = 13;
 
 struct Vec2f {
     float x;
@@ -89,6 +92,20 @@ struct FrontierEdgeRecord {
     std::uint32_t b;
 };
 
+struct FrontierPathRecord {
+    std::uint32_t path_offset;
+    std::uint32_t path_count;
+    std::uint32_t segment_offset;
+    std::uint32_t segment_count;
+    float path_length;
+};
+
+struct FrontierPathSegmentRecord {
+    std::int32_t tri;
+    Vec3f a;
+    Vec3f b;
+};
+
 enum class SurfaceSampleMethod {
     Random,
     Stratified,
@@ -127,6 +144,17 @@ double sqr(double x) {
 double dist2(Vec2f a, Vec2f b) {
     return sqr(static_cast<double>(a.x) - static_cast<double>(b.x)) +
            sqr(static_cast<double>(a.y) - static_cast<double>(b.y));
+}
+
+double dist(Vec2f a, Vec2f b) {
+    return std::sqrt(dist2(a, b));
+}
+
+Vec2f mix2(Vec2f a, Vec2f b, double t) {
+    return Vec2f{
+        static_cast<float>((1.0 - t) * a.x + t * b.x),
+        static_cast<float>((1.0 - t) * a.y + t * b.y),
+    };
 }
 
 double point_segment_dist2(Vec2f p, Vec2f a, Vec2f b) {
@@ -416,6 +444,14 @@ double signed_area(const std::vector<Vec2f>& poly) {
     return 0.5 * area;
 }
 
+double triangle_area_2d(Vec2f a, Vec2f b, Vec2f c) {
+    const double abx = static_cast<double>(b.x) - a.x;
+    const double aby = static_cast<double>(b.y) - a.y;
+    const double acx = static_cast<double>(c.x) - a.x;
+    const double acy = static_cast<double>(c.y) - a.y;
+    return 0.5 * std::abs(abx * acy - aby * acx);
+}
+
 Normalize2D make_normalize_2d(const Eigen::MatrixXd& V) {
     if (V.rows() == 0 || V.cols() < 2) {
         throw std::runtime_error("Expected non-empty 2D/3D vertex matrix.");
@@ -502,6 +538,50 @@ std::vector<Vec2f> normalized_mesh_boundary(
     return out;
 }
 
+double normalized_mesh_area_2d(const directional::TriMesh& mesh, const Normalize2D& norm) {
+    double area = 0.0;
+    for (int f = 0; f < mesh.F.rows(); ++f) {
+        const Vec2f a = normalize_point_2d(mesh.V.row(mesh.F(f, 0)), norm);
+        const Vec2f b = normalize_point_2d(mesh.V.row(mesh.F(f, 1)), norm);
+        const Vec2f c = normalize_point_2d(mesh.V.row(mesh.F(f, 2)), norm);
+        area += triangle_area_2d(a, b, c);
+    }
+    return area;
+}
+
+std::vector<Vec2f> resample_boundary_edges(
+    const std::vector<Vec2f>& boundary,
+    double target_edge_length
+) {
+    if (boundary.size() < 3) {
+        throw std::runtime_error("Cannot resample a degenerate boundary.");
+    }
+    if (target_edge_length <= 0.0) {
+        throw std::runtime_error("Boundary target edge length must be positive.");
+    }
+
+    std::vector<Vec2f> out;
+    for (size_t i = 0; i < boundary.size(); ++i) {
+        const Vec2f a = boundary[i];
+        const Vec2f b = boundary[(i + 1) % boundary.size()];
+        const double len = dist(a, b);
+        if (len <= 1e-12) continue;
+
+        const std::uint32_t segment_count = std::max<std::uint32_t>(
+            1,
+            static_cast<std::uint32_t>(std::llround(len / target_edge_length))
+        );
+        for (std::uint32_t j = 0; j < segment_count; ++j) {
+            out.push_back(mix2(a, b, static_cast<double>(j) / segment_count));
+        }
+    }
+
+    if (out.size() < 3 || std::abs(signed_area(out)) <= 1e-12) {
+        throw std::runtime_error("Boundary resampling produced a degenerate polygon.");
+    }
+    return out;
+}
+
 Normalize3D make_normalize_3d(const Eigen::MatrixXd& V) {
     if (V.rows() == 0 || V.cols() < 3) {
         throw std::runtime_error("Expected non-empty 3D vertex matrix.");
@@ -578,6 +658,18 @@ Vec3f mix3(Vec3f a, Vec3f b, Vec3f c, double wa, double wb, double wc) {
         static_cast<float>(wa * a.x + wb * b.x + wc * c.x),
         static_cast<float>(wa * a.y + wb * b.y + wc * c.y),
         static_cast<float>(wa * a.z + wb * b.z + wc * c.z),
+    };
+}
+
+double dist3(Vec3f a, Vec3f b) {
+    return (vec3_to_row(a) - vec3_to_row(b)).norm();
+}
+
+Vec3f mix3(Vec3f a, Vec3f b, double t) {
+    return Vec3f{
+        static_cast<float>((1.0 - t) * a.x + t * b.x),
+        static_cast<float>((1.0 - t) * a.y + t * b.y),
+        static_cast<float>((1.0 - t) * a.z + t * b.z),
     };
 }
 
@@ -1114,7 +1206,8 @@ void save_shape_cache(
     const directional::TriMesh& mesh,
     const Eigen::MatrixXd& dir_u,
     const Eigen::MatrixXd& dir_v,
-    const std::vector<Vec2f>* input_boundary
+    const std::vector<Vec2f>* input_boundary,
+    std::uint64_t target_quad_count
 ) {
     if (dir_u.rows() != mesh.F.rows() || dir_v.rows() != mesh.F.rows()) {
         throw std::runtime_error("Cross-field direction arrays must be face-sized.");
@@ -1133,6 +1226,20 @@ void save_shape_cache(
         validate_boundary_match(boundary, mesh_boundary);
     } else {
         boundary = mesh_boundary;
+    }
+
+    if (target_quad_count > 0) {
+        const double mesh_area = normalized_mesh_area_2d(mesh, norm);
+        if (mesh_area <= 0.0) {
+            throw std::runtime_error("Cannot derive boundary target edge length from zero mesh area.");
+        }
+        const double target_edge_length = std::sqrt(mesh_area / static_cast<double>(target_quad_count));
+        const size_t old_boundary_size = boundary.size();
+        boundary = resample_boundary_edges(boundary, target_edge_length);
+        std::cout << "Boundary resampling\n";
+        std::cout << "  target quad count: " << target_quad_count << "\n";
+        std::cout << "  target edge length: " << target_edge_length << "\n";
+        std::cout << "  vertices: " << old_boundary_size << " -> " << boundary.size() << "\n";
     }
 
     std::vector<CrossFieldFaceRecord> faces;
@@ -1191,6 +1298,7 @@ void save_surface_cache_3d(
     const Eigen::MatrixXd& dir_v,
     double sample_density,
     SurfaceSampleMethod sample_method,
+    std::uint64_t target_quad_count,
     double sharp_dihedral_radians,
     std::uint32_t sample_seed
 ) {
@@ -1353,8 +1461,16 @@ void save_surface_cache_3d(
         }
     }
 
-    std::vector<FrontierEdgeRecord> frontier_edges;
-    frontier_edges.reserve(edges.size());
+    struct SharpFrontierEdge {
+        EdgeAdjacency adj;
+        std::int32_t incident_tri = -1;
+    };
+
+    std::vector<SharpFrontierEdge> sharp_edges;
+    sharp_edges.reserve(edges.size());
+    const double target_frontier_edge_length = target_quad_count > 0
+        ? std::sqrt(total_area / static_cast<double>(target_quad_count))
+        : 0.0;
     const std::uint32_t invalid_sample = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::uint32_t> frontier_vertex_samples(vertices.size(), invalid_sample);
     const auto sample_for_frontier_vertex = [&](std::uint32_t vertex, std::int32_t incident_tri) -> std::uint32_t {
@@ -1376,6 +1492,20 @@ void save_surface_cache_3d(
         return sample_id;
     };
 
+    const auto sample_for_frontier_edge_point = [&](const EdgeAdjacency& adj, std::int32_t incident_tri, double t) -> std::uint32_t {
+        if (incident_tri < 0) {
+            throw std::runtime_error("Sharp frontier edge has no incident triangle.");
+        }
+        const std::uint32_t sample_id = static_cast<std::uint32_t>(samples.size());
+        samples.push_back(SurfaceSampleRecord{
+            mix3(vertices[adj.a], vertices[adj.b], t),
+            normalize_vec3f(mix3(vertex_normals[adj.a], vertex_normals[adj.b], t)),
+            static_cast<std::uint32_t>(incident_tri),
+            0,
+        });
+        return sample_id;
+    };
+
     for (const auto& item : edges) {
         const EdgeAdjacency& adj = item.second;
         float angle = static_cast<float>(M_PI);
@@ -1389,11 +1519,304 @@ void save_surface_cache_3d(
         }
         if (sharp) {
             const std::int32_t incident_tri = adj.f0 >= 0 ? adj.f0 : adj.f1;
-            frontier_edges.push_back(FrontierEdgeRecord{
-                sample_for_frontier_vertex(adj.a, incident_tri),
-                sample_for_frontier_vertex(adj.b, incident_tri),
-            });
+            sharp_edges.push_back(SharpFrontierEdge{adj, incident_tri});
         }
+    }
+
+    std::sort(
+        sharp_edges.begin(),
+        sharp_edges.end(),
+        [](const SharpFrontierEdge& lhs, const SharpFrontierEdge& rhs) {
+            if (lhs.adj.a != rhs.adj.a) return lhs.adj.a < rhs.adj.a;
+            return lhs.adj.b < rhs.adj.b;
+        }
+    );
+
+    std::vector<FrontierEdgeRecord> frontier_edges;
+    frontier_edges.reserve(sharp_edges.size());
+    std::vector<FrontierPathRecord> frontier_paths;
+    frontier_paths.reserve(sharp_edges.size());
+    std::vector<Vec3f> frontier_path_points;
+    std::vector<FrontierPathSegmentRecord> frontier_path_segments;
+    size_t frontier_sample_start = samples.size();
+    size_t frontier_component_count = 0;
+    size_t branch_component_count = 0;
+
+    struct FrontierPathPiece {
+        size_t edge_idx;
+        Vec3f a;
+        Vec3f b;
+    };
+
+    const auto append_frontier_edge = [&](std::uint32_t sample_a, std::uint32_t sample_b, const std::vector<FrontierPathPiece>& pieces) {
+        if (sample_a >= samples.size() || sample_b >= samples.size() || pieces.empty()) {
+            throw std::runtime_error("Invalid embedded frontier path.");
+        }
+
+        const std::uint32_t path_offset = static_cast<std::uint32_t>(frontier_path_points.size());
+        const std::uint32_t segment_offset = static_cast<std::uint32_t>(frontier_path_segments.size());
+        frontier_path_points.push_back(samples[sample_a].p);
+        double path_length = 0.0;
+
+        for (const FrontierPathPiece& piece : pieces) {
+            if (piece.edge_idx >= sharp_edges.size()) {
+                throw std::runtime_error("Embedded frontier path references an invalid sharp edge.");
+            }
+            const double piece_length = dist3(piece.a, piece.b);
+            if (piece_length <= 1e-12) continue;
+            const SharpFrontierEdge& edge = sharp_edges[piece.edge_idx];
+            frontier_path_points.push_back(piece.b);
+            path_length += piece_length;
+            if (edge.adj.f0 >= 0) {
+                frontier_path_segments.push_back(FrontierPathSegmentRecord{edge.adj.f0, piece.a, piece.b});
+            }
+            if (edge.adj.f1 >= 0 && edge.adj.f1 != edge.adj.f0) {
+                frontier_path_segments.push_back(FrontierPathSegmentRecord{edge.adj.f1, piece.a, piece.b});
+            }
+        }
+
+        if (frontier_path_points.size() - path_offset < 2 || frontier_path_segments.size() == segment_offset) {
+            throw std::runtime_error("Embedded frontier path is degenerate.");
+        }
+        frontier_path_points.back() = samples[sample_b].p;
+        frontier_edges.push_back(FrontierEdgeRecord{sample_a, sample_b});
+        frontier_paths.push_back(FrontierPathRecord{
+            path_offset,
+            static_cast<std::uint32_t>(frontier_path_points.size()) - path_offset,
+            segment_offset,
+            static_cast<std::uint32_t>(frontier_path_segments.size()) - segment_offset,
+            static_cast<float>(path_length),
+        });
+    };
+
+    const auto append_resampled_single_edge = [&](size_t edge_idx) {
+        const SharpFrontierEdge& edge = sharp_edges[edge_idx];
+        const EdgeAdjacency& adj = edge.adj;
+        const std::uint32_t a_sample = sample_for_frontier_vertex(adj.a, edge.incident_tri);
+        const std::uint32_t b_sample = sample_for_frontier_vertex(adj.b, edge.incident_tri);
+
+        std::uint32_t segment_count = 1;
+        if (target_frontier_edge_length > 0.0) {
+            segment_count = std::max<std::uint32_t>(
+                1,
+                static_cast<std::uint32_t>(std::llround(dist3(vertices[adj.a], vertices[adj.b]) / target_frontier_edge_length))
+            );
+        }
+
+        std::uint32_t prev_sample = a_sample;
+        for (std::uint32_t j = 1; j < segment_count; ++j) {
+            const double t = static_cast<double>(j) / segment_count;
+            const std::uint32_t next_sample = sample_for_frontier_edge_point(adj, edge.incident_tri, t);
+            append_frontier_edge(prev_sample, next_sample, {{edge_idx, samples[prev_sample].p, samples[next_sample].p}});
+            prev_sample = next_sample;
+        }
+        append_frontier_edge(prev_sample, b_sample, {{edge_idx, samples[prev_sample].p, samples[b_sample].p}});
+    };
+
+    if (target_quad_count == 0) {
+        for (size_t i = 0; i < sharp_edges.size(); ++i) {
+            append_resampled_single_edge(i);
+        }
+    } else {
+        std::unordered_map<std::uint32_t, std::vector<size_t>> vertex_edges;
+        vertex_edges.reserve(sharp_edges.size() * 2);
+        for (size_t i = 0; i < sharp_edges.size(); ++i) {
+            vertex_edges[sharp_edges[i].adj.a].push_back(i);
+            vertex_edges[sharp_edges[i].adj.b].push_back(i);
+        }
+
+        std::vector<char> component_seen(sharp_edges.size(), 0);
+        std::vector<char> in_component(sharp_edges.size(), 0);
+        std::vector<char> traced(sharp_edges.size(), 0);
+
+        const auto other_vertex = [&](size_t edge_idx, std::uint32_t vertex) -> std::uint32_t {
+            const EdgeAdjacency& adj = sharp_edges[edge_idx].adj;
+            if (adj.a == vertex) return adj.b;
+            if (adj.b == vertex) return adj.a;
+            throw std::runtime_error("Frontier edge is not incident to chain vertex.");
+        };
+
+        const auto sample_at_chain_distance = [&](
+            const std::vector<std::uint32_t>& chain_vertices,
+            const std::vector<size_t>& chain_edges,
+            double distance
+        ) -> std::uint32_t {
+            double remaining = distance;
+            for (size_t i = 0; i < chain_edges.size(); ++i) {
+                const std::uint32_t from = chain_vertices[i];
+                const std::uint32_t to = chain_vertices[i + 1];
+                const SharpFrontierEdge& edge = sharp_edges[chain_edges[i]];
+                const double len = dist3(vertices[from], vertices[to]);
+                if (i + 1 == chain_edges.size() || remaining <= len) {
+                    const double t = len <= 1e-12 ? 0.0 : std::clamp(remaining / len, 0.0, 1.0);
+                    if (t <= 1e-10) return sample_for_frontier_vertex(from, edge.incident_tri);
+                    if (t >= 1.0 - 1e-10) return sample_for_frontier_vertex(to, edge.incident_tri);
+                    const double edge_t = edge.adj.a == from ? t : 1.0 - t;
+                    return sample_for_frontier_edge_point(edge.adj, edge.incident_tri, edge_t);
+                }
+                remaining -= len;
+            }
+            const size_t last_edge = chain_edges.back();
+            return sample_for_frontier_vertex(chain_vertices.back(), sharp_edges[last_edge].incident_tri);
+        };
+
+        for (size_t start_edge = 0; start_edge < sharp_edges.size(); ++start_edge) {
+            if (component_seen[start_edge]) continue;
+            ++frontier_component_count;
+
+            std::vector<size_t> component_edges;
+            std::vector<size_t> stack{start_edge};
+            component_seen[start_edge] = 1;
+            std::set<std::uint32_t> component_vertices;
+
+            while (!stack.empty()) {
+                const size_t edge_idx = stack.back();
+                stack.pop_back();
+                component_edges.push_back(edge_idx);
+                const EdgeAdjacency& adj = sharp_edges[edge_idx].adj;
+                component_vertices.insert(adj.a);
+                component_vertices.insert(adj.b);
+
+                for (std::uint32_t vertex : {adj.a, adj.b}) {
+                    for (size_t next_edge : vertex_edges[vertex]) {
+                        if (!component_seen[next_edge]) {
+                            component_seen[next_edge] = 1;
+                            stack.push_back(next_edge);
+                        }
+                    }
+                }
+            }
+
+            bool has_branch = false;
+            std::vector<std::uint32_t> endpoints;
+            for (std::uint32_t vertex : component_vertices) {
+                const size_t degree = vertex_edges[vertex].size();
+                if (degree == 1) endpoints.push_back(vertex);
+                else if (degree != 2) has_branch = true;
+            }
+
+            const bool closed = endpoints.empty();
+            if (has_branch || (!closed && endpoints.size() != 2)) {
+                ++branch_component_count;
+                for (size_t edge_idx : component_edges) append_resampled_single_edge(edge_idx);
+                continue;
+            }
+
+            for (size_t edge_idx : component_edges) {
+                in_component[edge_idx] = 1;
+                traced[edge_idx] = 0;
+            }
+
+            std::vector<std::uint32_t> chain_vertices;
+            std::vector<size_t> chain_edges;
+            std::uint32_t current = closed ? sharp_edges[component_edges.front()].adj.a : endpoints.front();
+            const std::uint32_t start_vertex = current;
+            chain_vertices.push_back(current);
+
+            for (;;) {
+                size_t next_edge = std::numeric_limits<size_t>::max();
+                for (size_t candidate : vertex_edges[current]) {
+                    if (in_component[candidate] && !traced[candidate]) {
+                        next_edge = candidate;
+                        break;
+                    }
+                }
+                if (next_edge == std::numeric_limits<size_t>::max()) break;
+
+                traced[next_edge] = 1;
+                current = other_vertex(next_edge, current);
+                chain_edges.push_back(next_edge);
+                chain_vertices.push_back(current);
+                if (closed && current == start_vertex) break;
+            }
+
+            if (chain_edges.size() != component_edges.size()) {
+                ++branch_component_count;
+                for (size_t edge_idx : component_edges) append_resampled_single_edge(edge_idx);
+                for (size_t edge_idx : component_edges) in_component[edge_idx] = 0;
+                continue;
+            }
+
+            std::vector<double> chain_prefix(chain_edges.size() + 1, 0.0);
+            for (size_t i = 0; i < chain_edges.size(); ++i) {
+                chain_prefix[i + 1] = chain_prefix[i] + dist3(vertices[chain_vertices[i]], vertices[chain_vertices[i + 1]]);
+            }
+            const double chain_length = chain_prefix.back();
+            if (chain_length <= 1e-12) {
+                for (size_t edge_idx : component_edges) in_component[edge_idx] = 0;
+                continue;
+            }
+
+            const std::uint32_t segment_count = closed
+                ? std::max<std::uint32_t>(3, static_cast<std::uint32_t>(std::llround(chain_length / target_frontier_edge_length)))
+                : std::max<std::uint32_t>(1, static_cast<std::uint32_t>(std::llround(chain_length / target_frontier_edge_length)));
+            const double spacing = chain_length / segment_count;
+
+            std::vector<std::uint32_t> chain_samples;
+            chain_samples.reserve(static_cast<size_t>(segment_count) + (closed ? 0 : 1));
+            const std::uint32_t sample_count = closed ? segment_count : segment_count + 1;
+            for (std::uint32_t i = 0; i < sample_count; ++i) {
+                chain_samples.push_back(sample_at_chain_distance(chain_vertices, chain_edges, spacing * i));
+            }
+
+            for (std::uint32_t i = 0; i < segment_count; ++i) {
+                const std::uint32_t next = closed ? (i + 1) % segment_count : i + 1;
+                const double start_distance = spacing * i;
+                const double end_distance = spacing * (i + 1);
+                std::vector<FrontierPathPiece> pieces;
+                double cursor = start_distance;
+                while (end_distance - cursor > 1e-10) {
+                    size_t chain_edge = 0;
+                    while (chain_edge + 1 < chain_edges.size() && cursor >= chain_prefix[chain_edge + 1] - 1e-10) {
+                        ++chain_edge;
+                    }
+                    const double edge_length = chain_prefix[chain_edge + 1] - chain_prefix[chain_edge];
+                    if (edge_length <= 1e-12) {
+                        cursor = chain_prefix[chain_edge + 1];
+                        continue;
+                    }
+                    const double local_distance = std::clamp(cursor - chain_prefix[chain_edge], 0.0, edge_length);
+                    const double step = std::min(end_distance - cursor, edge_length - local_distance);
+                    if (step <= 1e-12) {
+                        cursor = chain_prefix[chain_edge + 1];
+                        continue;
+                    }
+
+                    const std::uint32_t from = chain_vertices[chain_edge];
+                    const std::uint32_t to = chain_vertices[chain_edge + 1];
+                    Vec3f a = pieces.empty()
+                        ? samples[chain_samples[i]].p
+                        : pieces.back().b;
+                    const bool is_last = end_distance - (cursor + step) <= 1e-10;
+                    Vec3f b = is_last
+                        ? samples[chain_samples[next]].p
+                        : mix3(vertices[from], vertices[to], (local_distance + step) / edge_length);
+                    pieces.push_back(FrontierPathPiece{chain_edges[chain_edge], a, b});
+                    cursor += step;
+                }
+                append_frontier_edge(chain_samples[i], chain_samples[next], pieces);
+            }
+
+            for (size_t edge_idx : component_edges) in_component[edge_idx] = 0;
+        }
+
+    }
+
+    if (target_quad_count > 0) {
+        std::cout << "Frontier edge resampling\n";
+        std::cout << "  target quad count: " << target_quad_count << "\n";
+        std::cout << "  target edge length: " << target_frontier_edge_length << "\n";
+        std::cout << "  sharp mesh edges: " << sharp_edges.size() << "\n";
+        std::cout << "  frontier components: " << frontier_component_count << "\n";
+        if (branch_component_count > 0) {
+            std::cout << "  branching components kept edge-local: " << branch_component_count << "\n";
+        }
+        std::cout << "  frontier edges: " << frontier_edges.size() << "\n";
+        std::cout << "  frontier samples: " << samples.size() - frontier_sample_start << "\n";
+    }
+
+    if (frontier_paths.size() != frontier_edges.size()) {
+        throw std::runtime_error("Frontier path metadata does not match frontier connectivity.");
     }
 
     const SurfaceInfoRecord info{
@@ -1411,7 +1834,7 @@ void save_surface_cache_3d(
     out.write(kSurfaceMagic, sizeof(kSurfaceMagic));
     if (!out) throw std::runtime_error("Failed to write 3D surface cache magic.");
 
-    const std::uint32_t section_count = 10;
+    const std::uint32_t section_count = 13;
     write_pod(out, kSurfaceVersion);
     write_pod(out, section_count);
 
@@ -1435,18 +1858,22 @@ void save_surface_cache_3d(
     write_section(kSurfSectionFaceDirV, static_cast<std::uint32_t>(face_dir_v.size()), sizeof(Vec3f), face_dir_v.data());
     write_section(kSurfSectionSamples, static_cast<std::uint32_t>(samples.size()), sizeof(SurfaceSampleRecord), samples.data());
     write_section(kSurfSectionFrontierEdges, static_cast<std::uint32_t>(frontier_edges.size()), sizeof(FrontierEdgeRecord), frontier_edges.data());
+    write_section(kSurfSectionFrontierPaths, static_cast<std::uint32_t>(frontier_paths.size()), sizeof(FrontierPathRecord), frontier_paths.data());
+    write_section(kSurfSectionFrontierPathPoints, static_cast<std::uint32_t>(frontier_path_points.size()), sizeof(Vec3f), frontier_path_points.data());
+    write_section(kSurfSectionFrontierPathSegments, static_cast<std::uint32_t>(frontier_path_segments.size()), sizeof(FrontierPathSegmentRecord), frontier_path_segments.data());
 }
 
 void print_usage(const char* argv0) {
     std::cerr
         << "Usage:\n"
-        << "  " << argv0 << " input.obj output.qmshape [--boundary boundary.json] [--npz debug.npz] [--no-boundary-constraints]\n"
-        << "  " << argv0 << " input.obj output.qmsurf [--3d] [--sample-density N] [--sample-method random|stratified] [--sharp-dihedral-deg D] [--sample-seed S] [--npz debug.npz]\n\n"
+        << "  " << argv0 << " input.obj output.qmshape [--boundary boundary.json] [--target-quad-count N] [--npz debug.npz] [--no-boundary-constraints]\n"
+        << "  " << argv0 << " input.obj output.qmsurf [--3d] [--sample-density N] [--sample-method random|stratified] [--target-quad-count N] [--sharp-dihedral-deg D] [--sample-seed S] [--npz debug.npz]\n\n"
         << "Primary output:\n"
         << "  .qmshape          binary normalized boundary + face cross-field cache\n\n"
         << "  .qmsurf           binary normalized 3D surface + normals + cross-field + samples\n\n"
         << "Options:\n"
         << "  --boundary PATH   store this JSON boundary and use it for normalization; validates it against input.obj\n"
+        << "  --target-quad-count N   resample 2D boundary or 3D frontier edges toward sqrt(mesh_area / N); disabled by default\n"
         << "  --npz PATH        additionally write a debug .npz cache\n\n"
         << "  --3d             write QMSURF3D cache instead of the 2D boundary cache\n"
         << "  --sample-density N       uniform candidate samples per normalized surface-area unit; default 1000\n"
@@ -1481,6 +1908,7 @@ int main(int argc, char** argv) {
         bool output_3d_surface = false;
         std::string output_npz;
         std::string input_boundary_json;
+        std::uint64_t target_quad_count = 0;
         double sample_density = 1000.0;
         SurfaceSampleMethod sample_method = SurfaceSampleMethod::Random;
         double sharp_dihedral_deg = 45.0;
@@ -1507,6 +1935,16 @@ int main(int argc, char** argv) {
                     return EXIT_FAILURE;
                 }
                 input_boundary_json = argv[++i];
+            } else if (arg == "--target-quad-count") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value after --target-quad-count\n";
+                    print_usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                target_quad_count = std::stoull(argv[++i]);
+                if (target_quad_count == 0) {
+                    throw std::runtime_error("--target-quad-count must be positive.");
+                }
             } else if (arg == "--sample-density") {
                 if (i + 1 >= argc) {
                     std::cerr << "Missing value after --sample-density\n";
@@ -1680,6 +2118,7 @@ int main(int argc, char** argv) {
                 dir_v,
                 sample_density,
                 sample_method,
+                target_quad_count,
                 sharp_dihedral_radians,
                 sample_seed
             );
@@ -1689,7 +2128,8 @@ int main(int argc, char** argv) {
                 mesh,
                 dir_u,
                 dir_v,
-                input_boundary_ptr
+                input_boundary_ptr,
+                target_quad_count
             );
         }
 

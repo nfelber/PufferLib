@@ -9,14 +9,14 @@ wandb = true
 # These values override config/default.ini and then config/quad_meshing_3d.ini
 # for every experiment in this file.
 [defaults.train]
-total_timesteps = 2_000_000
+total_timesteps = 20_000_000
+learning_rate = 1e-3
 
 [[experiments]]
 name = "baseline"
 
 [[experiments]]
-name = "larger-painn"
+name = "no_perceiver"
 
 [experiments.policy]
-frontier_painn_layers = 5
-frontier_painn_vector_channels = 32
+target_pipeline = [ "init", "painn" ]
