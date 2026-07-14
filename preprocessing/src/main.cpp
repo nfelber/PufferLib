@@ -1544,6 +1544,8 @@ int main(int argc, char** argv) {
 
         directional::TriMesh mesh;
 
+        std::cout << "Loading mesh...\n";
+
         if (!directional::readOBJ(input_obj, mesh)) {
             throw std::runtime_error("Failed to read OBJ: " + input_obj);
         }

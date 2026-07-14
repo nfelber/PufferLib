@@ -43,6 +43,203 @@ static bool qm3_check_face_registration_debug(void) {
     return quad_counts_ok && tri_counts_ok;
 }
 
+static bool qm3_check_loop_subdivision_case(const Qm3PathSegment* segments, uint32_t segment_count, int expected_cells, double expected_min_area, bool expected_edge_cut) {
+    Qm3Vec3 vertices[3] = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    Qm3Tri triangles[1] = {{0, 1, 2}};
+    Qm3Vec2 tri2d[3] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}};
+    unsigned char tri2d_valid[1] = {1};
+    QuadMeshing3DEnv env = {0};
+    env.surface.vertices = vertices;
+    env.surface.vertex_count = 3;
+    env.surface.triangles = triangles;
+    env.surface.triangle_count = 1;
+    env.continuous_ctx.tri2d_base = tri2d;
+    env.continuous_ctx.tri2d_valid = tri2d_valid;
+    Qm3PathSegmentArray path = {.data = (Qm3PathSegment*)segments, .count = segment_count, .cap = segment_count};
+    Qm3LoopSubdivision sub = {0};
+    sub.tri_ids = (int*)calloc(1, sizeof(int));
+    sub.tri_count = 1;
+    sub.tri_cell_offsets = (int*)calloc(2, sizeof(int));
+    sub.tri_portal_offsets = (int*)calloc(2, sizeof(int));
+    sub.tri_tol = (double*)calloc(1, sizeof(double));
+    unsigned char flags[3] = {0};
+    unsigned char boundary_tri[1] = {0};
+    bool ok = sub.tri_ids && sub.tri_cell_offsets && sub.tri_portal_offsets && sub.tri_tol &&
+        qm3_loop_build_triangle(&env, &path, 0, 0, &sub, flags, boundary_tri);
+    double min_area = INFINITY;
+    double total_area = 0.0;
+    for (int i = 0; i < sub.cell_count; ++i) {
+        min_area = fmin(min_area, sub.cells[i].area);
+        total_area += sub.cells[i].area;
+    }
+    bool has_edge_cut = ((flags[0] | flags[1] | flags[2]) & QM3_LOOP_EDGE_BLOCKED) != 0;
+    ok = ok && sub.cell_count == expected_cells && fabs(total_area - 0.5) <= 1e-6 &&
+        fabs(min_area - expected_min_area) <= 1e-6 && has_edge_cut == expected_edge_cut;
+    qm3_loop_subdivision_free(&sub);
+    return ok;
+}
+
+static bool qm3_check_loop_subdivision_debug(void) {
+    Qm3PathSegment chord[] = {{.tri = 0, .a = {0.5f, 0.0f, 0.0f}, .b = {0.0f, 0.5f, 0.0f}}};
+    Qm3PathSegment vertex_cut[] = {{.tri = 0, .a = {0.0f, 0.0f, 0.0f}, .b = {0.5f, 0.5f, 0.0f}}};
+    Qm3PathSegment interior_turn[] = {
+        {.tri = 0, .a = {0.5f, 0.0f, 0.0f}, .b = {0.25f, 0.25f, 0.0f}},
+        {.tri = 0, .a = {0.25f, 0.25f, 0.0f}, .b = {0.0f, 0.5f, 0.0f}},
+    };
+    Qm3PathSegment edge_cut[] = {{.tri = 0, .a = {0.0f, 0.0f, 0.0f}, .b = {1.0f, 0.0f, 0.0f}}};
+    bool chord_ok = qm3_check_loop_subdivision_case(chord, 1, 2, 0.125, false);
+    bool vertex_ok = qm3_check_loop_subdivision_case(vertex_cut, 1, 2, 0.25, false);
+    bool turn_ok = qm3_check_loop_subdivision_case(interior_turn, 2, 2, 0.125, false);
+    bool edge_ok = qm3_check_loop_subdivision_case(edge_cut, 1, 1, 0.5, true);
+    printf("debug_loop_subdivision chord=%d vertex=%d interior_turn=%d edge=%d\n", chord_ok, vertex_ok, turn_ok, edge_ok);
+    return chord_ok && vertex_ok && turn_ok && edge_ok;
+}
+
+static bool qm3_check_loop_removal_debug(void) {
+    Qm3Vec3 vertices[3] = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    Qm3Tri triangles[1] = {{0, 1, 2}};
+    Qm3TriNeighbors neighbors[1] = {{-1, -1, -1}};
+    Qm3SurfaceSample samples[2] = {
+        {.p = {0.3f, 0.3f, 0.0f}, .tri = 0},
+        {.p = {0.8f, 0.1f, 0.0f}, .tri = 0},
+    };
+    Qm3Vec2 tri2d[3] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}};
+    unsigned char tri2d_valid[1] = {1};
+    unsigned char disabled[2] = {0};
+    int sample_offsets[2] = {0, 2};
+    int sample_ids[2] = {0, 1};
+    Qm3PathSegment segments[] = {
+        {.tri = 0, .a = {0.2f, 0.2f, 0.0f}, .b = {0.6f, 0.2f, 0.0f}},
+        {.tri = 0, .a = {0.6f, 0.2f, 0.0f}, .b = {0.2f, 0.6f, 0.0f}},
+        {.tri = 0, .a = {0.2f, 0.6f, 0.0f}, .b = {0.2f, 0.2f, 0.0f}},
+    };
+    QuadMeshing3DEnv env = {0};
+    env.surface.vertices = vertices;
+    env.surface.vertex_count = 3;
+    env.surface.triangles = triangles;
+    env.surface.triangle_neighbors = neighbors;
+    env.surface.triangle_count = 1;
+    env.surface.samples = samples;
+    env.surface.sample_count = 2;
+    env.continuous_ctx.tri2d_base = tri2d;
+    env.continuous_ctx.tri2d_valid = tri2d_valid;
+    env.surface_topo.tri_sample_offsets = sample_offsets;
+    env.surface_topo.tri_sample_ids = sample_ids;
+    env.sample_disabled = disabled;
+    Qm3PathSegmentArray loop = {.data = segments, .count = 3, .cap = 3};
+    Qm3LoopRemovalStats stats = qm3_remove_samples_inside_loop(&env, &loop, 1);
+    bool ok = stats.chosen_side == 1 && stats.disabled_samples == 1 && disabled[0] && !disabled[1];
+    printf("debug_loop_removal chosen=%d removed=%u inside=%d outside=%d\n",
+        stats.chosen_side, stats.disabled_samples, disabled[0], disabled[1]);
+    qm3_loop_debug_free(&env.loop_debug);
+    return ok;
+}
+
+static bool qm3_check_loop_removal_across_triangles_debug(void) {
+    Qm3Vec3 vertices[4] = {
+        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+        {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+    };
+    Qm3Tri triangles[2] = {{0, 1, 2}, {0, 2, 3}};
+    Qm3TriNeighbors neighbors[2] = {{-1, 1, -1}, {-1, -1, 0}};
+    Qm3SurfaceSample samples[2] = {
+        {.p = {0.6f, 0.5f, 0.0f}, .tri = 0},
+        {.p = {0.9f, 0.1f, 0.0f}, .tri = 0},
+    };
+    Qm3Vec2 tri2d[6] = {
+        {0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f},
+        {0.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f},
+    };
+    unsigned char tri2d_valid[2] = {1, 1};
+    unsigned char disabled[2] = {0};
+    int sample_offsets[3] = {0, 2, 2};
+    int sample_ids[2] = {0, 1};
+    Qm3PathSegment segments[] = {
+        {.tri = 1, .a = {0.1f, 0.5f, 0.0f}, .b = {0.300001f, 0.300001f, 0.0f}},
+        {.tri = 0, .a = {0.299999f, 0.299999f, 0.0f}, .b = {0.5f, 0.1f, 0.0f}},
+        {.tri = 0, .a = {0.5f, 0.1f, 0.0f}, .b = {0.9f, 0.5f, 0.0f}},
+        {.tri = 0, .a = {0.9f, 0.5f, 0.0f}, .b = {0.699999f, 0.699999f, 0.0f}},
+        {.tri = 1, .a = {0.700001f, 0.700001f, 0.0f}, .b = {0.5f, 0.9f, 0.0f}},
+        {.tri = 1, .a = {0.5f, 0.9f, 0.0f}, .b = {0.1f, 0.5f, 0.0f}},
+    };
+    QuadMeshing3DEnv env = {0};
+    env.surface.vertices = vertices;
+    env.surface.vertex_count = 4;
+    env.surface.triangles = triangles;
+    env.surface.triangle_neighbors = neighbors;
+    env.surface.triangle_count = 2;
+    env.surface.samples = samples;
+    env.surface.sample_count = 2;
+    env.continuous_ctx.tri2d_base = tri2d;
+    env.continuous_ctx.tri2d_valid = tri2d_valid;
+    env.surface_topo.tri_sample_offsets = sample_offsets;
+    env.surface_topo.tri_sample_ids = sample_ids;
+    env.sample_disabled = disabled;
+    Qm3PathSegmentArray loop = {.data = segments, .count = 6, .cap = 6};
+    Qm3LoopRemovalStats stats = qm3_remove_samples_inside_loop(&env, &loop, 1);
+    bool ok = stats.chosen_side == 1 && stats.disabled_samples == 1 && disabled[0] && !disabled[1];
+    printf("debug_loop_removal_cross_tri chosen=%d removed=%u inside=%d outside=%d\n",
+        stats.chosen_side, stats.disabled_samples, disabled[0], disabled[1]);
+    qm3_loop_debug_free(&env.loop_debug);
+    return ok;
+}
+
+static bool qm3_check_loop_removal_locality_debug(void) {
+    const uint32_t triangle_count = 40000;
+    Qm3Vec3 vertices[3] = {{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}};
+    Qm3Tri* triangles = (Qm3Tri*)malloc((size_t)triangle_count * sizeof(*triangles));
+    Qm3TriNeighbors* neighbors = (Qm3TriNeighbors*)malloc((size_t)triangle_count * sizeof(*neighbors));
+    Qm3Vec2* tri2d = (Qm3Vec2*)calloc((size_t)triangle_count * 3, sizeof(*tri2d));
+    unsigned char* tri2d_valid = (unsigned char*)calloc(triangle_count, 1);
+    Qm3SurfaceSample samples[2] = {
+        {.p = {0.3f, 0.3f, 0.0f}, .tri = 0},
+        {.p = {0.3f, 0.3f, 0.0f}, .tri = (int32_t)triangle_count - 1},
+    };
+    unsigned char disabled[2] = {0};
+    Qm3PathSegment segments[] = {
+        {.tri = 0, .a = {0.2f, 0.2f, 0.0f}, .b = {0.6f, 0.2f, 0.0f}},
+        {.tri = 0, .a = {0.6f, 0.2f, 0.0f}, .b = {0.2f, 0.6f, 0.0f}},
+        {.tri = 0, .a = {0.2f, 0.6f, 0.0f}, .b = {0.2f, 0.2f, 0.0f}},
+    };
+    bool allocated = triangles && neighbors && tri2d && tri2d_valid;
+    if (!allocated) {
+        free(triangles); free(neighbors); free(tri2d); free(tri2d_valid);
+        return false;
+    }
+    for (uint32_t i = 0; i < triangle_count; ++i) {
+        triangles[i] = (Qm3Tri){0, 1, 2};
+        neighbors[i] = (Qm3TriNeighbors){-1, -1, -1};
+    }
+    tri2d[0] = (Qm3Vec2){0.0f, 0.0f};
+    tri2d[1] = (Qm3Vec2){1.0f, 0.0f};
+    tri2d[2] = (Qm3Vec2){0.0f, 1.0f};
+    tri2d_valid[0] = 1;
+    QuadMeshing3DEnv env = {0};
+    env.surface.vertices = vertices;
+    env.surface.vertex_count = 3;
+    env.surface.triangles = triangles;
+    env.surface.triangle_neighbors = neighbors;
+    env.surface.triangle_count = triangle_count;
+    env.surface.samples = samples;
+    env.surface.sample_count = 2;
+    env.surface_topo = qm3_surface_topo_build(&env.surface);
+    env.continuous_ctx.tri2d_base = tri2d;
+    env.continuous_ctx.tri2d_valid = tri2d_valid;
+    env.sample_disabled = disabled;
+    Qm3PathSegmentArray loop = {.data = segments, .count = 3, .cap = 3};
+    double start_ms = qm3_time_ms();
+    Qm3LoopRemovalStats stats = qm3_remove_samples_inside_loop(&env, &loop, 1);
+    double elapsed_ms = qm3_time_ms() - start_ms;
+    bool ok = stats.chosen_side == 1 && stats.boundary_tris == 1 && stats.flood_tris == 0 &&
+        stats.disabled_samples == 1 && disabled[0] && !disabled[1];
+    printf("debug_loop_removal_locality triangles=%u boundary=%u flood=%u removed=%u untouched=%d time_ms=%.3f\n",
+        triangle_count, stats.boundary_tris, stats.flood_tris, stats.disabled_samples, !disabled[1], elapsed_ms);
+    qm3_surface_topo_free(&env.surface_topo);
+    qm3_loop_debug_free(&env.loop_debug);
+    free(triangles); free(neighbors); free(tri2d); free(tri2d_valid);
+    return ok;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         usage(argv[0]);
@@ -148,6 +345,10 @@ int main(int argc, char** argv) {
             env.timing_intersection_tests,
             env.timing_target_query_ms + env.timing_path_build_ms + env.timing_intersection_ms);
         QM3_ASSERT(qm3_check_face_registration_debug());
+        QM3_ASSERT(qm3_check_loop_subdivision_debug());
+        QM3_ASSERT(qm3_check_loop_removal_debug());
+        QM3_ASSERT(qm3_check_loop_removal_across_triangles_debug());
+        QM3_ASSERT(qm3_check_loop_removal_locality_debug());
         c_close(&env);
         return 0;
     }

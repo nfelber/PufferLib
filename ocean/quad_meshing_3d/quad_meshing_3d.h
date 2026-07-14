@@ -109,6 +109,8 @@ enum {
 
 typedef struct {
     uint32_t disabled_samples;
+    uint32_t boundary_tris;
+    uint32_t flood_tris;
     uint32_t left_tris;
     uint32_t right_tris;
     float left_area;
@@ -910,96 +912,6 @@ static bool qm3_segments_intersect_2d(Qm3Vec2 a, Qm3Vec2 b, Qm3Vec2 c, Qm3Vec2 d
            qm3_v2_point_segment_dist_sq(d, a, b) <= tol_sq;
 }
 
-static bool qm3_segment_intersect_2d_params(Qm3Vec2 p, Qm3Vec2 q, Qm3Vec2 a, Qm3Vec2 b, float* out_t, float* out_u) {
-    Qm3Vec2 r = qm3_v2_sub(q, p);
-    Qm3Vec2 s = qm3_v2_sub(b, a);
-    float den = qm3_v2_cross(r, s);
-    if (fabsf(den) < 1e-8f) return false;
-    Qm3Vec2 ap = qm3_v2_sub(a, p);
-    float t = qm3_v2_cross(ap, s) / den;
-    float u = qm3_v2_cross(ap, r) / den;
-    if (t < -1e-2f || t > 1.0f + 1e-2f || u < -1e-2f || u > 1.0f + 1e-2f) return false;
-    if (out_t) *out_t = fminf(fmaxf(t, 0.0f), 1.0f);
-    if (out_u) *out_u = fminf(fmaxf(u, 0.0f), 1.0f);
-    return true;
-}
-
-typedef struct { Qm3Vec2 a; Qm3Vec2 b; } Qm3LocalCutSegment;
-typedef struct {
-    Qm3Vec2 p;
-    int side;
-    int comp;
-} Qm3LocalClassPoint;
-
-static void qm3_local_cut_segment_push(Qm3LocalCutSegment** cuts, int* count, int* cap, Qm3LocalCutSegment value) {
-    if (qm3_v2_dot(qm3_v2_sub(value.a, value.b), qm3_v2_sub(value.a, value.b)) <= 1e-14f) return;
-    if (*count == *cap) {
-        *cap = *cap ? *cap * 2 : 16;
-        *cuts = (Qm3LocalCutSegment*)qm3_checked_realloc(*cuts, (size_t)*cap * sizeof(Qm3LocalCutSegment));
-    }
-    (*cuts)[(*count)++] = value;
-}
-
-static void qm3_local_class_point_push(Qm3LocalClassPoint** points, int* count, int* cap, Qm3LocalClassPoint value) {
-    if (*count == *cap) {
-        *cap = *cap ? *cap * 2 : 32;
-        *points = (Qm3LocalClassPoint*)qm3_checked_realloc(*points, (size_t)*cap * sizeof(Qm3LocalClassPoint));
-    }
-    value.comp = -1;
-    (*points)[(*count)++] = value;
-}
-
-static bool qm3_point_inside_triangle_2d(Qm3Vec2 p, const Qm3Vec2 tri2d[3]) {
-    for (int edge = 0; edge < 3; ++edge) {
-        Qm3Vec2 a = tri2d[(edge + 1) % 3];
-        Qm3Vec2 b = tri2d[(edge + 2) % 3];
-        if (qm3_v2_cross(qm3_v2_sub(b, a), qm3_v2_sub(p, a)) < -1e-6f) return false;
-    }
-    return true;
-}
-
-static bool qm3_add_local_side_seed(Qm3LocalClassPoint** points, int* count, int* cap, Qm3Vec2 mid, Qm3Vec2 normal, int side, float eps, const Qm3Vec2 tri2d[3]) {
-    for (int i = 0; i < 8; ++i) {
-        Qm3Vec2 p = qm3_v2_add(mid, qm3_v2_scale(normal, eps));
-        if (qm3_point_inside_triangle_2d(p, tri2d)) {
-            qm3_local_class_point_push(points, count, cap, (Qm3LocalClassPoint){.p = p, .side = side});
-            return true;
-        }
-        eps *= 0.5f;
-    }
-    return false;
-}
-
-static bool qm3_local_connection_crosses_cut(Qm3Vec2 a, Qm3Vec2 b, const Qm3LocalCutSegment* cuts, int cut_count) {
-    for (int i = 0; i < cut_count; ++i) {
-        float t, u;
-        if (!qm3_segment_intersect_2d_params(a, b, cuts[i].a, cuts[i].b, &t, &u)) continue;
-        if (t > 1e-5f && t < 1.0f - 1e-5f && u > -1e-5f && u < 1.0f + 1e-5f) return true;
-    }
-    return false;
-}
-
-static int qm3_local_component_side(const Qm3LocalClassPoint* points, int point_count, int comp, uint32_t* conflicts) {
-    int side = 0;
-    for (int i = 0; i < point_count; ++i) {
-        if (points[i].comp != comp || points[i].side == 0) continue;
-        if (side != 0 && side != points[i].side) {
-            (*conflicts)++;
-            return 0;
-        }
-        side = points[i].side;
-    }
-    return side;
-}
-
-static float qm3_surface_triangle_area(const Qm3Surface* surface, int tri) {
-    Qm3Tri t = surface->triangles[tri];
-    Qm3Vec3 ab = qm3_sub(surface->vertices[t.b], surface->vertices[t.a]);
-    Qm3Vec3 ac = qm3_sub(surface->vertices[t.c], surface->vertices[t.a]);
-    Qm3Vec3 cross = (Qm3Vec3){ab.y * ac.z - ab.z * ac.y, ab.z * ac.x - ab.x * ac.z, ab.x * ac.y - ab.y * ac.x};
-    return 0.5f * qm3_len(cross);
-}
-
 static bool qm3_candidate_segments_intersect_graph(
     const QuadMeshing3DEnv* env,
     uint32_t source_vidx,
@@ -1113,18 +1025,6 @@ static void qm3_point_support_tris(const Qm3Surface* surface, Qm3Vec3 p, int bas
     }
 }
 
-static int qm3_surface_local_edge_between(const Qm3Surface* surface, int tri, uint32_t va, uint32_t vb) {
-    if (tri < 0 || tri >= (int)surface->triangle_count) return -1;
-    Qm3Tri t = surface->triangles[tri];
-    uint32_t v[3] = {t.a, t.b, t.c};
-    for (int edge = 0; edge < 3; ++edge) {
-        uint32_t a = v[(edge + 1) % 3];
-        uint32_t b = v[(edge + 2) % 3];
-        if ((a == va && b == vb) || (a == vb && b == va)) return edge;
-    }
-    return -1;
-}
-
 static void qm3_loop_debug_free(Qm3LoopDebugData* debug) {
     free(debug->flags);
     free(debug->boundary_tri);
@@ -1147,185 +1047,405 @@ static void qm3_loop_debug_capture(Qm3LoopDebugData* debug, const unsigned char*
     memcpy(debug->conflict_tri, conflict_tri, (size_t)tri_count * sizeof(unsigned char));
 }
 
-static void qm3_loop_mark_vertex_fan_boundary(const Qm3Surface* surface, const Qm3PropGraph* graph, int vertex, unsigned char* boundary_tri) {
-    if (!graph || vertex < 0 || vertex >= (int)surface->vertex_count) return;
-    for (int i = graph->node_tri_offsets[vertex]; i < graph->node_tri_offsets[vertex + 1]; ++i) boundary_tri[graph->node_tri_ids[i]] = 1;
+typedef struct { double x, y; } Qm3LoopPoint;
+typedef struct {
+    Qm3LoopPoint a, b;
+    double* split;
+    int split_count, split_cap;
+    int boundary_edge;
+    bool cut;
+} Qm3LoopPrimitive;
+typedef struct { Qm3LoopPoint p; } Qm3LoopNode;
+typedef struct { int a, b, boundary_edge; bool cut; } Qm3LoopEdge;
+typedef struct { int origin, twin, next, edge, cell; double angle; } Qm3LoopHalfEdge;
+typedef struct {
+    Qm3LoopPoint* polygon;
+    int polygon_count;
+    int tri;
+    double area;
+} Qm3LoopCell;
+typedef struct {
+    int tri, edge, cell;
+    uint32_t va, vb;
+    double lo, hi;
+    bool cut;
+} Qm3LoopPortal;
+typedef struct { int tri; Qm3LoopPoint a, b; double tol; } Qm3LoopCut;
+typedef struct {
+    Qm3LoopCell* cells;
+    int cell_count, cell_cap;
+    Qm3LoopPortal* portals;
+    int portal_count, portal_cap;
+    Qm3LoopCut* cuts;
+    int cut_count, cut_cap;
+    int* tri_ids;
+    int tri_count;
+    int* tri_cell_offsets;
+    int* tri_portal_offsets;
+    double* tri_tol;
+} Qm3LoopSubdivision;
+
+static Qm3LoopPoint qm3_loop_point(Qm3Vec2 p) { return (Qm3LoopPoint){(double)p.x, (double)p.y}; }
+static Qm3LoopPoint qm3_loop_add(Qm3LoopPoint a, Qm3LoopPoint b) { return (Qm3LoopPoint){a.x + b.x, a.y + b.y}; }
+static Qm3LoopPoint qm3_loop_sub(Qm3LoopPoint a, Qm3LoopPoint b) { return (Qm3LoopPoint){a.x - b.x, a.y - b.y}; }
+static Qm3LoopPoint qm3_loop_scale(Qm3LoopPoint a, double s) { return (Qm3LoopPoint){a.x * s, a.y * s}; }
+static double qm3_loop_dot(Qm3LoopPoint a, Qm3LoopPoint b) { return a.x * b.x + a.y * b.y; }
+static double qm3_loop_cross(Qm3LoopPoint a, Qm3LoopPoint b) { return a.x * b.y - a.y * b.x; }
+static double qm3_loop_len2(Qm3LoopPoint a) { return qm3_loop_dot(a, a); }
+
+static void qm3_loop_subdivision_free(Qm3LoopSubdivision* sub) {
+    for (int i = 0; i < sub->cell_count; ++i) free(sub->cells[i].polygon);
+    free(sub->cells); free(sub->portals); free(sub->cuts); free(sub->tri_ids);
+    free(sub->tri_cell_offsets); free(sub->tri_portal_offsets); free(sub->tri_tol);
+    memset(sub, 0, sizeof(*sub));
 }
 
-static void qm3_loop_mark_point_vertex_fan_boundary(const Qm3Surface* surface, const Qm3PropGraph* graph, int tri, Qm3Vec3 p, unsigned char* boundary_tri) {
-    Qm3Tri t = surface->triangles[tri];
-    float b[3];
-    qm3_barycentric3(p, surface->vertices[t.a], surface->vertices[t.b], surface->vertices[t.c], &b[0], &b[1], &b[2]);
-    uint32_t verts[3] = {t.a, t.b, t.c};
-    for (int i = 0; i < 3; ++i) if (b[i] >= 1.0f - 1e-5f) qm3_loop_mark_vertex_fan_boundary(surface, graph, (int)verts[i], boundary_tri);
+static void qm3_loop_split_push(Qm3LoopPrimitive* p, double t, double tol) {
+    t = fmin(fmax(t, 0.0), 1.0);
+    for (int i = 0; i < p->split_count; ++i) if (fabs(p->split[i] - t) <= tol) return;
+    if (p->split_count == p->split_cap) {
+        p->split_cap = p->split_cap ? 2 * p->split_cap : 8;
+        p->split = (double*)qm3_checked_realloc(p->split, (size_t)p->split_cap * sizeof(double));
+    }
+    p->split[p->split_count++] = t;
 }
 
-static void qm3_loop_update_local_vertex_side(int tri, int local_vertex, int side, float dist2, unsigned char* vertex_side, float* vertex_dist2) {
-    if (side == 0) return;
-    int idx = 3 * tri + local_vertex;
-    if (dist2 < vertex_dist2[idx]) {
-        vertex_dist2[idx] = dist2;
-        vertex_side[idx] = (unsigned char)side;
+static void qm3_loop_split_sort(Qm3LoopPrimitive* p) {
+    for (int i = 1; i < p->split_count; ++i) {
+        double value = p->split[i];
+        int j = i;
+        while (j > 0 && p->split[j - 1] > value) { p->split[j] = p->split[j - 1]; --j; }
+        p->split[j] = value;
     }
 }
 
-static void qm3_loop_mark_segment_blocked_edges(const QuadMeshing3DEnv* env, const Qm3PathSegment* seg, unsigned char* flags, unsigned char* vertex_side, float* vertex_dist2, unsigned char* boundary_tri) {
-    if (seg->tri < 0 || seg->tri >= (int)env->surface.triangle_count || !env->continuous_ctx.tri2d_valid[seg->tri]) return;
-    Qm3Vec2 tri2d[3] = {
-        env->continuous_ctx.tri2d_base[3 * seg->tri + 0],
-        env->continuous_ctx.tri2d_base[3 * seg->tri + 1],
-        env->continuous_ctx.tri2d_base[3 * seg->tri + 2],
-    };
-    Qm3Vec2 a2, b2;
-    if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->a, &a2)) return;
-    if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, seg->tri, seg->b, &b2)) return;
-    Qm3Vec2 dir = qm3_v2_sub(b2, a2);
-    if (qm3_v2_dot(dir, dir) < 1e-14f) return;
+static double qm3_loop_point_segment_dist2(Qm3LoopPoint p, Qm3LoopPoint a, Qm3LoopPoint b) {
+    Qm3LoopPoint ab = qm3_loop_sub(b, a);
+    double den = qm3_loop_len2(ab);
+    double t = den > 0.0 ? qm3_loop_dot(qm3_loop_sub(p, a), ab) / den : 0.0;
+    t = fmin(fmax(t, 0.0), 1.0);
+    return qm3_loop_len2(qm3_loop_sub(p, qm3_loop_add(a, qm3_loop_scale(ab, t))));
+}
 
-    boundary_tri[seg->tri] = 1;
-    qm3_loop_mark_point_vertex_fan_boundary(&env->surface, &env->prop_graph, seg->tri, seg->a, boundary_tri);
-    qm3_loop_mark_point_vertex_fan_boundary(&env->surface, &env->prop_graph, seg->tri, seg->b, boundary_tri);
-    Qm3Tri st = env->surface.triangles[seg->tri];
-    uint32_t verts[3] = {st.a, st.b, st.c};
+static bool qm3_loop_snap_to_triangle(Qm3LoopPoint* p, const Qm3LoopPoint tri[3], double tol) {
+    double best = tol * tol;
+    Qm3LoopPoint snapped = *p;
+    for (int i = 0; i < 3; ++i) {
+        double d2 = qm3_loop_len2(qm3_loop_sub(*p, tri[i]));
+        if (d2 <= best) { best = d2; snapped = tri[i]; }
+    }
     for (int edge = 0; edge < 3; ++edge) {
-        int ea = (edge + 1) % 3;
-        int eb = (edge + 2) % 3;
-        float t, u;
-        if (!qm3_segment_intersect_2d_params(a2, b2, tri2d[ea], tri2d[eb], &t, &u)) continue;
-        if (u <= 1e-5f || u >= 1.0f - 1e-5f) {
-            qm3_loop_mark_vertex_fan_boundary(&env->surface, &env->prop_graph, (int)verts[u <= 1e-5f ? ea : eb], boundary_tri);
-            continue;
-        }
-        flags[3 * seg->tri + edge] |= QM3_LOOP_EDGE_BLOCKED;
-        Qm3Vec2 hit = qm3_v2_lerp(tri2d[ea], tri2d[eb], u);
-        int side_a = qm3_v2_cross(dir, qm3_v2_sub(tri2d[ea], hit)) > 0.0f ? 1 : 2;
-        int side_b = qm3_v2_cross(dir, qm3_v2_sub(tri2d[eb], hit)) > 0.0f ? 1 : 2;
-
-        qm3_loop_update_local_vertex_side(seg->tri, ea, side_a, qm3_v2_dot(qm3_v2_sub(tri2d[ea], hit), qm3_v2_sub(tri2d[ea], hit)), vertex_side, vertex_dist2);
-        qm3_loop_update_local_vertex_side(seg->tri, eb, side_b, qm3_v2_dot(qm3_v2_sub(tri2d[eb], hit), qm3_v2_sub(tri2d[eb], hit)), vertex_side, vertex_dist2);
+        Qm3LoopPoint a = tri[(edge + 1) % 3], b = tri[(edge + 2) % 3], ab = qm3_loop_sub(b, a);
+        double den = qm3_loop_len2(ab);
+        if (den <= 0.0) continue;
+        double t = fmin(fmax(qm3_loop_dot(qm3_loop_sub(*p, a), ab) / den, 0.0), 1.0);
+        Qm3LoopPoint q = qm3_loop_add(a, qm3_loop_scale(ab, t));
+        double d2 = qm3_loop_len2(qm3_loop_sub(*p, q));
+        if (d2 <= best) { best = d2; snapped = q; }
     }
-}
-
-static void qm3_loop_enqueue_tri(int tri, int side, int* queue, int* tail, unsigned char* side_mark, const unsigned char* boundary_tri, unsigned char* conflict_tri, uint32_t* flood_conflicts) {
-    if (tri < 0 || boundary_tri[tri]) return;
-    unsigned char mark = side == 1 ? 1 : 2;
-    unsigned char other = side == 1 ? 2 : 1;
-    if (side_mark[tri] == mark) return;
-    if (side_mark[tri] == other) {
-        conflict_tri[tri] = 1;
-        (*flood_conflicts)++;
-        return;
-    }
-    side_mark[tri] = mark;
-    queue[(*tail)++] = tri;
-}
-
-static void qm3_loop_seed_cut_edges_from_vertices(const QuadMeshing3DEnv* env, const Qm3IntArray* boundary_list, const unsigned char* vertex_side, const unsigned char* boundary_tri, unsigned char* flags, int* queue_left, int* left_tail, int* queue_right, int* right_tail, unsigned char* side_mark, unsigned char* conflict_tri, uint32_t* classification_conflicts, uint32_t* flood_conflicts) {
-    for (int bi = 0; bi < boundary_list->size; ++bi) {
-        uint32_t tri = (uint32_t)boundary_list->data[bi];
-        for (int edge = 0; edge < 3; ++edge) {
-            if (flags[3 * tri + edge] & QM3_LOOP_EDGE_BLOCKED) continue;
-            int a = (edge + 1) % 3;
-            int b = (edge + 2) % 3;
-            bool has_left = vertex_side[3 * tri + a] == 1 || vertex_side[3 * tri + b] == 1;
-            bool has_right = vertex_side[3 * tri + a] == 2 || vertex_side[3 * tri + b] == 2;
-            if (!has_left && !has_right) continue;
-            if (has_left && has_right) {
-                flags[3 * tri + edge] |= QM3_LOOP_EDGE_LEFT | QM3_LOOP_EDGE_RIGHT;
-                conflict_tri[tri] = 1;
-                (*classification_conflicts)++;
-                continue;
-            }
-            int side = has_left ? 1 : 2;
-            flags[3 * tri + edge] |= side == 1 ? QM3_LOOP_EDGE_LEFT : QM3_LOOP_EDGE_RIGHT;
-            int nb = ((int*)&env->surface.triangle_neighbors[tri])[edge];
-            if (nb < 0 || boundary_tri[nb]) continue;
-            if (side == 1) qm3_loop_enqueue_tri(nb, 1, queue_left, left_tail, side_mark, boundary_tri, conflict_tri, flood_conflicts);
-            else qm3_loop_enqueue_tri(nb, 2, queue_right, right_tail, side_mark, boundary_tri, conflict_tri, flood_conflicts);
-        }
-    }
-}
-
-static bool qm3_loop_flood_pop(const QuadMeshing3DEnv* env, const unsigned char* flags, const unsigned char* boundary_tri, int side, int* queue, int* head, int* tail, unsigned char* side_mark, unsigned char* conflict_tri, float* area, uint32_t* count, Qm3IntArray* reached, uint32_t* flood_conflicts) {
-    if (*head >= *tail) return false;
-    int tri = queue[(*head)++];
-    *area += qm3_surface_triangle_area(&env->surface, tri);
-    (*count)++;
-    qm3_int_push(reached, tri);
-    Qm3Tri t = env->surface.triangles[tri];
-    uint32_t verts[3] = {t.a, t.b, t.c};
+    *p = snapped;
+    double orient = qm3_loop_cross(qm3_loop_sub(tri[1], tri[0]), qm3_loop_sub(tri[2], tri[0]));
+    if (fabs(orient) <= tol * tol) return false;
     for (int edge = 0; edge < 3; ++edge) {
-        if (flags[3 * tri + edge] & QM3_LOOP_EDGE_BLOCKED) continue;
-        int nb = ((int*)&env->surface.triangle_neighbors[tri])[edge];
-        if (nb < 0 || boundary_tri[nb]) continue;
-        int nb_edge = qm3_surface_local_edge_between(&env->surface, nb, verts[(edge + 1) % 3], verts[(edge + 2) % 3]);
-        if (nb_edge >= 0 && (flags[3 * nb + nb_edge] & QM3_LOOP_EDGE_BLOCKED)) continue;
-        qm3_loop_enqueue_tri(nb, side, queue, tail, side_mark, boundary_tri, conflict_tri, flood_conflicts);
+        Qm3LoopPoint a = tri[(edge + 1) % 3], b = tri[(edge + 2) % 3];
+        double side = qm3_loop_cross(qm3_loop_sub(b, a), qm3_loop_sub(*p, a));
+        if (side * orient < -tol * sqrt(qm3_loop_len2(qm3_loop_sub(b, a)))) return false;
     }
     return true;
 }
 
-static int qm3_classify_boundary_sample_side_local(const QuadMeshing3DEnv* env, const Qm3PathSegmentArray* loop_segments, int tri, Qm3Vec3 sample, uint32_t* conflicts) {
-    if (tri < 0 || tri >= (int)env->surface.triangle_count || !env->continuous_ctx.tri2d_valid[tri]) return 0;
-    Qm3Vec2 tri2d[3] = {
-        env->continuous_ctx.tri2d_base[3 * tri + 0],
-        env->continuous_ctx.tri2d_base[3 * tri + 1],
-        env->continuous_ctx.tri2d_base[3 * tri + 2],
-    };
-    Qm3LocalCutSegment* cuts = NULL;
-    int cut_count = 0, cut_cap = 0;
-    Qm3LocalClassPoint* points = NULL;
-    int point_count = 0, point_cap = 0;
-    float tri_scale = fmaxf(qm3_v2_dist(tri2d[0], tri2d[1]), fmaxf(qm3_v2_dist(tri2d[1], tri2d[2]), qm3_v2_dist(tri2d[2], tri2d[0])));
-    float seed_eps = fmaxf(tri_scale * 1e-4f, 1e-7f);
-    float inset = seed_eps / fmaxf(tri_scale, 1e-8f);
-    for (int i = 0; i < 3; ++i) {
-        Qm3Vec2 corner = qm3_v2_add(qm3_v2_scale(tri2d[i], 1.0f - 2.0f * inset), qm3_v2_scale(qm3_v2_add(tri2d[(i + 1) % 3], tri2d[(i + 2) % 3]), inset));
-        if (qm3_point_inside_triangle_2d(corner, tri2d)) qm3_local_class_point_push(&points, &point_count, &point_cap, (Qm3LocalClassPoint){.p = corner, .side = 0});
+static void qm3_loop_split_intersection(Qm3LoopPrimitive* a, Qm3LoopPrimitive* b, double tol) {
+    Qm3LoopPoint r = qm3_loop_sub(a->b, a->a), s = qm3_loop_sub(b->b, b->a), ba = qm3_loop_sub(b->a, a->a);
+    double rr = qm3_loop_len2(r), ss = qm3_loop_len2(s), den = qm3_loop_cross(r, s);
+    if (rr <= tol * tol || ss <= tol * tol) return;
+    if (fabs(den) > 1e-12 * sqrt(rr * ss)) {
+        double ta = qm3_loop_cross(ba, s) / den, tb = qm3_loop_cross(ba, r) / den;
+        double pa = tol / sqrt(rr), pb = tol / sqrt(ss);
+        if (ta >= -pa && ta <= 1.0 + pa && tb >= -pb && tb <= 1.0 + pb) {
+            qm3_loop_split_push(a, ta, pa); qm3_loop_split_push(b, tb, pb);
+        }
+        return;
     }
-    for (uint32_t i = 0; i < loop_segments->count; ++i) {
-        const Qm3PathSegment* seg = &loop_segments->data[i];
-        if (seg->tri != tri) continue;
-        Qm3Vec2 a2, b2;
-        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, seg->a, &a2)) continue;
-        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, seg->b, &b2)) continue;
-        Qm3Vec2 dir = qm3_v2_sub(b2, a2);
-        float len = qm3_v2_len(dir);
-        if (len <= 1e-8f) continue;
-        qm3_local_cut_segment_push(&cuts, &cut_count, &cut_cap, (Qm3LocalCutSegment){.a = a2, .b = b2});
-        Qm3Vec2 mid = qm3_v2_scale(qm3_v2_add(a2, b2), 0.5f);
-        Qm3Vec2 n = qm3_v2_scale((Qm3Vec2){-dir.y, dir.x}, 1.0f / len);
-        qm3_add_local_side_seed(&points, &point_count, &point_cap, mid, n, 1, seed_eps, tri2d);
-        qm3_add_local_side_seed(&points, &point_count, &point_cap, mid, qm3_v2_scale(n, -1.0f), 2, seed_eps, tri2d);
+    if (fabs(qm3_loop_cross(ba, r)) > tol * sqrt(rr)) return;
+    double ta0 = qm3_loop_dot(qm3_loop_sub(b->a, a->a), r) / rr;
+    double ta1 = qm3_loop_dot(qm3_loop_sub(b->b, a->a), r) / rr;
+    double tb0 = qm3_loop_dot(qm3_loop_sub(a->a, b->a), s) / ss;
+    double tb1 = qm3_loop_dot(qm3_loop_sub(a->b, b->a), s) / ss;
+    if (ta0 >= -tol / sqrt(rr) && ta0 <= 1.0 + tol / sqrt(rr)) qm3_loop_split_push(a, ta0, tol / sqrt(rr));
+    if (ta1 >= -tol / sqrt(rr) && ta1 <= 1.0 + tol / sqrt(rr)) qm3_loop_split_push(a, ta1, tol / sqrt(rr));
+    if (tb0 >= -tol / sqrt(ss) && tb0 <= 1.0 + tol / sqrt(ss)) qm3_loop_split_push(b, tb0, tol / sqrt(ss));
+    if (tb1 >= -tol / sqrt(ss) && tb1 <= 1.0 + tol / sqrt(ss)) qm3_loop_split_push(b, tb1, tol / sqrt(ss));
+}
+
+static int qm3_loop_node_get(Qm3LoopNode** nodes, int* count, int* cap, Qm3LoopPoint p, double tol) {
+    for (int i = 0; i < *count; ++i) if (qm3_loop_len2(qm3_loop_sub((*nodes)[i].p, p)) <= tol * tol) return i;
+    if (*count == *cap) { *cap = *cap ? 2 * *cap : 16; *nodes = (Qm3LoopNode*)qm3_checked_realloc(*nodes, (size_t)*cap * sizeof(**nodes)); }
+    (*nodes)[*count].p = p;
+    return (*count)++;
+}
+
+static void qm3_loop_edge_add(Qm3LoopEdge** edges, int* count, int* cap, int a, int b, int boundary_edge, bool cut) {
+    if (a == b) return;
+    for (int i = 0; i < *count; ++i) {
+        if (((*edges)[i].a == a && (*edges)[i].b == b) || ((*edges)[i].a == b && (*edges)[i].b == a)) {
+            (*edges)[i].cut |= cut;
+            if (boundary_edge >= 0) (*edges)[i].boundary_edge = boundary_edge;
+            return;
+        }
     }
-    Qm3Vec2 sample2;
-    if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, sample, &sample2)) {
-        free(cuts); free(points); return 0;
+    if (*count == *cap) { *cap = *cap ? 2 * *cap : 24; *edges = (Qm3LoopEdge*)qm3_checked_realloc(*edges, (size_t)*cap * sizeof(**edges)); }
+    (*edges)[(*count)++] = (Qm3LoopEdge){a, b, boundary_edge, cut};
+}
+
+static int qm3_loop_local_root(int* parent, int node) {
+    while (parent[node] != node) { parent[node] = parent[parent[node]]; node = parent[node]; }
+    return node;
+}
+
+static bool qm3_loop_bridge_visible(const Qm3LoopNode* nodes, const Qm3LoopEdge* edges, int edge_count, int a, int b, double tol) {
+    Qm3LoopPoint p = nodes[a].p, q = nodes[b].p, r = qm3_loop_sub(q, p);
+    double rr = qm3_loop_len2(r);
+    if (rr <= tol * tol) return false;
+    for (int ni = 0; ni < edge_count; ++ni) {
+        const Qm3LoopEdge* edge = &edges[ni];
+        Qm3LoopPoint c = nodes[edge->a].p, d = nodes[edge->b].p, s = qm3_loop_sub(d, c);
+        double ss = qm3_loop_len2(s), den = qm3_loop_cross(r, s);
+        if (ss <= tol * tol) continue;
+        Qm3LoopPoint cp = qm3_loop_sub(c, p);
+        if (fabs(den) <= 1e-12 * sqrt(rr * ss)) {
+            if (fabs(qm3_loop_cross(cp, r)) <= tol * sqrt(rr)) return false;
+            continue;
+        }
+        double t = qm3_loop_cross(cp, s) / den;
+        double u = qm3_loop_cross(cp, r) / den;
+        double t_tol = tol / sqrt(rr), u_tol = tol / sqrt(ss);
+        if (t > t_tol && t < 1.0 - t_tol && u > -u_tol && u < 1.0 + u_tol) return false;
     }
-    int sample_idx = point_count;
-    qm3_local_class_point_push(&points, &point_count, &point_cap, (Qm3LocalClassPoint){.p = sample2, .side = 0});
-    int* queue = (int*)malloc((size_t)fmaxf((float)point_count, 1.0f) * sizeof(int));
-    QM3_ASSERT(queue != NULL);
-    int comp_count = 0;
-    for (int start = 0; start < point_count; ++start) {
-        if (points[start].comp >= 0) continue;
-        int head = 0, tail = 0;
-        points[start].comp = comp_count;
-        queue[tail++] = start;
-        while (head < tail) {
-            int pidx = queue[head++];
-            for (int j = 0; j < point_count; ++j) {
-                if (points[j].comp >= 0) continue;
-                if (qm3_local_connection_crosses_cut(points[pidx].p, points[j].p, cuts, cut_count)) continue;
-                points[j].comp = comp_count;
-                queue[tail++] = j;
+    return true;
+}
+
+static bool qm3_loop_connect_components(Qm3LoopNode* nodes, int node_count, Qm3LoopEdge** edges, int* edge_count, int* edge_cap, double tol) {
+    int* parent = (int*)malloc((size_t)node_count * sizeof(int));
+    if (!parent) return false;
+    for (int i = 0; i < node_count; ++i) parent[i] = i;
+    for (int i = 0; i < *edge_count; ++i) {
+        int a = qm3_loop_local_root(parent, (*edges)[i].a), b = qm3_loop_local_root(parent, (*edges)[i].b);
+        if (a != b) parent[b] = a;
+    }
+    int boundary_node = -1;
+    for (int i = 0; i < *edge_count; ++i) if ((*edges)[i].boundary_edge >= 0) { boundary_node = (*edges)[i].a; break; }
+    if (boundary_node < 0) { free(parent); return false; }
+    for (;;) {
+        int boundary_root = qm3_loop_local_root(parent, boundary_node);
+        int other_root = -1;
+        for (int i = 0; i < node_count; ++i) if (qm3_loop_local_root(parent, i) != boundary_root) { other_root = qm3_loop_local_root(parent, i); break; }
+        if (other_root < 0) break;
+        int best_a = -1, best_b = -1;
+        double best_dist2 = INFINITY;
+        for (int a = 0; a < node_count; ++a) {
+            if (qm3_loop_local_root(parent, a) != boundary_root) continue;
+            for (int b = 0; b < node_count; ++b) {
+                if (qm3_loop_local_root(parent, b) != other_root) continue;
+                double dist2 = qm3_loop_len2(qm3_loop_sub(nodes[b].p, nodes[a].p));
+                if (dist2 >= best_dist2 || !qm3_loop_bridge_visible(nodes, *edges, *edge_count, a, b, tol)) continue;
+                best_dist2 = dist2; best_a = a; best_b = b;
             }
         }
-        comp_count++;
+        if (best_a < 0) { free(parent); return false; }
+        qm3_loop_edge_add(edges, edge_count, edge_cap, best_a, best_b, -1, false);
+        int a = qm3_loop_local_root(parent, best_a), b = qm3_loop_local_root(parent, best_b);
+        if (a != b) parent[b] = a;
     }
-    int side = points[sample_idx].comp >= 0 ? qm3_local_component_side(points, point_count, points[sample_idx].comp, conflicts) : 0;
-    free(queue); free(cuts); free(points);
-    return side;
+    free(parent);
+    return true;
+}
+
+static void qm3_loop_cell_push(Qm3LoopSubdivision* sub, Qm3LoopCell cell) {
+    if (sub->cell_count == sub->cell_cap) { sub->cell_cap = sub->cell_cap ? 2 * sub->cell_cap : 64; sub->cells = (Qm3LoopCell*)qm3_checked_realloc(sub->cells, (size_t)sub->cell_cap * sizeof(*sub->cells)); }
+    sub->cells[sub->cell_count++] = cell;
+}
+
+static void qm3_loop_portal_push(Qm3LoopSubdivision* sub, Qm3LoopPortal portal) {
+    if (sub->portal_count == sub->portal_cap) { sub->portal_cap = sub->portal_cap ? 2 * sub->portal_cap : 64; sub->portals = (Qm3LoopPortal*)qm3_checked_realloc(sub->portals, (size_t)sub->portal_cap * sizeof(*sub->portals)); }
+    sub->portals[sub->portal_count++] = portal;
+}
+
+static void qm3_loop_cut_push(Qm3LoopSubdivision* sub, Qm3LoopCut cut) {
+    if (sub->cut_count == sub->cut_cap) { sub->cut_cap = sub->cut_cap ? 2 * sub->cut_cap : 32; sub->cuts = (Qm3LoopCut*)qm3_checked_realloc(sub->cuts, (size_t)sub->cut_cap * sizeof(*sub->cuts)); }
+    sub->cuts[sub->cut_count++] = cut;
+}
+
+static bool qm3_loop_build_triangle(const QuadMeshing3DEnv* env, const Qm3PathSegmentArray* segments, int tri_index, int tri_slot, Qm3LoopSubdivision* sub, unsigned char* flags, unsigned char* boundary_tri) {
+    if (!env->continuous_ctx.tri2d_valid[tri_index]) return false;
+    Qm3LoopPoint tri[3] = {
+        qm3_loop_point(env->continuous_ctx.tri2d_base[3 * tri_index]),
+        qm3_loop_point(env->continuous_ctx.tri2d_base[3 * tri_index + 1]),
+        qm3_loop_point(env->continuous_ctx.tri2d_base[3 * tri_index + 2]),
+    };
+    double scale = 0.0;
+    for (int i = 0; i < 3; ++i) scale = fmax(scale, sqrt(qm3_loop_len2(qm3_loop_sub(tri[(i + 1) % 3], tri[i]))));
+    double tol = fmax(scale * 2e-6, 1e-10), area_tol = scale * scale * 1e-12;
+    sub->tri_tol[tri_slot] = tol;
+    Qm3LoopPrimitive* primitives = NULL;
+    int primitive_count = 0, primitive_cap = 0;
+#define QM3_LOOP_PRIMITIVE_PUSH(value) do { \
+    if (primitive_count == primitive_cap) { primitive_cap = primitive_cap ? 2 * primitive_cap : 8; primitives = (Qm3LoopPrimitive*)qm3_checked_realloc(primitives, (size_t)primitive_cap * sizeof(*primitives)); } \
+    primitives[primitive_count++] = (value); \
+} while (0)
+    for (int edge = 0; edge < 3; ++edge) QM3_LOOP_PRIMITIVE_PUSH(((Qm3LoopPrimitive){.a = tri[(edge + 1) % 3], .b = tri[(edge + 2) % 3], .boundary_edge = edge}));
+    for (uint32_t si = 0; si < segments->count; ++si) {
+        const Qm3PathSegment* segment = &segments->data[si];
+        if (segment->tri != tri_index) continue;
+        Qm3Vec2 af, bf;
+        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri_index, segment->a, &af) || !qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri_index, segment->b, &bf)) goto fail;
+        Qm3LoopPoint a = qm3_loop_point(af), b = qm3_loop_point(bf);
+        if (!qm3_loop_snap_to_triangle(&a, tri, tol * 8.0) || !qm3_loop_snap_to_triangle(&b, tri, tol * 8.0)) goto fail;
+        if (qm3_loop_len2(qm3_loop_sub(b, a)) <= tol * tol) continue;
+        QM3_LOOP_PRIMITIVE_PUSH(((Qm3LoopPrimitive){.a = a, .b = b, .boundary_edge = -1, .cut = true}));
+        qm3_loop_cut_push(sub, (Qm3LoopCut){tri_index, a, b, tol});
+        boundary_tri[tri_index] = 1;
+    }
+    for (int i = 0; i < primitive_count; ++i) { qm3_loop_split_push(&primitives[i], 0.0, 0.0); qm3_loop_split_push(&primitives[i], 1.0, 0.0); }
+    for (int i = 0; i < primitive_count; ++i) for (int j = i + 1; j < primitive_count; ++j) qm3_loop_split_intersection(&primitives[i], &primitives[j], tol);
+    Qm3LoopNode* nodes = NULL; Qm3LoopEdge* edges = NULL;
+    int node_count = 0, node_cap = 0, edge_count = 0, edge_cap = 0;
+    for (int i = 0; i < primitive_count; ++i) {
+        Qm3LoopPrimitive* p = &primitives[i];
+        qm3_loop_split_sort(p);
+        Qm3LoopPoint d = qm3_loop_sub(p->b, p->a);
+        for (int j = 0; j + 1 < p->split_count; ++j) {
+            if ((p->split[j + 1] - p->split[j]) * sqrt(qm3_loop_len2(d)) <= tol) continue;
+            Qm3LoopPoint a = qm3_loop_add(p->a, qm3_loop_scale(d, p->split[j]));
+            Qm3LoopPoint b = qm3_loop_add(p->a, qm3_loop_scale(d, p->split[j + 1]));
+            int na = qm3_loop_node_get(&nodes, &node_count, &node_cap, a, tol);
+            int nb = qm3_loop_node_get(&nodes, &node_count, &node_cap, b, tol);
+            qm3_loop_edge_add(&edges, &edge_count, &edge_cap, na, nb, p->boundary_edge, p->cut);
+        }
+    }
+    if (node_count < 3 || edge_count < 3) { free(nodes); free(edges); goto fail; }
+    if (!qm3_loop_connect_components(nodes, node_count, &edges, &edge_count, &edge_cap, tol)) { free(nodes); free(edges); goto fail; }
+    Qm3LoopHalfEdge* half = (Qm3LoopHalfEdge*)calloc((size_t)edge_count * 2, sizeof(*half));
+    int* degree = (int*)calloc((size_t)node_count, sizeof(int));
+    int* offset = (int*)calloc((size_t)node_count + 1, sizeof(int));
+    int* cursor = (int*)calloc((size_t)node_count, sizeof(int));
+    int* outgoing = (int*)malloc((size_t)edge_count * 2 * sizeof(int));
+    if (!half || !degree || !offset || !cursor || !outgoing) { free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+    for (int i = 0; i < edge_count; ++i) {
+        half[2 * i] = (Qm3LoopHalfEdge){edges[i].a, 2 * i + 1, -1, i, -1, 0.0};
+        half[2 * i + 1] = (Qm3LoopHalfEdge){edges[i].b, 2 * i, -1, i, -1, 0.0};
+        degree[edges[i].a]++; degree[edges[i].b]++;
+    }
+    for (int i = 0; i < node_count; ++i) offset[i + 1] = offset[i] + degree[i];
+    memcpy(cursor, offset, (size_t)node_count * sizeof(int));
+    for (int hi = 0; hi < edge_count * 2; ++hi) {
+        int dest = half[half[hi].twin].origin;
+        Qm3LoopPoint d = qm3_loop_sub(nodes[dest].p, nodes[half[hi].origin].p);
+        half[hi].angle = atan2(d.y, d.x);
+        outgoing[cursor[half[hi].origin]++] = hi;
+    }
+    for (int n = 0; n < node_count; ++n) for (int i = offset[n] + 1; i < offset[n + 1]; ++i) {
+        int value = outgoing[i], j = i;
+        while (j > offset[n] && half[outgoing[j - 1]].angle > half[value].angle) { outgoing[j] = outgoing[j - 1]; --j; }
+        outgoing[j] = value;
+    }
+    for (int hi = 0; hi < edge_count * 2; ++hi) {
+        int dest = half[half[hi].twin].origin, reverse = half[hi].twin, pos = -1;
+        for (int i = offset[dest]; i < offset[dest + 1]; ++i) if (outgoing[i] == reverse) { pos = i; break; }
+        if (pos < 0) { free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+        half[hi].next = outgoing[pos == offset[dest] ? offset[dest + 1] - 1 : pos - 1];
+    }
+    double tri_orient = qm3_loop_cross(qm3_loop_sub(tri[1], tri[0]), qm3_loop_sub(tri[2], tri[0]));
+    unsigned char* visited = (unsigned char*)calloc((size_t)edge_count * 2, 1);
+    double area_sum = 0.0;
+    for (int start = 0; start < edge_count * 2; ++start) {
+        if (visited[start]) continue;
+        int h = start, count = 0;
+        double twice_area = 0.0;
+        do {
+            if (h < 0 || h >= edge_count * 2 || visited[h] || count > edge_count * 2) { free(visited); free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+            visited[h] = 1;
+            Qm3LoopPoint a = nodes[half[h].origin].p, b = nodes[half[half[h].next].origin].p;
+            twice_area += qm3_loop_cross(a, b); h = half[h].next; count++;
+        } while (h != start);
+        double area = 0.5 * twice_area * (tri_orient > 0.0 ? 1.0 : -1.0);
+        if (area <= area_tol) continue;
+        Qm3LoopCell cell = {.polygon = (Qm3LoopPoint*)malloc((size_t)count * sizeof(Qm3LoopPoint)), .polygon_count = count, .tri = tri_index, .area = area};
+        if (!cell.polygon) { free(visited); free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+        h = start;
+        for (int i = 0; i < count; ++i) { cell.polygon[i] = nodes[half[h].origin].p; half[h].cell = sub->cell_count; h = half[h].next; }
+        qm3_loop_cell_push(sub, cell); area_sum += area;
+    }
+    free(visited);
+    if (fabs(area_sum - 0.5 * fabs(tri_orient)) > fmax(area_tol * 32.0, fabs(tri_orient) * 2e-5)) { free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+    Qm3Tri surface_tri = env->surface.triangles[tri_index];
+    uint32_t vertices[3] = {surface_tri.a, surface_tri.b, surface_tri.c};
+    for (int i = 0; i < edge_count; ++i) if (edges[i].boundary_edge >= 0) {
+        int cell = half[2 * i].cell >= 0 ? half[2 * i].cell : half[2 * i + 1].cell;
+        if (cell < 0 || (half[2 * i].cell >= 0 && half[2 * i + 1].cell >= 0)) { free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing); goto fail; }
+        int edge = edges[i].boundary_edge, la = (edge + 1) % 3, lb = (edge + 2) % 3;
+        uint32_t va = vertices[la], vb = vertices[lb]; Qm3LoopPoint origin = tri[la], d = qm3_loop_sub(tri[lb], origin);
+        double den = qm3_loop_len2(d), t0 = qm3_loop_dot(qm3_loop_sub(nodes[edges[i].a].p, origin), d) / den, t1 = qm3_loop_dot(qm3_loop_sub(nodes[edges[i].b].p, origin), d) / den;
+        if (va > vb) { uint32_t swap = va; va = vb; vb = swap; t0 = 1.0 - t0; t1 = 1.0 - t1; }
+        qm3_loop_portal_push(sub, (Qm3LoopPortal){tri_index, edge, cell, va, vb, fmin(t0, t1), fmax(t0, t1), edges[i].cut});
+        if (edges[i].cut) flags[3 * tri_index + edge] |= QM3_LOOP_EDGE_BLOCKED;
+    }
+    free(nodes); free(edges); free(half); free(degree); free(offset); free(cursor); free(outgoing);
+    for (int i = 0; i < primitive_count; ++i) free(primitives[i].split);
+    free(primitives);
+#undef QM3_LOOP_PRIMITIVE_PUSH
+    return true;
+fail:
+    for (int i = 0; i < primitive_count; ++i) free(primitives[i].split);
+    free(primitives);
+#undef QM3_LOOP_PRIMITIVE_PUSH
+    return false;
+}
+
+static int qm3_loop_find_root(int* parent, int a) {
+    while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; }
+    return a;
+}
+
+static void qm3_loop_union(int* parent, unsigned char* rank, int a, int b) {
+    a = qm3_loop_find_root(parent, a); b = qm3_loop_find_root(parent, b);
+    if (a == b) return;
+    if (rank[a] < rank[b]) { int swap = a; a = b; b = swap; }
+    parent[b] = a;
+    if (rank[a] == rank[b]) rank[a]++;
+}
+
+static bool qm3_loop_point_in_cell(Qm3LoopPoint p, const Qm3LoopCell* cell, double tol, bool* boundary) {
+    int winding = 0; *boundary = false;
+    for (int i = 0; i < cell->polygon_count; ++i) {
+        Qm3LoopPoint a = cell->polygon[i], b = cell->polygon[(i + 1) % cell->polygon_count];
+        if (qm3_loop_point_segment_dist2(p, a, b) <= tol * tol) { *boundary = true; return true; }
+        double side = qm3_loop_cross(qm3_loop_sub(b, a), qm3_loop_sub(p, a));
+        if (a.y <= p.y && b.y > p.y && side > 0.0) winding++;
+        if (a.y > p.y && b.y <= p.y && side < 0.0) winding--;
+    }
+    return winding != 0;
+}
+
+static int qm3_loop_locate_cell(const Qm3LoopSubdivision* sub, int tri_slot, Qm3LoopPoint p, bool allow_boundary) {
+    int found = -1;
+    for (int i = sub->tri_cell_offsets[tri_slot]; i < sub->tri_cell_offsets[tri_slot + 1]; ++i) {
+        bool boundary = false;
+        if (!qm3_loop_point_in_cell(p, &sub->cells[i], sub->tri_tol[tri_slot], &boundary)) continue;
+        if (boundary && !allow_boundary) continue;
+        if (found >= 0 && found != i) return -1;
+        found = i;
+    }
+    return found;
+}
+
+static int qm3_loop_tri_slot(const Qm3LoopSubdivision* sub, int tri) {
+    int lo = 0, hi = sub->tri_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (sub->tri_ids[mid] < tri) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < sub->tri_count && sub->tri_ids[lo] == tri ? lo : -1;
 }
 
 static void qm3_rebuild_sample_to_graph(QuadMeshing3DEnv* env) {
@@ -1394,115 +1514,460 @@ static void qm3_build_face_loop_segments(const Qm3Mesh* mesh, const Qm3MeshFace*
     }
 }
 
-static Qm3LoopRemovalStats qm3_remove_samples_inside_loop(QuadMeshing3DEnv* env, const Qm3PathSegmentArray* loop_segments) {
+static int qm3_face_interior_side(const Qm3Mesh* mesh, const Qm3MeshFace* face) {
+    if (!face || face->disabled || face->n < 3) return 0;
+    Qm3Vec3 cycle_normal = {0};
+    Qm3Vec3 surface_normal = {0};
+    for (uint32_t i = 0; i < face->n; ++i) {
+        const Qm3MeshVertex* a = &mesh->vertices[face->vertices[i]];
+        const Qm3MeshVertex* b = &mesh->vertices[face->vertices[(i + 1) % face->n]];
+        cycle_normal.x += a->pos.y * b->pos.z - a->pos.z * b->pos.y;
+        cycle_normal.y += a->pos.z * b->pos.x - a->pos.x * b->pos.z;
+        cycle_normal.z += a->pos.x * b->pos.y - a->pos.y * b->pos.x;
+        surface_normal = qm3_add(surface_normal, a->normal);
+    }
+    if (qm3_dot(cycle_normal, cycle_normal) <= 1e-20f || qm3_dot(surface_normal, surface_normal) <= 1e-20f) return 0;
+    return qm3_dot(cycle_normal, surface_normal) >= 0.0f ? 1 : 2;
+}
+
+static bool qm3_mesh_vertex_is_registered_face_boundary(const Qm3Mesh* mesh, uint32_t vidx) {
+    for (uint32_t fi = 0; fi < mesh->face_count; ++fi) {
+        if (qm3_mesh_vertex_is_face_boundary(&mesh->faces[fi], vidx)) return true;
+    }
+    return false;
+}
+
+static bool qm3_mesh_edge_is_registered_face_boundary(const Qm3Mesh* mesh, uint32_t eidx) {
+    for (uint32_t fi = 0; fi < mesh->face_count; ++fi) {
+        if (qm3_mesh_edge_is_face_boundary(&mesh->faces[fi], eidx)) return true;
+    }
+    return false;
+}
+
+static bool qm3_sample_is_registered_face_vertex(const QuadMeshing3DEnv* env, uint32_t sample_id) {
+    if (sample_id >= env->surface.sample_count) return false;
+    if (env->sample_to_graph && env->sample_to_graph[sample_id] >= 0) {
+        return qm3_mesh_vertex_is_registered_face_boundary(&env->mesh, (uint32_t)env->sample_to_graph[sample_id]);
+    }
+    for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) {
+        const Qm3MeshVertex* vertex = &env->mesh.vertices[vi];
+        if (!vertex->disabled && vertex->sample_id == sample_id && qm3_mesh_vertex_is_registered_face_boundary(&env->mesh, vi)) return true;
+    }
+    return false;
+}
+
+static int qm3_loop_segment_tri_compare(const void* a, const void* b) {
+    const Qm3PathSegment* sa = (const Qm3PathSegment*)a;
+    const Qm3PathSegment* sb = (const Qm3PathSegment*)b;
+    return (sa->tri > sb->tri) - (sa->tri < sb->tri);
+}
+
+static bool qm3_loop_label_cell(int* parent, unsigned char* root_side, int cell, int side) {
+    if (cell < 0) return true;
+    int root = qm3_loop_find_root(parent, cell);
+    if (root_side[root] != 0 && root_side[root] != side) return false;
+    root_side[root] = (unsigned char)side;
+    return true;
+}
+
+static int qm3_loop_locate_side_cell(const Qm3LoopSubdivision* sub, int tri_slot, Qm3LoopPoint p,
+    int* parent, const unsigned char* root_side, int side) {
+    int found = -1;
+    for (int i = sub->tri_cell_offsets[tri_slot]; i < sub->tri_cell_offsets[tri_slot + 1]; ++i) {
+        if (root_side[qm3_loop_find_root(parent, i)] != side) continue;
+        bool boundary = false;
+        if (!qm3_loop_point_in_cell(p, &sub->cells[i], sub->tri_tol[tri_slot], &boundary)) continue;
+        if (found >= 0 && found != i) return -1;
+        found = i;
+    }
+    return found;
+}
+
+static float qm3_surface_triangle_area(const Qm3Surface* surface, int tri) {
+    Qm3Tri t = surface->triangles[tri];
+    Qm3Vec3 a = surface->vertices[t.a], b = surface->vertices[t.b], c = surface->vertices[t.c];
+    float abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+    float acx = c.x - a.x, acy = c.y - a.y, acz = c.z - a.z;
+    float x = aby * acz - abz * acy;
+    float y = abz * acx - abx * acz;
+    float z = abx * acy - aby * acx;
+    return 0.5f * sqrtf(x * x + y * y + z * z);
+}
+
+static bool qm3_loop_flood_enqueue(int tri, int side, const unsigned char* boundary_tri, unsigned char* side_mark,
+    unsigned char* conflict_tri, Qm3IntArray* queue, uint32_t* conflicts) {
+    if (tri < 0 || boundary_tri[tri]) return true;
+    if (side_mark[tri] == side) return true;
+    if (side_mark[tri] != 0) {
+        conflict_tri[tri] = 1;
+        (*conflicts)++;
+        return false;
+    }
+    side_mark[tri] = (unsigned char)side;
+    qm3_int_push(queue, tri);
+    return true;
+}
+
+static bool qm3_loop_flood_pop(const QuadMeshing3DEnv* env, int side, const unsigned char* boundary_tri,
+    unsigned char* side_mark, unsigned char* conflict_tri, Qm3IntArray* queue, int* head,
+    Qm3IntArray* reached, float* area, uint32_t* tris, uint32_t* conflicts) {
+    if (*head >= queue->size) return true;
+    int tri = queue->data[(*head)++];
+    *area += qm3_surface_triangle_area(&env->surface, tri);
+    (*tris)++;
+    qm3_int_push(reached, tri);
+    for (int edge = 0; edge < 3; ++edge) {
+        int neighbor = ((int*)&env->surface.triangle_neighbors[tri])[edge];
+        if (!qm3_loop_flood_enqueue(neighbor, side, boundary_tri, side_mark, conflict_tri, queue, conflicts)) return false;
+    }
+    return true;
+}
+
+static Qm3LoopRemovalStats qm3_remove_samples_inside_loop(QuadMeshing3DEnv* env, const Qm3PathSegmentArray* loop_segments, int interior_side) {
     Qm3LoopRemovalStats stats = {0};
     if (loop_segments->count == 0 || !env->sample_disabled) return stats;
-    Qm3IntArray boundary_list = {0};
-    Qm3IntArray reached_left = {0};
-    Qm3IntArray reached_right = {0};
     uint32_t tri_count = env->surface.triangle_count;
-    unsigned char* flags = (unsigned char*)calloc((size_t)tri_count * 3, sizeof(unsigned char));
-    unsigned char* vertex_side = (unsigned char*)calloc((size_t)tri_count * 3, sizeof(unsigned char));
-    float* vertex_dist2 = (float*)malloc((size_t)tri_count * 3 * sizeof(float));
-    unsigned char* boundary_tri = (unsigned char*)calloc((size_t)tri_count, sizeof(unsigned char));
-    unsigned char* side_mark = (unsigned char*)calloc((size_t)tri_count, sizeof(unsigned char));
-    unsigned char* conflict_tri = (unsigned char*)calloc((size_t)tri_count, sizeof(unsigned char));
-    int* queue_left = (int*)malloc((size_t)tri_count * sizeof(int));
-    int* queue_right = (int*)malloc((size_t)tri_count * sizeof(int));
-    QM3_ASSERT(flags && vertex_side && vertex_dist2 && boundary_tri && side_mark && conflict_tri && queue_left && queue_right);
-    for (uint32_t i = 0; i < tri_count * 3; ++i) vertex_dist2[i] = INFINITY;
-
-    for (uint32_t i = 0; i < loop_segments->count; ++i) {
-        qm3_loop_mark_segment_blocked_edges(env, &loop_segments->data[i], flags, vertex_side, vertex_dist2, boundary_tri);
+    unsigned char* flags = (unsigned char*)calloc((size_t)tri_count * 3, 1);
+    unsigned char* boundary_tri = (unsigned char*)calloc((size_t)tri_count, 1);
+    unsigned char* side_mark = (unsigned char*)calloc((size_t)tri_count, 1);
+    unsigned char* conflict_tri = (unsigned char*)calloc((size_t)tri_count, 1);
+    Qm3LoopSubdivision sub = {0};
+    sub.tri_ids = (int*)malloc((size_t)loop_segments->count * sizeof(int));
+    sub.tri_cell_offsets = (int*)calloc((size_t)loop_segments->count + 1, sizeof(int));
+    sub.tri_portal_offsets = (int*)calloc((size_t)loop_segments->count + 1, sizeof(int));
+    sub.tri_tol = (double*)calloc((size_t)loop_segments->count, sizeof(double));
+    Qm3PathSegment* sorted_segments = (Qm3PathSegment*)malloc((size_t)loop_segments->count * sizeof(*sorted_segments));
+    Qm3IntArray boundary_list = {0}, segment_offsets = {0}, cut_offsets = {0};
+    bool valid = flags && boundary_tri && side_mark && conflict_tri && sub.tri_ids && sub.tri_cell_offsets &&
+        sub.tri_portal_offsets && sub.tri_tol && sorted_segments && env->surface.triangle_neighbors;
+    if (valid) {
+        memcpy(sorted_segments, loop_segments->data, (size_t)loop_segments->count * sizeof(*sorted_segments));
+        qsort(sorted_segments, loop_segments->count, sizeof(*sorted_segments), qm3_loop_segment_tri_compare);
     }
-    for (uint32_t tri = 0; tri < tri_count; ++tri) if (boundary_tri[tri]) qm3_int_push(&boundary_list, (int)tri);
+    for (uint32_t begin = 0; valid && begin < loop_segments->count;) {
+        int tri = sorted_segments[begin].tri;
+        if (tri < 0 || tri >= (int)tri_count) { valid = false; break; }
+        uint32_t end = begin + 1;
+        while (end < loop_segments->count && sorted_segments[end].tri == tri) end++;
+        boundary_tri[tri] = 1;
+        int tri_slot = sub.tri_count++;
+        sub.tri_ids[tri_slot] = tri;
+        qm3_int_push(&boundary_list, tri);
+        qm3_int_push(&segment_offsets, (int)begin);
+        qm3_int_push(&cut_offsets, sub.cut_count);
+        sub.tri_cell_offsets[tri_slot] = sub.cell_count;
+        sub.tri_portal_offsets[tri_slot] = sub.portal_count;
+        Qm3PathSegmentArray local = {.data = &sorted_segments[begin], .count = end - begin, .cap = end - begin};
+        valid = qm3_loop_build_triangle(env, &local, tri, tri_slot, &sub, flags, boundary_tri);
+        sub.tri_cell_offsets[tri_slot + 1] = sub.cell_count;
+        sub.tri_portal_offsets[tri_slot + 1] = sub.portal_count;
+        begin = end;
+    }
+    qm3_int_push(&segment_offsets, (int)loop_segments->count);
+    qm3_int_push(&cut_offsets, sub.cut_count);
+    stats.boundary_tris = (uint32_t)boundary_list.size;
+    int* parent = NULL;
+    unsigned char* rank = NULL;
+    unsigned char* root_side = NULL;
+    double* breaks = NULL;
+    int breaks_cap = 0;
+    int failure_stage = 1;
+    uint32_t ambiguous_classifications = 0;
+    if (valid) {
+        parent = (int*)malloc((size_t)sub.cell_count * sizeof(int));
+        rank = (unsigned char*)calloc((size_t)sub.cell_count, 1);
+        root_side = (unsigned char*)calloc((size_t)sub.cell_count, 1);
+        valid = parent && rank && root_side && (env->surface.sample_count == 0 ||
+            (env->surface_topo.tri_sample_offsets && env->surface_topo.tri_sample_ids));
+    }
+    for (int i = 0; valid && i < sub.cell_count; ++i) parent[i] = i;
 
-    int left_head = 0, left_tail = 0, right_head = 0, right_tail = 0;
-    qm3_loop_seed_cut_edges_from_vertices(env, &boundary_list, vertex_side, boundary_tri, flags, queue_left, &left_tail, queue_right, &right_tail, side_mark, conflict_tri, &stats.classification_conflicts, &stats.flood_conflicts);
-
-    bool left_seeded = left_tail > 0;
-    bool right_seeded = right_tail > 0;
-    if (!left_seeded && right_seeded) {
-        stats.chosen_side = 1;
-    } else if (!right_seeded && left_seeded) {
-        stats.chosen_side = 2;
-    } else {
-        bool prefer_left = true;
-        while (left_head < left_tail || right_head < right_tail) {
-            bool popped = false;
-            if (prefer_left) {
-                popped = qm3_loop_flood_pop(env, flags, boundary_tri, 1, queue_left, &left_head, &left_tail, side_mark, conflict_tri, &stats.left_area, &stats.left_tris, &reached_left, &stats.flood_conflicts);
-                if (!popped) qm3_loop_flood_pop(env, flags, boundary_tri, 2, queue_right, &right_head, &right_tail, side_mark, conflict_tri, &stats.right_area, &stats.right_tris, &reached_right, &stats.flood_conflicts);
-            } else {
-                popped = qm3_loop_flood_pop(env, flags, boundary_tri, 2, queue_right, &right_head, &right_tail, side_mark, conflict_tri, &stats.right_area, &stats.right_tris, &reached_right, &stats.flood_conflicts);
-                if (!popped) qm3_loop_flood_pop(env, flags, boundary_tri, 1, queue_left, &left_head, &left_tail, side_mark, conflict_tri, &stats.left_area, &stats.left_tris, &reached_left, &stats.flood_conflicts);
+    /* Stitch only boundary cells. The scratch buffer is reused for every edge. */
+    if (valid) failure_stage = 2;
+    for (int bi = 0; valid && bi < boundary_list.size; ++bi) {
+        int tri = boundary_list.data[bi];
+        int tri_slot = bi;
+        for (int edge = 0; valid && edge < 3; ++edge) {
+            int neighbor = ((int*)&env->surface.triangle_neighbors[tri])[edge];
+            if (neighbor < 0 || neighbor < tri || !boundary_tri[neighbor]) continue;
+            int neighbor_slot = qm3_loop_tri_slot(&sub, neighbor);
+            if (neighbor_slot < 0) { valid = false; break; }
+            Qm3Tri surface_tri = env->surface.triangles[tri];
+            uint32_t vertices[3] = {surface_tri.a, surface_tri.b, surface_tri.c};
+            uint32_t va = vertices[(edge + 1) % 3], vb = vertices[(edge + 2) % 3];
+            if (va > vb) { uint32_t swap = va; va = vb; vb = swap; }
+            int max_breaks = 2;
+            for (int i = sub.tri_portal_offsets[tri_slot]; i < sub.tri_portal_offsets[tri_slot + 1]; ++i) if (sub.portals[i].edge == edge) max_breaks += 2;
+            for (int i = sub.tri_portal_offsets[neighbor_slot]; i < sub.tri_portal_offsets[neighbor_slot + 1]; ++i) if (sub.portals[i].va == va && sub.portals[i].vb == vb) max_breaks += 2;
+            if (max_breaks > breaks_cap) {
+                breaks_cap = max_breaks;
+                breaks = (double*)qm3_checked_realloc(breaks, (size_t)breaks_cap * sizeof(double));
             }
-            prefer_left = !prefer_left;
-            bool left_done = left_head >= left_tail;
-            bool right_done = right_head >= right_tail;
-            if (left_done && stats.right_area >= stats.left_area) break;
-            if (right_done && stats.left_area >= stats.right_area) break;
-        }
-
-        if (stats.right_tris <= 0 && stats.left_tris > 0) stats.chosen_side = 2;
-        else if (stats.left_tris <= 0 && stats.right_tris > 0) stats.chosen_side = 1;
-        else if (stats.left_tris > 0 && stats.left_area <= stats.right_area) stats.chosen_side = 1;
-        else if (stats.right_tris > 0) stats.chosen_side = 2;
-    }
-
-    if (stats.chosen_side != 0) {
-        Qm3IntArray* chosen_tris = stats.chosen_side == 1 ? &reached_left : &reached_right;
-        for (int ti = 0; ti < chosen_tris->size; ++ti) {
-            uint32_t tri = (uint32_t)chosen_tris->data[ti];
-            int begin = env->surface_topo.tri_sample_offsets[tri];
-            int end = env->surface_topo.tri_sample_offsets[tri + 1];
-            for (int si = begin; si < end; ++si) {
-                uint32_t sample_id = (uint32_t)env->surface_topo.tri_sample_ids[si];
-                if (!env->sample_disabled[sample_id]) {
-                    env->sample_disabled[sample_id] = 1;
-                    if (env->sample_to_graph) env->sample_to_graph[sample_id] = -1;
-                    env->disabled_sample_count++;
-                    stats.disabled_samples++;
+            int break_count = 0;
+            breaks[break_count++] = 0.0;
+            breaks[break_count++] = 1.0;
+            for (int i = sub.tri_portal_offsets[tri_slot]; i < sub.tri_portal_offsets[tri_slot + 1]; ++i) {
+                const Qm3LoopPortal* portal = &sub.portals[i];
+                if (portal->edge != edge) continue;
+                breaks[break_count++] = portal->lo; breaks[break_count++] = portal->hi;
+            }
+            for (int i = sub.tri_portal_offsets[neighbor_slot]; i < sub.tri_portal_offsets[neighbor_slot + 1]; ++i) {
+                const Qm3LoopPortal* portal = &sub.portals[i];
+                if (portal->va != va || portal->vb != vb) continue;
+                breaks[break_count++] = portal->lo; breaks[break_count++] = portal->hi;
+            }
+            for (int i = 1; i < break_count; ++i) {
+                double value = breaks[i]; int j = i;
+                while (j > 0 && breaks[j - 1] > value) { breaks[j] = breaks[j - 1]; --j; }
+                breaks[j] = value;
+            }
+            double edge_length = qm3_distance(env->surface.vertices[va], env->surface.vertices[vb]);
+            double param_tol = edge_length > 0.0
+                ? fmax(8.0 * fmax(sub.tri_tol[tri_slot], sub.tri_tol[neighbor_slot]) / edge_length, 1e-10)
+                : 1e-10;
+            int unique_count = 0;
+            for (int i = 0; i < break_count; ++i) {
+                double value = fmin(fmax(breaks[i], 0.0), 1.0);
+                if (unique_count > 0 && value - breaks[unique_count - 1] <= param_tol) {
+                    breaks[unique_count - 1] = 0.5 * (breaks[unique_count - 1] + value);
+                } else {
+                    breaks[unique_count++] = value;
                 }
             }
-        }
-        for (int bi = 0; bi < boundary_list.size; ++bi) {
-            uint32_t tri = (uint32_t)boundary_list.data[bi];
-            int begin = env->surface_topo.tri_sample_offsets[tri];
-            int end = env->surface_topo.tri_sample_offsets[tri + 1];
-            for (int si = begin; si < end; ++si) {
-                uint32_t sample_id = (uint32_t)env->surface_topo.tri_sample_ids[si];
-                if (env->sample_disabled[sample_id]) continue;
-                int side = qm3_classify_boundary_sample_side_local(env, loop_segments, (int)tri, env->surface.samples[sample_id].p, &stats.classification_conflicts);
-                if (side == stats.chosen_side) {
-                    env->sample_disabled[sample_id] = 1;
-                    if (env->sample_to_graph) env->sample_to_graph[sample_id] = -1;
-                    env->disabled_sample_count++;
-                    stats.disabled_samples++;
+            for (int bi = 0; valid && bi + 1 < unique_count; ++bi) {
+                if (breaks[bi + 1] - breaks[bi] <= 2.0 * param_tol) continue;
+                double midpoint = 0.5 * (breaks[bi] + breaks[bi + 1]);
+                const Qm3LoopPortal* a = NULL;
+                const Qm3LoopPortal* b = NULL;
+                for (int i = sub.tri_portal_offsets[tri_slot]; i < sub.tri_portal_offsets[tri_slot + 1]; ++i) {
+                    const Qm3LoopPortal* portal = &sub.portals[i];
+                    if (portal->edge == edge && midpoint >= portal->lo - param_tol && midpoint <= portal->hi + param_tol) { a = portal; break; }
                 }
+                for (int i = sub.tri_portal_offsets[neighbor_slot]; i < sub.tri_portal_offsets[neighbor_slot + 1]; ++i) {
+                    const Qm3LoopPortal* portal = &sub.portals[i];
+                    if (portal->va == va && portal->vb == vb && midpoint >= portal->lo - param_tol && midpoint <= portal->hi + param_tol) { b = portal; break; }
+                }
+                if (!a || !b) { valid = false; break; }
+                if (!a->cut && !b->cut) qm3_loop_union(parent, rank, a->cell, b->cell);
             }
         }
     }
 
+    /* Directed probes label boundary-cell components without assuming one cell per triangle. */
+    if (valid) failure_stage = 3;
+    for (uint32_t si = 0; valid && si < loop_segments->count; ++si) {
+        const Qm3PathSegment* segment = &sorted_segments[si];
+        int tri_slot = qm3_loop_tri_slot(&sub, segment->tri);
+        if (tri_slot < 0) { valid = false; break; }
+        Qm3Vec2 af, bf;
+        if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, segment->tri, segment->a, &af) ||
+            !qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, segment->tri, segment->b, &bf)) { valid = false; break; }
+        Qm3LoopPoint a = qm3_loop_point(af), b = qm3_loop_point(bf), d = qm3_loop_sub(b, a);
+        double len = sqrt(qm3_loop_len2(d));
+        if (len <= sub.tri_tol[tri_slot]) continue;
+        Qm3LoopPoint normal = {-d.y / len, d.x / len};
+        const double positions[3] = {0.25, 0.5, 0.75};
+        for (int pi = 0; pi < 3 && valid; ++pi) {
+            Qm3LoopPoint mid = qm3_loop_add(a, qm3_loop_scale(d, positions[pi]));
+            double eps = fmax(sub.tri_tol[tri_slot] * 4.0, len * 1e-6);
+            for (int attempt = 0; attempt < 5; ++attempt) {
+                int left = qm3_loop_locate_cell(&sub, tri_slot, qm3_loop_add(mid, qm3_loop_scale(normal, eps)), false);
+                int right = qm3_loop_locate_cell(&sub, tri_slot, qm3_loop_add(mid, qm3_loop_scale(normal, -eps)), false);
+                int left_probe_root = left >= 0 ? qm3_loop_find_root(parent, left) : -1;
+                int right_probe_root = right >= 0 ? qm3_loop_find_root(parent, right) : -1;
+                if (left_probe_root >= 0 && left_probe_root == right_probe_root) {
+                    eps *= 4.0;
+                    continue;
+                }
+                if (left_probe_root >= 0 && !qm3_loop_label_cell(parent, root_side, left, 1)) valid = false;
+                if (right_probe_root >= 0 && !qm3_loop_label_cell(parent, root_side, right, 2)) valid = false;
+                if (left_probe_root >= 0 || right_probe_root >= 0) break;
+                eps *= 0.25;
+            }
+        }
+    }
+
+    /* An edge-coincident cut has one in-triangle probe. Label an adjacent
+       boundary cell as the opposite side; a full neighbor is seeded below. */
+    if (valid) failure_stage = 4;
+    for (int bi = 0; valid && bi < boundary_list.size; ++bi) {
+        int tri = boundary_list.data[bi];
+        int tri_slot = bi;
+        for (int i = sub.tri_portal_offsets[tri_slot]; valid && i < sub.tri_portal_offsets[tri_slot + 1]; ++i) {
+            const Qm3LoopPortal* portal = &sub.portals[i];
+            if (!portal->cut) continue;
+            int neighbor = ((int*)&env->surface.triangle_neighbors[tri])[portal->edge];
+            const Qm3LoopCell* cell = &sub.cells[portal->cell];
+            Qm3LoopPoint center = {0};
+            for (int p = 0; p < cell->polygon_count; ++p) center = qm3_loop_add(center, cell->polygon[p]);
+            center = qm3_loop_scale(center, 1.0 / cell->polygon_count);
+            Qm3Tri st = env->surface.triangles[tri];
+            uint32_t vertices[3] = {st.a, st.b, st.c};
+            int la = (portal->edge + 1) % 3, lb = (portal->edge + 2) % 3;
+            Qm3LoopPoint edge_a = qm3_loop_point(env->continuous_ctx.tri2d_base[3 * tri + la]);
+            Qm3LoopPoint edge_b = qm3_loop_point(env->continuous_ctx.tri2d_base[3 * tri + lb]);
+            double edge_t = 0.5 * (portal->lo + portal->hi);
+            if (vertices[la] > vertices[lb]) edge_t = 1.0 - edge_t;
+            Qm3LoopPoint portal_mid = qm3_loop_add(edge_a, qm3_loop_scale(qm3_loop_sub(edge_b, edge_a), edge_t));
+            for (int si = segment_offsets.data[bi]; si < segment_offsets.data[bi + 1]; ++si) {
+                const Qm3PathSegment* segment = &sorted_segments[si];
+                Qm3Vec2 af, bf;
+                if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, segment->a, &af) ||
+                    !qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, segment->b, &bf)) { valid = false; break; }
+                Qm3LoopPoint a = qm3_loop_point(af), b = qm3_loop_point(bf), d = qm3_loop_sub(b, a);
+                if (qm3_loop_point_segment_dist2(portal_mid, a, b) > 4.0 * sub.tri_tol[tri_slot] * sub.tri_tol[tri_slot]) continue;
+                if (qm3_loop_point_segment_dist2(center, a, b) <= sub.tri_tol[tri_slot] * sub.tri_tol[tri_slot]) continue;
+                int side = qm3_loop_cross(d, qm3_loop_sub(center, a)) > 0.0 ? 1 : 2;
+                if (!qm3_loop_label_cell(parent, root_side, portal->cell, side)) { valid = false; break; }
+                int neighbor_slot = neighbor >= 0 ? qm3_loop_tri_slot(&sub, neighbor) : -1;
+                int portal_begin = neighbor_slot >= 0 ? sub.tri_portal_offsets[neighbor_slot] : 0;
+                int portal_end = neighbor_slot >= 0 ? sub.tri_portal_offsets[neighbor_slot + 1] : 0;
+                for (int j = portal_begin; j < portal_end; ++j) {
+                    const Qm3LoopPortal* other = &sub.portals[j];
+                    if (other->tri != neighbor || other->va != portal->va || other->vb != portal->vb ||
+                        fmin(other->hi, portal->hi) - fmax(other->lo, portal->lo) <= 1e-10) continue;
+                    if (!qm3_loop_label_cell(parent, root_side, other->cell, 3 - side)) { valid = false; break; }
+                }
+                break;
+            }
+        }
+    }
+
+    if (valid) failure_stage = 5;
+    for (int ci = 0; valid && ci < sub.cell_count; ++ci) {
+        int side = root_side[qm3_loop_find_root(parent, ci)];
+        if (side == 0) { valid = false; break; }
+        if (side == 1) stats.left_area += (float)sub.cells[ci].area;
+        else stats.right_area += (float)sub.cells[ci].area;
+    }
+    for (int bi = 0; valid && bi < boundary_list.size; ++bi) {
+        int tri = boundary_list.data[bi];
+        bool has_left = false, has_right = false;
+        for (int ci = sub.tri_cell_offsets[bi]; ci < sub.tri_cell_offsets[bi + 1]; ++ci) {
+            int side = root_side[qm3_loop_find_root(parent, ci)];
+            has_left |= side == 1;
+            has_right |= side == 2;
+        }
+        if (has_left) stats.left_tris++;
+        if (has_right) stats.right_tris++;
+        if (has_left != has_right) side_mark[tri] = has_left ? 1 : 2;
+    }
+    for (int i = 0; valid && i < sub.portal_count; ++i) {
+        const Qm3LoopPortal* portal = &sub.portals[i];
+        int side = root_side[qm3_loop_find_root(parent, portal->cell)];
+        flags[3 * portal->tri + portal->edge] |= side == 1 ? QM3_LOOP_EDGE_LEFT : QM3_LOOP_EDGE_RIGHT;
+    }
+
+    Qm3IntArray queue_left = {0}, queue_right = {0}, reached_left = {0}, reached_right = {0};
+    int left_head = 0, right_head = 0;
+    if (valid) failure_stage = 6;
+    for (int i = 0; valid && i < sub.portal_count; ++i) {
+        const Qm3LoopPortal* portal = &sub.portals[i];
+        int neighbor = ((int*)&env->surface.triangle_neighbors[portal->tri])[portal->edge];
+        if (neighbor < 0 || boundary_tri[neighbor]) continue;
+        int side = root_side[qm3_loop_find_root(parent, portal->cell)];
+        if (portal->cut) side = 3 - side;
+        Qm3IntArray* queue = side == 1 ? &queue_left : &queue_right;
+        if (!qm3_loop_flood_enqueue(neighbor, side, boundary_tri, side_mark, conflict_tri, queue, &stats.flood_conflicts)) valid = false;
+    }
+    bool prefer_left = true;
+    while (valid) {
+        bool left_done = left_head >= queue_left.size;
+        bool right_done = right_head >= queue_right.size;
+        if ((left_done && stats.right_area >= stats.left_area) ||
+            (right_done && stats.left_area >= stats.right_area)) break;
+        if (left_done && right_done) break;
+        if (prefer_left && !left_done) {
+            valid = qm3_loop_flood_pop(env, 1, boundary_tri, side_mark, conflict_tri, &queue_left, &left_head,
+                &reached_left, &stats.left_area, &stats.left_tris, &stats.flood_conflicts);
+        } else if (!right_done) {
+            valid = qm3_loop_flood_pop(env, 2, boundary_tri, side_mark, conflict_tri, &queue_right, &right_head,
+                &reached_right, &stats.right_area, &stats.right_tris, &stats.flood_conflicts);
+        } else {
+            valid = qm3_loop_flood_pop(env, 1, boundary_tri, side_mark, conflict_tri, &queue_left, &left_head,
+                &reached_left, &stats.left_area, &stats.left_tris, &stats.flood_conflicts);
+        }
+        prefer_left = !prefer_left;
+    }
+    stats.flood_tris = (uint32_t)(reached_left.size + reached_right.size);
+    if (valid) {
+        if (stats.left_area < stats.right_area) stats.chosen_side = 1;
+        else if (stats.right_area < stats.left_area) stats.chosen_side = 2;
+        else stats.chosen_side = interior_side == 2 ? 2 : 1;
+    }
+
+    /* Collect only samples in the completed smaller flood and boundary cells.
+       Mutation is delayed until all selected samples classify unambiguously. */
+    Qm3IntArray selected = {0};
+    if (valid) failure_stage = 7;
+    Qm3IntArray* chosen_reached = stats.chosen_side == 1 ? &reached_left : &reached_right;
+    for (int ri = 0; valid && ri < chosen_reached->size; ++ri) {
+        int tri = chosen_reached->data[ri];
+        for (int si = env->surface_topo.tri_sample_offsets[tri]; si < env->surface_topo.tri_sample_offsets[tri + 1]; ++si) {
+            uint32_t sample_id = (uint32_t)env->surface_topo.tri_sample_ids[si];
+            if (sample_id >= env->surface.sample_count) { valid = false; break; }
+            if (!env->sample_disabled[sample_id] && !qm3_sample_is_registered_face_vertex(env, sample_id)) qm3_int_push(&selected, (int)sample_id);
+        }
+    }
+    for (int bi = 0; valid && bi < boundary_list.size; ++bi) {
+        int tri = boundary_list.data[bi];
+        for (int si = env->surface_topo.tri_sample_offsets[tri]; si < env->surface_topo.tri_sample_offsets[tri + 1]; ++si) {
+            uint32_t sample_id = (uint32_t)env->surface_topo.tri_sample_ids[si];
+            if (sample_id >= env->surface.sample_count) { valid = false; break; }
+            if (env->sample_disabled[sample_id]) continue;
+            Qm3Vec2 pf;
+            if (!qm3_point_to_base_tri2d(&env->surface, &env->continuous_ctx, tri, env->surface.samples[sample_id].p, &pf)) {
+                ambiguous_classifications++;
+                continue;
+            }
+            Qm3LoopPoint p = qm3_loop_point(pf);
+            bool on_cut = false;
+            for (int ci = cut_offsets.data[bi]; ci < cut_offsets.data[bi + 1]; ++ci) {
+                const Qm3LoopCut* cut = &sub.cuts[ci];
+                if (qm3_loop_point_segment_dist2(p, cut->a, cut->b) <= cut->tol * cut->tol) { on_cut = true; break; }
+            }
+            if (on_cut) { ambiguous_classifications++; continue; }
+            int cell = qm3_loop_locate_side_cell(&sub, bi, p, parent, root_side, stats.chosen_side);
+            if (cell < 0) continue;
+            if (!qm3_sample_is_registered_face_vertex(env, sample_id)) qm3_int_push(&selected, (int)sample_id);
+        }
+    }
+    for (int i = 0; valid && i < selected.size; ++i) {
+        uint32_t sample_id = (uint32_t)selected.data[i];
+        env->sample_disabled[sample_id] = 1;
+        if (env->sample_to_graph) env->sample_to_graph[sample_id] = -1;
+        env->disabled_sample_count++; stats.disabled_samples++;
+    }
+    if (!valid) {
+        fprintf(stderr, "loop subdivision failed: stage=%d boundary=%d cells=%d cuts=%d\n", failure_stage, boundary_list.size, sub.cell_count, sub.cut_count);
+        stats.chosen_side = 0;
+        stats.disabled_samples = 0;
+        stats.classification_conflicts++;
+        for (int bi = 0; bi < boundary_list.size; ++bi) conflict_tri[boundary_list.data[bi]] = 1;
+    }
+    stats.classification_conflicts += ambiguous_classifications;
     qm3_loop_debug_capture(&env->loop_debug, flags, boundary_tri, side_mark, conflict_tri, tri_count);
-    free(flags); free(vertex_side); free(vertex_dist2); free(boundary_tri); free(side_mark); free(conflict_tri); free(queue_left); free(queue_right);
-    qm3_int_free(&boundary_list); qm3_int_free(&reached_left); qm3_int_free(&reached_right);
+    free(parent); free(rank); free(root_side); free(breaks); free(sorted_segments);
+    qm3_int_free(&boundary_list); qm3_int_free(&segment_offsets); qm3_int_free(&cut_offsets);
+    qm3_int_free(&queue_left); qm3_int_free(&queue_right); qm3_int_free(&reached_left); qm3_int_free(&reached_right); qm3_int_free(&selected);
+    qm3_loop_subdivision_free(&sub);
+    free(flags); free(boundary_tri); free(side_mark); free(conflict_tri);
     return stats;
 }
 
-static void qm3_prune_graph_after_loop_removal(QuadMeshing3DEnv* env, const Qm3MeshFace* face) {
+static void qm3_prune_graph_after_loop_removal(QuadMeshing3DEnv* env) {
     if (!env->sample_disabled) return;
     for (uint32_t vi = 0; vi < env->mesh.vertex_count; ++vi) {
         Qm3MeshVertex* v = &env->mesh.vertices[vi];
         if (v->disabled || v->sample_id >= env->surface.sample_count) continue;
         if (!env->sample_disabled[v->sample_id]) continue;
-        if (qm3_mesh_vertex_is_face_boundary(face, vi)) continue;
+        if (qm3_mesh_vertex_is_registered_face_boundary(&env->mesh, vi)) continue;
         v->disabled = true;
         if (v->frontier_index >= 0) qm3_mesh_update_frontier_vertex(&env->mesh, vi);
     }
     for (uint32_t ei = 0; ei < env->mesh.edge_count; ++ei) {
         Qm3MeshEdge* e = &env->mesh.edges[ei];
-        if (e->disabled || qm3_mesh_edge_is_face_boundary(face, ei)) continue;
+        if (e->disabled || qm3_mesh_edge_is_registered_face_boundary(&env->mesh, ei)) continue;
         if (env->mesh.vertices[e->a].disabled || env->mesh.vertices[e->b].disabled) {
             qm3_mark_edge_frontier_dirty(env, ei);
             qm3_mesh_disable_edge(&env->mesh, ei);
@@ -2019,8 +2484,8 @@ static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidat
                 qm3_mark_face_frontier_dirty(env, face);
                 qm3_add_reward(env, 0.5f * qm3_compute_face_reward(env, face));
                 qm3_build_face_loop_segments(&env->mesh, face, &loop_segments);
-                env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments);
-                qm3_prune_graph_after_loop_removal(env, face);
+                env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments, qm3_face_interior_side(&env->mesh, face));
+                qm3_prune_graph_after_loop_removal(env);
                 env->timing_loop_removal_ms = qm3_time_ms() - loop_start;
             }
         }
@@ -2034,8 +2499,8 @@ static bool qm3_commit_target_candidate(QuadMeshing3DEnv* env, uint32_t candidat
                 qm3_mark_face_frontier_dirty(env, face);
                 qm3_add_reward(env, qm3_compute_face_reward(env, face));
                 qm3_build_face_loop_segments(&env->mesh, face, &loop_segments);
-                env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments);
-                qm3_prune_graph_after_loop_removal(env, face);
+                env->loop_stats = qm3_remove_samples_inside_loop(env, &loop_segments, qm3_face_interior_side(&env->mesh, face));
+                qm3_prune_graph_after_loop_removal(env);
                 env->timing_loop_removal_ms = qm3_time_ms() - loop_start;
             }
         }
