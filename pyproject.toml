@@ -25,11 +25,15 @@ dependencies = [
     "scikit-learn",
     "wandb",
     "pybind11",
+    "tqdm",
+    "matplotlib",
     "tomli>=1.1.0; python_version < '3.11'",
 ]
 
 [project.scripts]
 puffer = "pufferlib.pufferl:main"
+puffer-evaluate-experiments = "pufferlib.evaluate_experiments:main"
+puffer-plot-experiments = "pufferlib.plot_experiments:main"
 
 [project.urls]
 Homepage = "https://puffer.ai"

@@ -1,0 +1,124 @@
+[batch]
+env = "quad_meshing"
+project = "puffer4"
+group = "quad_meshing_single"
+seeds = [1, 2, 3]
+slowly = true
+wandb = true
+
+# These values override config/default.ini and then config/quad_meshing.ini for
+# every experiment in this file.
+[defaults.vec]
+total_agents = 64
+
+[defaults.policy]
+spatial_dim = 2
+pos_bands = 4
+frontier_node_hidden_size = 64
+frontier_edge_hidden_size = 64
+frontier_context_hidden_size = 64
+target_hidden_size = 64
+network_layers = 2
+use_suggested_vertex = false
+
+frontier_pipeline = [ "init", "painn" ]
+
+frontier_init_node_position = false
+frontier_init_node_ring = false
+frontier_init_node_ring_n_neighbors = 3
+frontier_init_edge_midpoint = false
+frontier_init_edge_direction = false
+frontier_init_edge_length = true
+frontier_init_edge_target_length = true
+frontier_init_edge_target_log_length = true
+frontier_init_edge_relative_length = true
+frontier_init_edge_face_incidence = true
+
+frontier_painn_layers = 3
+frontier_painn_vector_channels = 16
+frontier_painn_length_bands = 4
+frontier_painn_chiral = true
+
+target_pipeline = [ "init", "painn", "source_global_perceiver" ]
+
+target_init_ring_frame_pos = false
+target_init_distance = false
+target_init_relative_distance = false
+target_init_target_length = true
+target_init_target_log_length = true
+target_init_boundary_flag = true
+target_init_frontier_parity = true
+target_init_cross_field = true
+
+target_painn_length_bands = 4
+
+target_global_perceiver_d_model = 64
+target_global_perceiver_length_bands = 4
+target_global_perceiver_num_latents = 16
+target_global_perceiver_layers = 3
+target_global_perceiver_heads = 4
+target_global_perceiver_mlp_ratio = 4
+target_global_perceiver_dropout = 0.0
+target_global_perceiver_residual_scale_init = 1e-2
+target_global_perceiver_fixed_shapes = false
+target_global_perceiver_compile = false
+
+max_frontier = 512
+max_degree = 8
+max_candidates = 336
+
+[defaults.env]
+boundary_mode = false
+prevent_triangles = true
+episode_max_length_ratio = 1.5
+candidate_rings = 7
+candidate_angles = 48
+target_edge_length_ratio = 1.0
+candidate_radius_min_ratio = 0.5
+candidate_radius_max_ratio = 1.5
+shape_folder = "./resources/quad_meshing/shapes/eval"
+shape_names = ["dolphin.qmshape"]
+
+# Rewards
+reward_cross_field = true
+reward_invalid = -0.1
+reward_incomplete = -1.0
+reward_triangle = 0.0
+base_quad_reward = 0.0
+potential_beta = 0.1
+potential_gamma = 0.997
+frontier_quality_weight = 1.0
+frontier_edge_length_weight = 1.0
+frontier_alignment_weight = 1.0
+frontier_angle_weight = 1.0
+frontier_size_pressure_weight = 1.0
+degree_pressure_weight = 1.0
+safe_frontier_size_ratio = 0.9
+safe_degree_ratio = 0.7
+
+# Perf
+max_frontier = 512
+max_degree = 8
+grid_res = 16
+grid_cell_size = 0.0625
+grid_cell_cap = 8
+intersection_tol = 1e-3
+
+# Eval
+export_obj = false
+
+[defaults.train]
+total_timesteps = 30_000_000
+learning_rate = 1e-3
+anneal_lr = true
+min_lr_ratio = 0.1
+gamma = 0.997
+gae_lambda = 0.95
+replay_ratio = 1.0
+ent_coef = 0.001
+minibatch_size = 1024
+horizon = 256
+
+[[experiments]]
+name = "baseline_single_shape"
+

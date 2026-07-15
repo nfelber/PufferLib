@@ -59,6 +59,8 @@ RUN uv pip install \
         gpytorch \
         scikit-learn \
         wandb \
+        tqdm \
+        matplotlib \
         tomli \
         pybind11
 

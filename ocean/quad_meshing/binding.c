@@ -45,7 +45,7 @@
 
 #include "vecenv.h"
 
-static void load_shape_paths_from_folder(Env* env, Dict* kwargs) {
+static void load_shape_paths_from_folder(Env* env, Dict* kwargs, int env_index) {
     DictItem* folder_item = dict_get_unsafe(kwargs, "shape_folder");
     QM_ASSERT(folder_item != NULL && folder_item->ptr != NULL);
     const char* folder = (const char*)folder_item->ptr;
@@ -54,6 +54,17 @@ static void load_shape_paths_from_folder(Env* env, Dict* kwargs) {
     if (names_item != NULL && names_item->value > 0) {
         const char** names = (const char**)names_item->ptr;
         int count = (int)names_item->value;
+        DictItem* export_paths_item = dict_get_unsafe(kwargs, "export_obj_paths");
+        if (export_paths_item != NULL && export_paths_item->value > 0) {
+            QM_ASSERT((int)export_paths_item->value == count);
+            QM_ASSERT(env_index >= 0 && env_index < count);
+            const char** paths = (const char**)calloc(1, sizeof(const char*));
+            QM_ASSERT(paths != NULL);
+            paths[0] = path_join(folder, names[env_index]);
+            env->shape_paths = paths;
+            env->shape_count = 1;
+            return;
+        }
         const char** paths = (const char**)calloc(count, sizeof(const char*));
         QM_ASSERT(paths != NULL);
         for (int i = 0; i < count; ++i) paths[i] = path_join(folder, names[i]);
@@ -66,6 +77,7 @@ static void load_shape_paths_from_folder(Env* env, Dict* kwargs) {
 }
 
 void my_init(Env* env, Dict* kwargs) {
+    int env_index = (int)env->rng;
     env->num_agents = 1;
 
     env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
@@ -75,15 +87,21 @@ void my_init(Env* env, Dict* kwargs) {
     env->candidate_radius_max_ratio = (float)dict_get(kwargs, "candidate_radius_max_ratio")->value;
     env->target_edge_length_ratio = (float)dict_get(kwargs, "target_edge_length_ratio")->value;
 
-    load_shape_paths_from_folder(env, kwargs);
+    load_shape_paths_from_folder(env, kwargs, env_index);
     QM_ASSERT(env->shape_count > 0);
 
     env->boundary_mode = dict_get(kwargs, "boundary_mode")->value > 0.5;
     env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
     env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
-    DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
-    QM_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
-    env->export_obj_path = (const char*)export_obj_path_item->ptr;
+    DictItem* export_paths_item = dict_get_unsafe(kwargs, "export_obj_paths");
+    if (export_paths_item != NULL && export_paths_item->value > 0) {
+        QM_ASSERT(env_index >= 0 && env_index < (int)export_paths_item->value);
+        env->export_obj_path = ((const char**)export_paths_item->ptr)[env_index];
+    } else {
+        DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
+        QM_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
+        env->export_obj_path = (const char*)export_obj_path_item->ptr;
+    }
     env->reward_cross_field = (float)dict_get(kwargs, "reward_cross_field")->value;
     env->reward_invalid = dict_get(kwargs, "reward_invalid")->value > 0.5;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;

@@ -291,3 +291,119 @@ Each W&B run uses the manifest's project and group, with names such as
 and as `config.experiment`, while the seed is recorded as
 `config.experiment_seed`. This makes repeated seeds easy to group and compare
 without creating a W&B sweep.
+
+## Evaluate Explicit Experiments
+
+Evaluate every experiment and seed in a manifest against every shape directly
+inside a test dataset folder:
+
+```bash
+python -m pufferlib.evaluate_experiments \
+  experiments/quad_meshing.toml \
+  resources/quad_meshing/shapes/test \
+  --download \
+  --remote-root 'nfelber@izar1:~/PufferLib/cluster_runs/experiments/quad_meshing'
+```
+
+`--download` first uses `rsync` over SSH to fetch the completed run logs. It
+maps each manifest `(experiment, seed)` pair to its run ID, downloads that run's
+checkpoint directory, and stores the highest numeric-step checkpoint as:
+
+```text
+eval/<wandb-group>/models/<experiment>/<seed>/model.pt
+```
+
+Omit `--download` to reuse models already present in that layout. Generated
+meshes are written to:
+
+```text
+eval/<wandb-group>/meshes/<experiment>/<seed>/<shape>.obj
+```
+
+Use `--output-dir PATH` to replace the top-level `eval` directory. The command
+requires the float CUDA backend for the manifest environment and evaluates all
+test shapes as one vectorized environment batch without opening a render
+window. Each environment receives one shape and a distinct staging output, and
+the evaluator preserves its first terminal mesh export.
+
+By default, the whole dataset is evaluated concurrently for each model. Limit
+GPU memory and environment concurrency with, for example:
+
+```bash
+python -m pufferlib.evaluate_experiments MANIFEST DATASET --batch-size 16
+```
+
+The relevant backend must be rebuilt after changing the indexed shape/export
+binding implementation.
+
+The downloader only considers valid completed JSON logs with matching
+environment, W&B group, experiment name, and seed. If a task was retried, it
+prefers the candidate with the highest final agent step and reports discarded
+run IDs. All expected models must be available before evaluation starts.
+
+## Plot W&B Training Curves
+
+Download full metric histories from W&B and generate seed-aggregated training
+curves directly from an experiment manifest:
+
+```bash
+python -m pufferlib.plot_experiments \
+  experiments/quad_meshing.toml \
+  --entity YOUR_WANDB_ENTITY \
+  --metric env/score
+```
+
+The command writes an individual figure for every experiment and one figure
+containing every experiment:
+
+```text
+eval/<wandb-group>/training_curves/<metric>/
+  baseline.pdf
+  baseline.png
+  other_experiment.pdf
+  other_experiment.png
+  all_experiments.pdf
+  all_experiments.png
+  baseline.csv
+  other_experiment.csv
+```
+
+Use `--experiment NAME` one or more times to limit which individual figures are
+written. The `all_experiments` figure always contains every experiment in the
+manifest. Use `--format pdf png svg` to select output formats and `--ylabel` to
+override the automatically generated metric label.
+
+Finished W&B runs matching the manifest's group, experiment names, and seeds
+are preferred. If no finished retry exists, a crashed or failed run is used
+with an explicit warning and without extrapolating beyond its available
+history. A finished run always takes precedence over an incomplete retry. Each
+history is truncated at its configured
+`train.total_timesteps`; seeds are interpolated onto their shared timestep
+range, and figures show the seed mean with a shaded sample-standard-deviation
+envelope. Every figure caption states the number of aggregated seeds. W&B
+histories are cached under `training_curves/wandb_cache`; pass `--refresh` to
+download them again.
+
+The default W&B history request uses the fast sampled-history endpoint with a
+limit of 10,000 points per run, which is normally greater than the number of
+logged training points. Progress is reported per run and every completed
+download is cached immediately, so an interrupted command resumes. Use
+`--full-history` for the substantially slower exact `scan_history` endpoint, or
+change the fast-mode limit with `--history-samples`.
+
+Figures use serif fonts, vector-compatible embedded text, restrained grids,
+consistent colors, and publication-oriented dimensions. Both the plots and
+the corresponding aggregate CSV data are retained for reproducibility.
+
+The one-off pre-manifest runs from the older `pufferlib` W&B project are mapped
+explicitly by run ID in `analysis/plot_legacy_runs.py`. Reproduce their
+`environment/perf` curves, labeled as normalized return, with:
+
+```bash
+python analysis/plot_legacy_runs.py
+```
+
+The script uses each run's own `train.total_timesteps`, the same history cache,
+mean/standard-deviation aggregation, seed captions, CSV export, and figure
+styling as the manifest plotting command. Outputs default to
+`eval/legacy_quad_meshing/training_curves`.

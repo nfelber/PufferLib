@@ -611,7 +611,7 @@ static float compute_vertex_frontier_cost(QuadMeshingEnv* env, int vidx) {
         edge_length_cost += 1.0f - compute_edge_length_quality(edge_length, env->cache.target_edge_length);
 
         const Vec2 edir = scalmul2(eivec, 1.0f / edge_length);
-        alignment_cost += cross_field_alignment(&field, edir);
+        alignment_cost += 1.0f - cross_field_alignment(&field, edir);
 
         const bool cw_face_i = mesh_edge_face_orientation_from_vertex(&env->mesh, eidx, vidx);
         if (ei->face_count == 1 && !cw_face_i) continue;

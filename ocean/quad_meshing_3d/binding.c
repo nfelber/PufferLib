@@ -88,7 +88,7 @@ static const char** qm3_list_files_with_suffix(const char* folder, const char* s
     return paths;
 }
 
-static void load_surface_paths_from_folder(Env* env, Dict* kwargs) {
+static void load_surface_paths_from_folder(Env* env, Dict* kwargs, int env_index) {
     DictItem* folder_item = dict_get_unsafe(kwargs, "shape_folder");
     QM3_ASSERT(folder_item != NULL && folder_item->ptr != NULL);
     const char* folder = (const char*)folder_item->ptr;
@@ -97,6 +97,17 @@ static void load_surface_paths_from_folder(Env* env, Dict* kwargs) {
     if (names_item != NULL && names_item->value > 0) {
         const char** names = (const char**)names_item->ptr;
         int count = (int)names_item->value;
+        DictItem* export_paths_item = dict_get_unsafe(kwargs, "export_obj_paths");
+        if (export_paths_item != NULL && export_paths_item->value > 0) {
+            QM3_ASSERT((int)export_paths_item->value == count);
+            QM3_ASSERT(env_index >= 0 && env_index < count);
+            const char** paths = (const char**)calloc(1, sizeof(const char*));
+            QM3_ASSERT(paths != NULL);
+            paths[0] = qm3_path_join(folder, names[env_index]);
+            env->shape_paths = paths;
+            env->shape_count = 1;
+            return;
+        }
         const char** paths = (const char**)calloc((size_t)count, sizeof(const char*));
         QM3_ASSERT(paths != NULL);
         for (int i = 0; i < count; ++i) paths[i] = qm3_path_join(folder, names[i]);
@@ -109,6 +120,7 @@ static void load_surface_paths_from_folder(Env* env, Dict* kwargs) {
 }
 
 void my_init(Env* env, Dict* kwargs) {
+    int env_index = (int)env->rng;
     env->num_agents = 1;
     env->rng ^= (unsigned int)dict_get(kwargs, "seed")->value;
     env->max_frontier = (int)dict_get(kwargs, "max_frontier")->value;
@@ -124,9 +136,15 @@ void my_init(Env* env, Dict* kwargs) {
     env->episode_max_length_ratio = (float)dict_get(kwargs, "episode_max_length_ratio")->value;
     env->prevent_triangles = dict_get(kwargs, "prevent_triangles")->value > 0.5;
     env->export_obj = dict_get(kwargs, "export_obj")->value > 0.5;
-    DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
-    QM3_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
-    env->export_obj_path = (const char*)export_obj_path_item->ptr;
+    DictItem* export_paths_item = dict_get_unsafe(kwargs, "export_obj_paths");
+    if (export_paths_item != NULL && export_paths_item->value > 0) {
+        QM3_ASSERT(env_index >= 0 && env_index < (int)export_paths_item->value);
+        env->export_obj_path = ((const char**)export_paths_item->ptr)[env_index];
+    } else {
+        DictItem* export_obj_path_item = dict_get_unsafe(kwargs, "export_obj_path");
+        QM3_ASSERT(export_obj_path_item != NULL && export_obj_path_item->ptr != NULL);
+        env->export_obj_path = (const char*)export_obj_path_item->ptr;
+    }
     env->reward_invalid = (float)dict_get(kwargs, "reward_invalid")->value;
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
     env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
@@ -143,7 +161,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->safe_frontier_size_ratio = (float)dict_get(kwargs, "safe_frontier_size_ratio")->value;
     env->safe_degree_ratio = (float)dict_get(kwargs, "safe_degree_ratio")->value;
 
-    load_surface_paths_from_folder(env, kwargs);
+    load_surface_paths_from_folder(env, kwargs, env_index);
     QM3_ASSERT(env->shape_count > 0);
 
     env->render_target_fps = (int)dict_get(kwargs, "render_target_fps")->value;
