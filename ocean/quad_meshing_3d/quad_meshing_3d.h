@@ -505,11 +505,11 @@ static void qm3_draw_mesh(const Qm3Surface* surface, bool opaque) {
             Vector3 a = qm3_v3(surface->vertices[tri.a]);
             Vector3 b = qm3_v3(surface->vertices[tri.b]);
             Vector3 c = qm3_v3(surface->vertices[tri.c]);
-            DrawTriangle3D(a, b, c, (Color){170, 185, 205, 190});
+            DrawTriangle3D(a, b, c, (Color){100, 115, 135, 255});
         }
     }
 
-    Color wire = opaque ? (Color){25, 35, 45, 180} : (Color){85, 110, 135, 140};
+    Color wire = opaque ? (Color){25, 35, 45, 255} : (Color){85, 110, 135, 140};
     for (uint32_t i = 0; i < surface->triangle_count; ++i) {
         Qm3Tri tri = surface->triangles[i];
         Vector3 a = qm3_v3(surface->vertices[tri.a]);
@@ -3496,9 +3496,10 @@ void c_render(QuadMeshing3DEnv* env) {
     float cross_length = env->render_cross_field_length > 0.0f ? env->render_cross_field_length : diag * 0.0025f;
 
     BeginDrawing();
-    ClearBackground((Color){9, 13, 18, 255});
+    ClearBackground(RAYWHITE);
 
     BeginMode3D(env->camera);
+    rlSetLineWidth(4.0f);
     if (env->render_show_mesh) qm3_draw_mesh(surface, env->render_mesh_opaque);
     qm3_draw_loop_debug(env, diag);
     if (env->render_show_vertices) qm3_draw_vertices(surface, env->camera, point_size, (Color){110, 130, 160, 170});
@@ -3552,8 +3553,8 @@ void c_render(QuadMeshing3DEnv* env) {
         DrawSphere(p, fmaxf(point_size * 1.3f, diag * 0.002f), color);
         DrawSphereWires(p, fmaxf(point_size * 2.0f, diag * 0.003f), 12, 8, color);
     }
-    DrawBoundingBox((BoundingBox){qm3_v3(surface->bounds_min), qm3_v3(surface->bounds_max)}, (Color){90, 140, 220, 80});
     EndMode3D();
+    rlSetLineWidth(1.0f);
 
     DrawRectangle(12, 12, 1160, 250, (Color){0, 0, 0, 170});
     DrawText(TextFormat("QMSURF3D | vertices: %u | triangles: %u | samples: %u | frontier_edges: %u | prop nodes: %d",
