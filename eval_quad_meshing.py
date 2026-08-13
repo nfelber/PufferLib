@@ -69,6 +69,50 @@ def _load_boundary_vertices(path: Path) -> list[tuple[float, float]]:
     return [(float(x), float(y)) for x, y in vertices]
 
 
+def _discover_boundaries(config: dict, base_dir: Path) -> list[dict]:
+    boundary_folder = _resolve_path(config.get("boundary_folder"), base_dir)
+    if boundary_folder is None:
+        raise ValueError("eval config must define boundary_folder")
+    if not boundary_folder.is_dir():
+        raise FileNotFoundError(f"Boundary folder not found: {boundary_folder}")
+
+    boundary_names = config.get("boundary_names", [])
+    if not isinstance(boundary_names, list):
+        raise ValueError("boundary_names must be a list of JSON boundary filenames")
+    if not boundary_names:
+        boundary_names = sorted(path.name for path in boundary_folder.glob("*.json"))
+    if not boundary_names:
+        raise ValueError(f"No .json boundary files found in folder: {boundary_folder}")
+
+    boundaries = []
+    for boundary_name in boundary_names:
+        boundary_file = boundary_folder / boundary_name
+        if not boundary_file.is_file():
+            raise FileNotFoundError(f"Boundary file not found: {boundary_file}")
+        boundaries.append(
+            {
+                "name": Path(boundary_name).stem,
+                "boundary_folder": boundary_folder,
+                "boundary_name": boundary_name,
+                "boundary_file": boundary_file,
+            }
+        )
+    return boundaries
+
+
+def _instant_mesh_face_count(boundary_file: Path) -> int:
+    coords = np.asarray(_load_boundary_vertices(boundary_file), dtype=np.float64)
+    if np.array_equal(coords[0], coords[-1]):
+        coords = coords[:-1]
+
+    segment_lengths = np.linalg.norm(np.roll(coords, -1, axis=0) - coords, axis=1)
+    average_length = float(np.mean(segment_lengths))
+    area = float(Polygon(coords).area)
+    if average_length <= 0 or area <= 0:
+        raise ValueError(f"Boundary must have positive area and segment lengths: {boundary_file}")
+    return max(1, round(area / average_length**2))
+
+
 def _triangulate_boundary_to_obj(boundary_file: Path, out_path: Path) -> None:
     coords = _load_boundary_vertices(boundary_file)
     poly = Polygon(coords)
@@ -180,7 +224,8 @@ def _run_puffer_eval(
     env_name: str,
     model_path: str,
     config_path: Optional[Path],
-    boundary_file: Path,
+    boundary_folder: Path,
+    boundary_name: str,
     export_template: Path,
     seed: int,
     device: str,
@@ -197,7 +242,9 @@ def _run_puffer_eval(
     args["vec"]["num_workers"] = 1
     args["env"]["num_envs"] = 1
     args["env"].pop("boundary_file", None)
-    args["env"]["boundary_files"] = [str(boundary_file)]
+    args["env"].pop("boundary_files", None)
+    args["env"]["boundary_folder"] = str(boundary_folder)
+    args["env"]["boundary_names"] = [boundary_name]
     args["env"]["export_meshes"] = True
     args["env"]["export_mesh_path"] = str(export_template)
     args["env"]["render_enabled"] = False
@@ -245,7 +292,7 @@ def _run_puffer_eval(
         if steps >= max_steps:
             vecenv.close()
             raise RuntimeError(
-                f"Episode did not terminate within {max_steps} steps for {boundary_file}"
+                f"Episode did not terminate within {max_steps} steps for {boundary_name}"
             )
 
     vecenv.close()
@@ -462,7 +509,8 @@ def _measure_quad(quad: Polygon) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     Returns (side_lengths, diagonal_lengths, internal_angles)
     """
     verts = np.array(quad.exterior.coords[:-1])
-    assert(len(verts) == 4)
+    if len(verts) != 4:
+        raise ValueError(f"Expected four quad vertices, got {len(verts)}")
 
     sides = np.roll(verts, -1, axis=0) - verts
     side_lengths = np.linalg.norm(sides, axis=1)
@@ -480,7 +528,10 @@ def _measure_quad(quad: Polygon) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _compute_quad_score(quad: Polygon) -> float:
-    side_lengths, diagonal_lengths, angles = _measure_quad(quad)
+    try:
+        side_lengths, diagonal_lengths, angles = _measure_quad(quad)
+    except ValueError:
+        return 0.0
 
     q_edge = np.sqrt(2) * np.min(side_lengths) / np.max(diagonal_lengths)
 
@@ -488,7 +539,8 @@ def _compute_quad_score(quad: Polygon) -> float:
     if np.isnan(q_angle):
         q_angle = 0
 
-    return np.sqrt(q_edge * q_angle)
+    score = np.sqrt(q_edge * q_angle)
+    return float(score) if np.isfinite(score) else 0.0
 
 
 def _save_mesh_scores(polygons: list[np.ndarray], out_file: Path) -> dict:
@@ -754,11 +806,16 @@ def _render_summary_grid(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate quad meshing models and baselines.")
     parser.add_argument("--config", required=True, help="Path to eval config YAML.")
-    parser.add_argument("--model", required=True, help="Model path or 'latest'.")
+    parser.add_argument("--model", help="Model path or 'latest' (required unless --instant-only).")
     parser.add_argument("--output", default="eval", help="Output directory (default: eval).")
     parser.add_argument("--env-name", default="puffer_quad_meshing", help="PufferLib env name.")
     parser.add_argument("--device", default="cpu", help="Torch device for evaluation.")
     parser.add_argument("--max-steps", type=int, default=10000, help="Max steps per episode.")
+    parser.add_argument(
+        "--instant-only",
+        action="store_true",
+        help="Only run the Instant Meshes evaluation; no model is required.",
+    )
     parser.add_argument(
         "--stochastic-policy",
         action=argparse.BooleanOptionalAction,
@@ -771,6 +828,10 @@ def main() -> None:
         help="Re-evaluate all baselines in a temp folder and compare scores.",
     )
     args = parser.parse_args()
+    if not args.instant_only and not args.model:
+        parser.error("--model is required unless --instant-only is used")
+    if args.instant_only and args.recheck_baselines:
+        parser.error("--recheck-baselines cannot be used with --instant-only")
 
     config_path = Path(args.config).resolve()
     config = _load_eval_config(config_path)
@@ -779,43 +840,37 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    boundaries = []
-    for entry in config.get("boundaries", []):
-        if isinstance(entry, str):
-            boundaries.append({"name": Path(entry).stem, "boundary_file": entry})
-        elif isinstance(entry, dict):
-            if "boundary_file" not in entry:
-                raise ValueError("Each boundary entry must include 'boundary_file'.")
-            name = entry.get("name") or Path(entry["boundary_file"]).stem
-            normalized = dict(entry)
-            normalized["name"] = name
-            boundaries.append(normalized)
-        else:
-            raise ValueError("Boundary entries must be strings or dicts.")
+    boundaries = _discover_boundaries(config, base_dir)
     rl_runs = int(config.get("rl_evals_per_boundary", 1))
     seed_base = int(config.get("seed", 42))
     stochastic_policy = bool(config.get("stochastic_policy", args.stochastic_policy))
 
-    baseline_dir = config.get("baseline_dir")
-    if not baseline_dir:
-        raise ValueError("eval config must define baseline_dir")
-    baseline_dir_path = _resolve_path(baseline_dir, base_dir)
-    if baseline_dir_path is None:
-        raise ValueError("baseline_dir must be a valid path")
+    baseline_entries = []
+    model_entries = []
+    if not args.instant_only:
+        baseline_dir = config.get("baseline_dir")
+        if not baseline_dir:
+            raise ValueError("eval config must define baseline_dir")
+        baseline_dir_path = _resolve_path(baseline_dir, base_dir)
+        if baseline_dir_path is None:
+            raise ValueError("baseline_dir must be a valid path")
 
-    baseline_entries = _discover_baselines(baseline_dir_path)
-    model_entries = [{"name": "target", "path": args.model, "config_path": None}, *baseline_entries]
+        baseline_entries = _discover_baselines(baseline_dir_path)
+        model_entries = [
+            {"name": "target", "path": args.model, "config_path": None},
+            *baseline_entries,
+        ]
 
     instant_cfg = config.get("instant_meshes", {}) or {}
-    instant_enabled = instant_cfg.get("enabled", True)
+    instant_enabled = args.instant_only or instant_cfg.get("enabled", True)
     instant_binary = _resolve_path(instant_cfg.get("binary", "./instant-meshes"), base_dir)
     instant_base_args = instant_cfg.get("args", ["-b"])
-    instant_default_faces = int(instant_cfg.get("default_faces", 200))
     if instant_enabled:
         if instant_binary is None or not instant_binary.exists():
             raise FileNotFoundError(f"Instant-meshes binary not found: {instant_binary}")
 
     for model_entry in model_entries:
+        print(model_entry)
         model_name = _safe_name(model_entry["name"])
         if model_entry.get("config_path") is None:
             model_path = _resolve_model_path(model_entry["path"], base_dir)
@@ -835,9 +890,6 @@ def main() -> None:
 
         for boundary in boundaries:
             boundary_name = _safe_name(boundary["name"])
-            boundary_file = _resolve_path(boundary["boundary_file"], base_dir)
-            if boundary_file is None or not boundary_file.exists():
-                raise FileNotFoundError(f"Missing boundary_file for {boundary_name}")
 
             boundary_mesh_dir = model_meshes_dir / boundary_name
             boundary_mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -852,7 +904,8 @@ def main() -> None:
                     env_name=args.env_name,
                     model_path=model_path,
                     config_path=model_entry.get("config_path"),
-                    boundary_file=boundary_file,
+                    boundary_folder=boundary["boundary_folder"],
+                    boundary_name=boundary["boundary_name"],
                     export_template=export_template,
                     seed=seed_base + run_idx,
                     device=args.device,
@@ -871,9 +924,7 @@ def main() -> None:
         instant_inputs_dir = instant_root / "inputs"
         for boundary in boundaries:
             boundary_name = _safe_name(boundary["name"])
-            boundary_file = _resolve_path(boundary["boundary_file"], base_dir)
-            if boundary_file is None or not boundary_file.exists():
-                raise FileNotFoundError(f"Missing boundary_file for {boundary_name}")
+            boundary_file = boundary["boundary_file"]
 
             mesh_out = instant_meshes_dir / f"{boundary_name}.obj"
             score_out = instant_scores_dir / f"{boundary_name}.json"
@@ -881,7 +932,7 @@ def main() -> None:
             if mesh_out.exists() and score_out.exists() and fig_out.exists():
                 continue
 
-            faces = int(boundary.get("instant_faces", instant_default_faces))
+            faces = _instant_mesh_face_count(boundary_file)
             triangulated_input = instant_inputs_dir / f"{boundary_name}.obj"
             _triangulate_boundary_to_obj(boundary_file, triangulated_input)
 
@@ -908,9 +959,6 @@ def main() -> None:
 
             for boundary in boundaries:
                 boundary_name = _safe_name(boundary["name"])
-                boundary_file = _resolve_path(boundary["boundary_file"], base_dir)
-                if boundary_file is None or not boundary_file.exists():
-                    raise FileNotFoundError(f"Missing boundary_file for {boundary_name}")
 
                 boundary_mesh_dir = model_meshes_dir / boundary_name
                 boundary_fig_dir = model_figs_dir / boundary_name
@@ -925,7 +973,8 @@ def main() -> None:
                         env_name=args.env_name,
                         model_path=str(Path(baseline["path"]).resolve()),
                         config_path=baseline.get("config_path"),
-                        boundary_file=boundary_file,
+                        boundary_folder=boundary["boundary_folder"],
+                        boundary_name=boundary["boundary_name"],
                         export_template=export_template,
                         seed=seed_base + run_idx,
                         device=args.device,

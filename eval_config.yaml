@@ -2,24 +2,9 @@ rl_evals_per_boundary: 3
 seed: 42
 stochastic_policy: true
 baseline_dir: baselines
-boundaries:
-  - name: square
-    boundary_file: boundaries/square.json
-    instant_faces: 200
-  - name: dolphin
-    boundary_file: boundaries/dolphin.json
-    instant_faces: 70
-  - name: asterisk3
-    boundary_file: boundaries/asterisk3.json
-    instant_faces: 200
-  - name: asterisk3_big
-    boundary_file: boundaries/asterisk3_big.json
-    instant_faces: 200
-  - name: circle
-    boundary_file: boundaries/circle_32.json
-    instant_faces: 25
+boundary_folder: boundaries/test
+boundary_names: []
 instant_meshes:
   enabled: true
   binary: ./instant-meshes
-  args: ["-b", "-d"]
-  default_faces: 200
+  args: ["-b", "-d", "-D"]

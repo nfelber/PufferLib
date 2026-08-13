@@ -21,3 +21,55 @@ All of our documentation is hosted at [puffer.ai](https://puffer.ai "PufferLib D
    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pufferai/pufferlib&type=Date" />
  </picture>
 </a>
+
+## The quad meshing environment
+
+Here are some instructions to get started with the quad meshing environment. As
+a prerequisite, after cloning this repository, you should start by installing
+PufferLib as an editable python project. For example, with `uv`:
+
+```bash
+uv pip install -e . --no-build-isolation
+```
+
+### Compile the environment code
+
+To compile the environment C code in `./pufferlib/ocean/quad_meshing`, use:
+
+```bash
+ONLY_QUAD=1 python setup.py build_ext --inplace --force
+```
+
+### Train an agent
+
+Start by editing the environment's config in `./config/ocean/quad_meshing.ini`
+to your liking, then run `puffer train`:
+
+```bash
+# Optionally add --wandb to track the experiment
+puffer train puffer_quad_meshing
+```
+
+### Evaluate the agent
+
+When training is complete, you can evaluate the agent with `puffer eval`:
+
+```bash
+# You can replace latest with specific weights, e.g., baselines/single_vertex_1/model.pt
+puffer eval puffer_quad_meshing --load-model-path latest --env.render-enabled True
+```
+
+To generate meshes and plots automatically for a set of models, you can add the
+models and configs in `./baselines/`, edit the eval configuration in
+`./eval_config.yaml` and use the evaluation script `./eval_quad_meshing.py`:
+
+```bash
+python eval_quad_meshing.py --config eval_config.yaml --model latest --output eval
+```
+
+The results will be found in the `eval/` folder.
+
+> [!WARNING]
+> If [Instant Meshes](https://github.com/wjakob/instant-meshes) is enabled, an
+> Instant Meshes executable must exist at the path set for
+> `instant_meshes.binary` in `./eval_config.yaml`.
