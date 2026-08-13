@@ -259,7 +259,7 @@ Thus `config/default.ini` continues to provide every setting not replaced by
 the selected environment config. See `experiments/quad_meshing.toml` and
 `experiments/quad_meshing_3d.toml` for complete examples.
 
-Submit all experiment and seed combinations with:
+Submit all experiment and seed combinations from the cluster with:
 
 ```bash
 cluster/submit_dev_experiments.sh experiments/quad_meshing.toml \
@@ -282,9 +282,10 @@ The default output directory is
 Each array task requests one GPU, and `--max-concurrent` controls the Slurm
 array concurrency cap.
 
-Do not overlap 2D and 3D arrays that mount the same checkout. Both environment
-builds write the same `pufferlib/_C*.so`; build and finish one environment's
-batch before building the other.
+> [!Warning]
+> Do not overlap 2D and 3D arrays that mount the same checkout. Both
+> environment builds write the same `pufferlib/_C*.so`; build and finish one
+> environment's batch before building the other.
 
 Each W&B run uses the manifest's project and group, with names such as
 `deeper-painn-seed-2`. The experiment name is also recorded as W&B `job_type`
@@ -302,7 +303,7 @@ python -m pufferlib.evaluate_experiments \
   experiments/quad_meshing.toml \
   resources/quad_meshing/shapes/test \
   --download \
-  --remote-root 'nfelber@izar1:~/PufferLib/cluster_runs/experiments/quad_meshing'
+  --remote-root 'username@cluster:~/PufferLib/cluster_runs/experiments/quad_meshing'
 ```
 
 `--download` first uses `rsync` over SSH to fetch the completed run logs. It
@@ -372,38 +373,3 @@ Use `--experiment NAME` one or more times to limit which individual figures are
 written. The `all_experiments` figure always contains every experiment in the
 manifest. Use `--format pdf png svg` to select output formats and `--ylabel` to
 override the automatically generated metric label.
-
-Finished W&B runs matching the manifest's group, experiment names, and seeds
-are preferred. If no finished retry exists, a crashed or failed run is used
-with an explicit warning and without extrapolating beyond its available
-history. A finished run always takes precedence over an incomplete retry. Each
-history is truncated at its configured
-`train.total_timesteps`; seeds are interpolated onto their shared timestep
-range, and figures show the seed mean with a shaded sample-standard-deviation
-envelope. Every figure caption states the number of aggregated seeds. W&B
-histories are cached under `training_curves/wandb_cache`; pass `--refresh` to
-download them again.
-
-The default W&B history request uses the fast sampled-history endpoint with a
-limit of 10,000 points per run, which is normally greater than the number of
-logged training points. Progress is reported per run and every completed
-download is cached immediately, so an interrupted command resumes. Use
-`--full-history` for the substantially slower exact `scan_history` endpoint, or
-change the fast-mode limit with `--history-samples`.
-
-Figures use serif fonts, vector-compatible embedded text, restrained grids,
-consistent colors, and publication-oriented dimensions. Both the plots and
-the corresponding aggregate CSV data are retained for reproducibility.
-
-The one-off pre-manifest runs from the older `pufferlib` W&B project are mapped
-explicitly by run ID in `analysis/plot_legacy_runs.py`. Reproduce their
-`environment/perf` curves, labeled as normalized return, with:
-
-```bash
-python analysis/plot_legacy_runs.py
-```
-
-The script uses each run's own `train.total_timesteps`, the same history cache,
-mean/standard-deviation aggregation, seed captions, CSV export, and figure
-styling as the manifest plotting command. Outputs default to
-`eval/legacy_quad_meshing/training_curves`.

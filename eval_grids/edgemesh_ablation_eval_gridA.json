@@ -1,0 +1,50 @@
+{
+  "folders": [
+    {
+      "path": "eval/quad_meshing_ablations/meshes/baseline/1",
+      "label": "Baseline"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/big/1",
+      "label": "Big"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/small/1",
+      "label": "Small"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/se2_invariant/1",
+      "label": "SE(2) invariant"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/no_perceiver/1",
+      "label": "No perceiver"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/deep_perceiver/1",
+      "label": "Deep perceiver"
+    }
+  ],
+  "files": [
+    {
+      "name": "dolphin.obj",
+      "label": "Dolphin"
+    },
+    {
+      "name": "device2-1.obj",
+      "label": "Flower"
+    },
+    {
+      "name": "cup-19.obj",
+      "label": "Cup"
+    },
+    {
+      "name": "chicken-2.obj",
+      "label": "Chicken"
+    },
+    {
+      "name": "horseshoe-14.obj",
+      "label": "Horseshoe"
+    }
+  ]
+}

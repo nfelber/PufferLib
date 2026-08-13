@@ -28,6 +28,8 @@ typedef struct {
     float episode_length_ratio; // normalized episode length
     float num_quads; // number of quads created
     float num_quads_ratio; // normalized number of quads created
+    float softmin_quad_quality;
+    float quad_area_ratio;
     float n; // Required as the last field
 } Log;
 
@@ -45,6 +47,7 @@ typedef struct {
     IntArray frontier_hop_queue;
     Vec2Array candidates_local;
     float potential;
+    float quad_area_potential;
 } QuadMeshingCache;
 
 // Required that you have some struct for your env
@@ -64,6 +67,10 @@ typedef struct {
     int episode_length;
     float episode_return;
     float total_quad_quality;
+    float terminal_total_quad_quality;
+    float softmin_quad_quality_min;
+    float softmin_quad_quality_exp_sum;
+    float total_quad_area;
     int num_quads;
     int source_frontier_idx;
 
@@ -101,7 +108,11 @@ typedef struct {
     float reward_incomplete;
     float reward_triangle;
     float base_quad_reward;
+    bool terminal_reward;
+    float terminal_average_quality_weight;
+    float terminal_softmin_temperature;
     float potential_beta;
+    float quad_area_potential_beta;
     float potential_gamma;
     float frontier_quality_weight;
     float frontier_edge_length_weight;
@@ -157,6 +168,9 @@ static void init_candidates(QuadMeshingEnv* env) {
 /** Allocates env buffers and computes observation layout. */
 void quad_meshing_init(QuadMeshingEnv* env)
 {
+    QM_ASSERT(env->terminal_average_quality_weight >= 0.0f && env->terminal_average_quality_weight <= 1.0f);
+    QM_ASSERT(env->terminal_softmin_temperature > 0.0f);
+    QM_ASSERT(env->quad_area_potential_beta >= 0.0f);
     mesh_init(&env->mesh, env->max_degree, env->grid_res, env->grid_cell_size, env->grid_cell_cap, env->intersection_tol);
     qmshape_init(&env->shape);
     cross_field_init(&env->cross_field, env->grid_res, env->grid_cell_size, env->grid_cell_cap);
@@ -168,15 +182,35 @@ void quad_meshing_init(QuadMeshingEnv* env)
     env->ui_pending_source = -1;
 }
 
+static float terminal_softmin_quad_quality(QuadMeshingEnv* env) {
+    if (env->num_quads == 0) return 0.0f;
+    return env->softmin_quad_quality_min - env->terminal_softmin_temperature * logf(
+        env->softmin_quad_quality_exp_sum / (float)env->num_quads
+    );
+}
+
+static float terminal_mesh_quality(QuadMeshingEnv* env) {
+    if (env->num_quads == 0) return 0.0f;
+    const float average = env->terminal_total_quad_quality / (float)env->num_quads;
+    const float softmin = terminal_softmin_quad_quality(env);
+    const float weight = env->terminal_average_quality_weight;
+    return fminf(1.0f, fmaxf(0.0f, weight * average + (1.0f - weight) * softmin));
+}
+
 void add_log(QuadMeshingEnv* env) {
     const float area_scale = env->cache.target_quad_area / env->cache.starting_boundary_area;
-    env->log.perf += env->total_quad_quality / env->num_quads;
-    env->log.score += env->total_quad_quality / env->num_quads;
+    const float average_quality = env->num_quads > 0
+        ? env->total_quad_quality / (float)env->num_quads
+        : 0.0f;
+    env->log.perf += average_quality;
+    env->log.score += average_quality;
     env->log.episode_length += env->episode_length;
     env->log.episode_length_ratio += (float)env->episode_length / env->cache.episode_max_length;
     env->log.episode_return += env->episode_return;
     env->log.num_quads += (float)env->num_quads;
     env->log.num_quads_ratio += (float)env->num_quads * area_scale;
+    env->log.softmin_quad_quality += terminal_softmin_quad_quality(env);
+    env->log.quad_area_ratio += env->cache.quad_area_potential;
     env->log.n++;
 }
 
@@ -751,6 +785,28 @@ static float compute_frontier_potential(QuadMeshingEnv* env) {
         - env->degree_pressure_weight * compute_degree_pressure(env);
 }
 
+static void record_quad(QuadMeshingEnv* env, float quality, float area) {
+    env->total_quad_quality += quality;
+    env->total_quad_area += area;
+
+    const float q = isfinite(quality) ? fminf(1.0f, fmaxf(0.0f, quality)) : 0.0f;
+    env->terminal_total_quad_quality += q;
+    if (env->num_quads == 0) {
+        env->softmin_quad_quality_min = q;
+        env->softmin_quad_quality_exp_sum = 1.0f;
+    } else if (q < env->softmin_quad_quality_min) {
+        env->softmin_quad_quality_exp_sum = 1.0f + env->softmin_quad_quality_exp_sum * expf(
+            -(env->softmin_quad_quality_min - q) / env->terminal_softmin_temperature
+        );
+        env->softmin_quad_quality_min = q;
+    } else {
+        env->softmin_quad_quality_exp_sum += expf(
+            -(q - env->softmin_quad_quality_min) / env->terminal_softmin_temperature
+        );
+    }
+    ++env->num_quads;
+}
+
 static float compute_quad_reward(QuadMeshingEnv* env, const Vec2* quad, float* quality) {
     *quality = compute_quad_quality(env, quad);
     float quad_reward = *quality;
@@ -765,6 +821,10 @@ void c_reset(QuadMeshingEnv* env) {
     env->episode_length = 0;
     env->episode_return = 0.0;
     env->total_quad_quality = 0.0;
+    env->terminal_total_quad_quality = 0.0;
+    env->softmin_quad_quality_min = 0.0;
+    env->softmin_quad_quality_exp_sum = 0.0;
+    env->total_quad_area = 0.0;
     env->num_quads = 0;
     env->source_frontier_idx = -1;
 
@@ -787,6 +847,7 @@ void c_reset(QuadMeshingEnv* env) {
 
     // Compute starting potential
     env->cache.potential = compute_frontier_potential(env);
+    env->cache.quad_area_potential = 0.0f;
 
     compute_observations(env);
 }
@@ -849,7 +910,7 @@ void c_step(QuadMeshingEnv* env) {
 
     if (!valid) {
         BENCH_START(invalid_path, "quad_meshing.invalid_path");
-        env->rewards[0] = env->reward_invalid;
+        env->rewards[0] = env->terminal_reward ? 0.0f : env->reward_invalid;
         // Check episode termination
         if (env->episode_length >= env->cache.episode_max_length) {
             env->rewards[0] = env->reward_incomplete;
@@ -881,9 +942,9 @@ void c_step(QuadMeshingEnv* env) {
             Vec2 face[4];
             for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
             float quality = 0.0;
-            env->rewards[0] += 0.5 * compute_quad_reward(env, face, &quality);
-            env->total_quad_quality += quality;
-            ++env->num_quads;
+            const float quad_reward = compute_quad_reward(env, face, &quality);
+            if (!env->terminal_reward) env->rewards[0] += 0.5f * quad_reward;
+            record_quad(env, quality, polygon_area(face, 4));
             mesh_disable_edges_inside_face(&env->mesh, verts, 4);
         }
         BENCH_END(boundary_face_path);
@@ -905,9 +966,9 @@ void c_step(QuadMeshingEnv* env) {
             if (mesh_register_face(&env->mesh, verts, 4)) {
                 for (int j = 0; j < 4; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
                 float quality = 0.0;
-                env->rewards[0] += 0.5 * compute_quad_reward(env, face, &quality);
-                env->total_quad_quality += quality;
-                ++env->num_quads;
+                const float quad_reward = compute_quad_reward(env, face, &quality);
+                if (!env->terminal_reward) env->rewards[0] += 0.5f * quad_reward;
+                record_quad(env, quality, polygon_area(face, 4));
                 ++new_face_count;
                 mesh_disable_edges_inside_face(&env->mesh, verts, 4);
             };
@@ -923,7 +984,7 @@ void c_step(QuadMeshingEnv* env) {
                 // for (int j = 0; j < 3; ++j) face[j] = env->mesh.vertices.data[verts[j]].pos;
                 // face[3] = face[2]; // Duplicate last vertex to make (degenerate) quad
                 // env->rewards[0] += compute_quad_quality(env, face);
-                env->rewards[0] += env->reward_triangle;
+                if (!env->terminal_reward) env->rewards[0] += env->reward_triangle;
                 ++new_face_count;
                 mesh_disable_edges_inside_face(&env->mesh, verts, 3);
             };
@@ -946,11 +1007,22 @@ void c_step(QuadMeshingEnv* env) {
     const float new_potential = compute_frontier_potential(env);
     env->rewards[0] += env->potential_beta * (env->potential_gamma * new_potential - env->cache.potential);
     env->cache.potential = new_potential;
+    const float new_quad_area_potential = env->total_quad_area / env->cache.starting_boundary_area;
+    if (env->terminal_reward) {
+        env->rewards[0] += env->quad_area_potential_beta * (
+            env->potential_gamma * new_quad_area_potential - env->cache.quad_area_potential
+        );
+    }
+    env->cache.quad_area_potential = new_quad_area_potential;
 
     // Check episode termination
     if ((env->mesh.frontier.size == 0) || (env->mesh.frontier.size > env->max_frontier) || (env->episode_length >= env->cache.episode_max_length) || mesh_saturated) {
         BENCH_START(terminal_reset, "quad_meshing.terminal_reset");
-        if (env->mesh.frontier.size != 0) {
+        if (env->terminal_reward && env->mesh.frontier.size == 0) {
+            env->rewards[0] += terminal_mesh_quality(env);
+        } else if (env->terminal_reward) {
+            env->rewards[0] += env->reward_incomplete;
+        } else if (env->mesh.frontier.size != 0) {
             env->rewards[0] = env->reward_incomplete;
         }
         env->episode_return += env->rewards[0];

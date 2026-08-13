@@ -1,0 +1,50 @@
+{
+  "folders": [
+    {
+      "path": "eval/quad_meshing_ablations/meshes/no_chiral/1",
+      "label": "No chiral"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/no_cross_field_observation/1",
+      "label": "No cross-field observation"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/no_cross_field_reward/1",
+      "label": "No cross-field reward"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/random_source/1",
+      "label": "Random source"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/boundary_mode/1",
+      "label": "Boundary mode"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/no_potential/1",
+      "label": "No potential"
+    }
+  ],
+  "files": [
+    {
+      "name": "dolphin.obj",
+      "label": "Dolphin"
+    },
+    {
+      "name": "device2-1.obj",
+      "label": "Flower"
+    },
+    {
+      "name": "cup-19.obj",
+      "label": "Cup"
+    },
+    {
+      "name": "chicken-2.obj",
+      "label": "Chicken"
+    },
+    {
+      "name": "horseshoe-14.obj",
+      "label": "Horseshoe"
+    }
+  ]
+}

@@ -27,7 +27,11 @@ int main() {
     env.reward_incomplete = -1.0;
     env.reward_triangle = -0.5;
     env.base_quad_reward = 0.0;
+    env.terminal_reward = false;
+    env.terminal_average_quality_weight = 0.5;
+    env.terminal_softmin_temperature = 0.1;
     env.potential_beta = 0.15;
+    env.quad_area_potential_beta = 0.0;
     env.potential_gamma = 1.0;
     env.frontier_quality_weight = 1.0;
     env.frontier_edge_length_weight = 1.0;

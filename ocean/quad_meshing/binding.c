@@ -107,7 +107,11 @@ void my_init(Env* env, Dict* kwargs) {
     env->reward_incomplete = (float)dict_get(kwargs, "reward_incomplete")->value;
     env->reward_triangle = (float)dict_get(kwargs, "reward_triangle")->value;
     env->base_quad_reward = (float)dict_get(kwargs, "base_quad_reward")->value;
+    env->terminal_reward = dict_get(kwargs, "terminal_reward")->value > 0.5;
+    env->terminal_average_quality_weight = (float)dict_get(kwargs, "terminal_average_quality_weight")->value;
+    env->terminal_softmin_temperature = (float)dict_get(kwargs, "terminal_softmin_temperature")->value;
     env->potential_beta = (float)dict_get(kwargs, "potential_beta")->value;
+    env->quad_area_potential_beta = (float)dict_get(kwargs, "quad_area_potential_beta")->value;
     env->potential_gamma = (float)dict_get(kwargs, "potential_gamma")->value;
     env->frontier_quality_weight = (float)dict_get(kwargs, "frontier_quality_weight")->value;
     env->frontier_edge_length_weight = (float)dict_get(kwargs, "frontier_edge_length_weight")->value;
@@ -148,5 +152,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_length_ratio", log->episode_length_ratio);
     dict_set(out, "num_quads", log->num_quads);
     dict_set(out, "num_quads_ratio", log->num_quads_ratio);
+    dict_set(out, "softmin_quad_quality", log->softmin_quad_quality);
+    dict_set(out, "quad_area_ratio", log->quad_area_ratio);
     dict_set(out, "n", log->n);
 }

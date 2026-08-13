@@ -85,7 +85,11 @@ reward_invalid = -0.1
 reward_incomplete = -1.0
 reward_triangle = 0.0
 base_quad_reward = 0.0
+terminal_reward = false
+terminal_average_quality_weight = 0.5
+terminal_softmin_temperature = 0.1
 potential_beta = 0.1
+quad_area_potential_beta = 1.0
 potential_gamma = 0.997
 frontier_quality_weight = 1.0
 frontier_edge_length_weight = 1.0
@@ -201,4 +205,3 @@ name = "no_potential"
 
 [experiments.env]
 potential_beta = 0.0
-

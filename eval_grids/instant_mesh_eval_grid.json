@@ -1,0 +1,45 @@
+{
+  "folders": [
+    {
+      "path": "eval/instant_meshes/",
+      "label": "Instant meshes"
+    },
+    {
+      "path": "eval/facemesh/multi_vertex/",
+      "label": "FaceMesh Multi-shape vertex"
+    },
+    {
+      "path": "eval/quad_meshing_ablations/meshes/baseline/1",
+      "label": "EdgeMesh Multi-shape baseline"
+    }
+  ],
+  "files": [
+    {
+      "name": "dolphin.obj",
+      "label": "Dolphin"
+    },
+    {
+      "name": "device2-1.obj",
+      "label": "Flower"
+    },
+    {
+      "name": "cup-19.obj",
+      "label": "Cup"
+    },
+    {
+      "name": "chicken-2.obj",
+      "label": "Chicken"
+    },
+    {
+      "name": "horseshoe-14.obj",
+      "label": "Horseshoe"
+    }
+  ],
+  "reward": {
+    "qmshape_folder": "resources/quad_meshing/shapes/test",
+    "target_edge_length_ratio": 1.0,
+    "base_quad_reward": 0.0,
+    "triangle_reward": 0.0,
+    "quad_reward_scale": 1.0
+  }
+}

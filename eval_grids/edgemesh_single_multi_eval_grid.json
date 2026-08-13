@@ -1,0 +1,34 @@
+{
+  "folders": [
+    {
+      "path": "eval/quad_meshing_ablations/meshes/baseline/1",
+      "label": "Multi-shape baseline"
+    },
+    {
+      "path": "eval/quad_meshing_single/meshes/baseline_single_shape/1",
+      "label": "Single-shape baseline"
+    }
+  ],
+  "files": [
+    {
+      "name": "dolphin.obj",
+      "label": "Dolphin"
+    },
+    {
+      "name": "device2-1.obj",
+      "label": "Flower"
+    },
+    {
+      "name": "cup-19.obj",
+      "label": "Cup"
+    },
+    {
+      "name": "chicken-2.obj",
+      "label": "Chicken"
+    },
+    {
+      "name": "horseshoe-14.obj",
+      "label": "Horseshoe"
+    }
+  ]
+}

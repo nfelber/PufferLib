@@ -1,0 +1,38 @@
+{
+  "folders": [
+    {
+      "path": "eval/facemesh/single_vertex/",
+      "label": "Single-shape vertex"
+    },
+    {
+      "path": "eval/facemesh/multi_vertex/",
+      "label": "Multi-shape vertex"
+    },
+    {
+      "path": "eval/facemesh/multi_edge/",
+      "label": "Multi-shape edge"
+    }
+  ],
+  "files": [
+    {
+      "name": "dolphin.obj",
+      "label": "Dolphin"
+    },
+    {
+      "name": "device2-1.obj",
+      "label": "Flower"
+    },
+    {
+      "name": "cup-19.obj",
+      "label": "Cup"
+    },
+    {
+      "name": "chicken-2.obj",
+      "label": "Chicken"
+    },
+    {
+      "name": "horseshoe-14.obj",
+      "label": "Horseshoe"
+    }
+  ]
+}
